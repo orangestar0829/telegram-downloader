@@ -298,12 +298,6 @@ class _App:
         tabs_row.pack(fill="x", **pad)
         nb = ttk.Notebook(tabs_row)
         nb.pack(side="left", fill="x", expand=True)
-        ttk.Button(tabs_row, text="运行日志", command=self._open_log_window).pack(
-            side="right", padx=(8, 0)
-        )
-        ttk.Button(tabs_row, text="下载记录", command=self._open_download_window).pack(
-            side="right", padx=(8, 0)
-        )
         nb.add(self._build_gallery_tab(), text="浏览媒体(选图/视频)")
         nb.add(self._build_download_tab(), text="批量下载")
         nb.add(self._build_monitor_tab(), text="多频道监控")
@@ -317,15 +311,34 @@ class _App:
         ttk.Button(folder, text="更改", command=self._change_dir).pack(side="left")
         ttk.Button(folder, text="打开下载文件夹", command=self._open_folder).pack(side="left", padx=6)
 
-        logframe = ttk.LabelFrame(self.root, text="运行日志")
+        logframe = ttk.LabelFrame(self.root, text="日志")
         logframe.pack(fill="both", expand=True, **pad)
-        self.log = self.scrolledtext.ScrolledText(logframe, height=8, wrap="word", state="disabled")
-        self.log.pack(fill="both", expand=True, padx=4, pady=4)
-        ttk.Button(logframe, text="跳转最新", command=lambda: self.log.see("end")).pack(anchor="e", padx=4, pady=2)
-        # Download completions have their own buffer and window; stdout/stderr
-        # remain in the runtime log above.
-        self.download_log = self.scrolledtext.ScrolledText(logframe, height=1, wrap="word", state="disabled")
-        self.download_log.pack_forget()
+        toolbar = ttk.Frame(logframe)
+        toolbar.pack(fill="x", padx=4, pady=(4, 0))
+        self.log_tabs = ttk.Notebook(logframe)
+        self.log_tabs.pack(fill="both", expand=True, padx=4, pady=(2, 4))
+        runtime_tab = ttk.Frame(self.log_tabs)
+        downloads_tab = ttk.Frame(self.log_tabs)
+        self.log_tabs.add(runtime_tab, text="运行日志")
+        self.log_tabs.add(downloads_tab, text="下载记录")
+        self.log = self.scrolledtext.ScrolledText(runtime_tab, height=8, wrap="word", state="disabled")
+        self.log.pack(fill="both", expand=True)
+        self.download_log = self.scrolledtext.ScrolledText(downloads_tab, height=8, wrap="word", state="disabled")
+        self.download_log.pack(fill="both", expand=True)
+        ttk.Button(toolbar, text="跳转最新", command=self._jump_to_latest_log).pack(side="right", padx=3)
+        ttk.Button(toolbar, text="放大查看", command=self._open_active_log_window).pack(side="right", padx=3)
+
+    def _active_log_widget(self):
+        return self.download_log if self.log_tabs.index("current") == 1 else self.log
+
+    def _jump_to_latest_log(self):
+        self._active_log_widget().see("end")
+
+    def _open_active_log_window(self):
+        if self.log_tabs.index("current") == 1:
+            self._open_download_window()
+        else:
+            self._open_log_window()
 
     def _build_monitor_tab(self):
         tk, ttk = self.tk, self.ttk
