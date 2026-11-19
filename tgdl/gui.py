@@ -196,6 +196,10 @@ class _App:
         self._auto_job_id = None
         self._auto_config = None
         self._download_future = None
+        self._download_task = None
+        self._stop_download = threading.Event()
+        self._closing = False
+        self._monitor_cursor = 0
         try:
             self._monitored = load_channels()
         except (ValueError, OSError) as exc:
@@ -222,6 +226,7 @@ class _App:
 
         self._stdout, self._stderr = sys.stdout, sys.stderr
         self._timestamp_formatter = TimestampedLines()
+        self._download_timestamp_formatter = TimestampedLines()
         writer = _QueueWriter(self.log_queue, self._timestamp_formatter)
         sys.stdout = writer
         sys.stderr = writer
@@ -330,37 +335,57 @@ class _App:
         ttk.Label(controls, text="扫描间隔(分钟)").pack(side="left")
         self.monitor_minutes_var = tk.StringVar(value="15")
         ttk.Entry(controls, textvariable=self.monitor_minutes_var, width=6).pack(side="left", padx=5)
+        ttk.Label(controls, text="方向").pack(side="left", padx=4)
+        self.monitor_direction_var = tk.StringVar(value="从新到旧")
+        ttk.Combobox(
+            controls, textvariable=self.monitor_direction_var, state="readonly", width=10,
+            values=("从新到旧", "从旧到新"),
+        ).pack(side="left", padx=4)
         ttk.Button(controls, text="添加当前频道", command=self._monitor_add).pack(side="left")
+        ttk.Button(controls, text="更新所选", command=self._monitor_update).pack(side="left", padx=4)
         ttk.Button(controls, text="删除所选", command=self._monitor_remove).pack(side="left", padx=5)
         ttk.Button(controls, text="启用/暂停所选", command=self._monitor_toggle).pack(side="left")
-        columns = ("target", "minutes", "enabled", "next")
+        columns = ("target", "minutes", "direction", "enabled", "next")
         self.monitor_tree = ttk.Treeview(frame, columns=columns, show="headings", height=7)
         for column, label, width in (
             ("target", "频道 ID / 用户名", 220),
             ("minutes", "间隔(分钟)", 95),
+            ("direction", "扫描方向", 105),
             ("enabled", "状态", 85),
             ("next", "下次扫描", 145),
         ):
             self.monitor_tree.heading(column, text=label)
             self.monitor_tree.column(column, width=width)
         self.monitor_tree.pack(fill="both", expand=True, padx=6)
+        self.monitor_tree.bind("<<TreeviewSelect>>", self._monitor_selection_changed)
         actions = ttk.Frame(frame)
         actions.pack(fill="x", padx=6, pady=4)
         self.monitor_button = ttk.Button(actions, text="启动全部监控", command=self._monitor_start_stop)
         self.monitor_button.pack(side="left")
+        ttk.Button(actions, text="取消当前下载", command=self._cancel_current_download).pack(side="left", padx=6)
         ttk.Label(actions, text="重启后保留频道配置；需手动启动监控", foreground="#555").pack(side="left", padx=10)
         self._monitor_refresh()
         return frame
 
     def _monitor_refresh(self):
-        self.monitor_tree.delete(*self.monitor_tree.get_children())
+        expected = {str(i) for i in range(len(self._monitored))}
+        for iid in self.monitor_tree.get_children():
+            if iid not in expected:
+                self.monitor_tree.delete(iid)
         for index, item in enumerate(self._monitored):
             due = self._monitor_next.get(item["target"])
             next_time = time.strftime("%H:%M:%S", time.localtime(due)) if due and item["enabled"] and self._monitor_active else "-"
-            self.monitor_tree.insert("", "end", iid=str(index), values=(
+            values = (
                 item["target"], item["minutes"],
+                "旧→新" if item.get("direction") == "oldest" else "新→旧",
                 "启用" if item["enabled"] else "暂停", next_time,
-            ))
+            )
+            iid = str(index)
+            if self.monitor_tree.exists(iid):
+                if tuple(map(str, values)) != tuple(self.monitor_tree.item(iid, "values")):
+                    self.monitor_tree.item(iid, values=values)
+            else:
+                self.monitor_tree.insert("", "end", iid=iid, values=values)
 
     def _monitor_add(self):
         target = self._selected_target()
@@ -378,8 +403,12 @@ class _App:
         if not types:
             self.messagebox.showwarning("监控", "至少选择一种下载类型")
             return
+        self.monitor_tree.selection_remove(self.monitor_tree.selection())
         self._monitored = [item for item in self._monitored if item["target"] != target]
-        self._monitored.append({"target": target, "minutes": minutes, "types": types, "enabled": True})
+        self._monitored.append({
+            "target": target, "minutes": minutes, "types": types, "enabled": True,
+            "direction": "oldest" if self.monitor_direction_var.get() == "从旧到新" else "newest",
+        })
         self._monitor_next[target] = time.time()
         save_channels(self._monitored)
         self._monitor_refresh()
@@ -388,9 +417,38 @@ class _App:
         selected = self.monitor_tree.selection()
         return int(selected[0]) if selected else None
 
+    def _monitor_selection_changed(self, _event=None):
+        index = self._monitor_selected_index()
+        if index is not None and index < len(self._monitored):
+            item = self._monitored[index]
+            self.monitor_minutes_var.set(str(item["minutes"]))
+            self.monitor_direction_var.set(
+                "从旧到新" if item.get("direction") == "oldest" else "从新到旧"
+            )
+
+    def _monitor_update(self):
+        index = self._monitor_selected_index()
+        if index is None:
+            self.messagebox.showwarning("监控", "请先在监控列表中选一个频道")
+            return
+        try:
+            minutes = int(self.monitor_minutes_var.get())
+            if not 1 <= minutes <= 1440:
+                raise ValueError
+        except ValueError:
+            self.messagebox.showwarning("监控", "间隔应为 1～1440 分钟")
+            return
+        item = self._monitored[index]
+        item["minutes"] = minutes
+        item["direction"] = "oldest" if self.monitor_direction_var.get() == "从旧到新" else "newest"
+        self._monitor_next[item["target"]] = time.time()
+        save_channels(self._monitored)
+        self._monitor_refresh()
+
     def _monitor_remove(self):
         index = self._monitor_selected_index()
         if index is not None:
+            self.monitor_tree.selection_remove(self.monitor_tree.selection())
             item = self._monitored.pop(index)
             self._monitor_next.pop(item["target"], None)
             save_channels(self._monitored)
@@ -428,7 +486,10 @@ class _App:
         now = time.time()
         busy = self._download_future is not None and not self._download_future.done()
         if not busy:
-            for item in self._monitored:
+            total = len(self._monitored)
+            for offset in range(total):
+                index = (self._monitor_cursor + offset) % total
+                item = self._monitored[index]
                 if not item["enabled"] or self._monitor_next.get(item["target"], 0) > now:
                     continue
                 try:
@@ -436,9 +497,13 @@ class _App:
                 except ValueError as exc:
                     self._log(f"[监控] 设置错误：{exc}\n")
                     break
+                self._monitor_cursor = (index + 1) % total
                 self._monitor_next[item["target"]] = now + item["minutes"] * 60
                 self._log(f"[监控] 开始扫描 {item['target']}，间隔 {item['minutes']} 分钟\n")
-                self._start_channel_download(item["target"], item["types"], "", concurrency, retries, chunks)
+                self._start_channel_download(
+                    item["target"], item["types"], "", concurrency, retries, chunks,
+                    monitor_item=item,
+                )
                 break
         self._monitor_refresh()
         self._monitor_job = self.root.after(1000, self._monitor_tick)
@@ -632,7 +697,7 @@ class _App:
         self.log_queue.put(self._timestamp_formatter.format(text))
 
     def _log_download(self, text: str) -> None:
-        self.download_queue.put(self._timestamp_formatter.format(text + "\n"))
+        self.download_queue.put(self._download_timestamp_formatter.format(text + "\n"))
 
     def _drain_log(self) -> None:
         try:
@@ -897,30 +962,41 @@ class _App:
         )
 
     def _start_channel_download(
-        self, target, types_raw, limit, concurrency, retries, chunk_concurrency
+        self, target, types_raw, limit, concurrency, retries, chunk_concurrency,
+        monitor_item=None,
     ) -> None:
         if self._download_future is not None and not self._download_future.done():
             self._log("[定时] 上一次下载尚未结束，跳过本轮。\n")
             return
 
+        self._stop_download.clear()
+
         async def coro():
-            await self._ensure_client()
-            await download_channel(
-                self.client,
-                target=target,
-                download_dir=self.settings.download_dir,
-                types=parse_types(types_raw),
-                limit=int(limit) if limit else None,
-                since=None,
-                until=None,
-                skip_existing=True,
-                dry_run=False,
-                concurrency=concurrency,
-                retries=retries,
-                chunk_concurrency=chunk_concurrency,
-                on_saved=self._log_download,
-            )
-            print("下载完成。点『打开下载文件夹』查看。\n")
+            self._download_task = asyncio.current_task()
+            try:
+                await self._ensure_client()
+                result = await download_channel(
+                    self.client,
+                    target=target,
+                    download_dir=self.settings.download_dir,
+                    types=parse_types(types_raw),
+                    limit=int(limit) if limit else None,
+                    since=None,
+                    until=None,
+                    skip_existing=True,
+                    dry_run=False,
+                    concurrency=concurrency,
+                    retries=retries,
+                    chunk_concurrency=chunk_concurrency,
+                    on_saved=self._log_download,
+                    monitor_direction=monitor_item.get("direction", "newest") if monitor_item else None,
+                    monitor_batch_size=100,
+                    stop_event=self._stop_download,
+                )
+                print("下载完成。点『打开下载文件夹』查看。\n")
+                return result
+            finally:
+                self._download_task = None
 
         self.download_btn.config(state="disabled")
         future = self.loop.submit(coro())
@@ -928,11 +1004,20 @@ class _App:
 
         def finished(fut: concurrent.futures.Future) -> None:
             try:
-                fut.result()
+                result = fut.result()
+                if monitor_item is not None and result.more_pending:
+                    # Run the next bounded batch soon, after giving other channels a turn.
+                    self._monitor_next[target] = time.time()
+            except concurrent.futures.CancelledError:
+                self._log("[下载] 已取消当前任务\n")
             except Exception as exc:
                 self._log(f"[下载错误] {exc}\n")
             finally:
-                self.root.after(0, lambda: self.download_btn.config(state="normal"))
+                def on_ui():
+                    self.download_btn.config(state="normal")
+                    if self._closing:
+                        self._finish_close()
+                self.root.after(0, on_ui)
 
         future.add_done_callback(finished)
 
@@ -1100,19 +1185,68 @@ class _App:
         )
 
     # ---------- lifecycle ----------
+    def _cancel_current_download(self) -> None:
+        self._stop_download.set()
+        if self._download_future is not None and not self._download_future.done():
+            self._download_future.cancel()
+            self._log("[下载] 正在取消当前扫描及未完成文件；已成功的文件不会删除\n")
+
+    def _finish_close(self) -> None:
+        if self._download_future is not None and not self._download_future.done():
+            return
+        sys.stdout, sys.stderr = self._stdout, self._stderr
+
+        async def disconnect():
+            # Cancellation can settle the thread-safe Future before the real
+            # asyncio download task has removed its temporary chunk files.
+            active = self._download_task
+            if active is not None and not active.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(active), timeout=30)
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if self.client is not None:
+                await self.client.disconnect()
+
+        try:
+            future = self.loop.submit(disconnect())
+            future.add_done_callback(lambda _f: self.root.after(0, self._destroy_after_disconnect))
+        except Exception:
+            self._destroy_after_disconnect()
+
+    def _destroy_after_disconnect(self) -> None:
+        self.loop.stop()
+        self.root.destroy()
+
     def _on_close(self) -> None:
+        if self._closing:
+            return
+        busy = self._download_future is not None and not self._download_future.done()
+        if busy:
+            decision = self.messagebox.askyesnocancel(
+                "安全退出",
+                "当前有文件正在下载。\n\n"
+                "是：等待已开始的文件完成后退出（不再启动新文件）\n"
+                "否：取消正在下载的文件并退出\n"
+                "取消：继续下载，不退出",
+            )
+            if decision is None:
+                return
         if self._monitor_active:
             self._monitor_start_stop()
         if self._auto_config is not None:
             self._stop_auto()
-        sys.stdout, sys.stderr = self._stdout, self._stderr
-        try:
-            if self.client is not None:
-                self.loop.submit(self.client.disconnect())
-        except Exception:
-            pass
-        self.loop.stop()
-        self.root.destroy()
+        self._closing = True
+        self._stop_download.set()
+        if busy:
+            if not decision:
+                self._download_future.cancel()
+            self._log(
+                "[退出] 等待当前已开始的文件完成后关闭\n"
+                if decision else "[退出] 正在取消下载\n"
+            )
+            return
+        self._finish_close()
 
     def run(self) -> None:
         self.root.mainloop()
