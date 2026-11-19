@@ -27,6 +27,7 @@ from tqdm import tqdm
 from tgdl.chunked import (
     ChunkDownloadStalled, chunkable_document, document_suffix, download_chunked,
 )
+from tgdl.history import DownloadHistory
 
 PHOTO_TYPES = {"photo"}
 VIDEO_TYPES = {"video", "animation"}
@@ -253,15 +254,21 @@ async def download_channel(
             dest_dir = photos_dir if kind == "photo" else videos_dir
             yield message, dest_dir, base
 
+    history = DownloadHistory() if not dry_run else None
     try:
-        await download_many(
-            client, jobs(), stats=stats, concurrency=concurrency,
-            retries=retries, skip_existing=skip_existing,
-            chunk_concurrency=chunk_concurrency,
-        )
-    except FloodWaitError as exc:
-        print(f"\nRate limited. Wait {exc.seconds}s then retry this channel.")
-        raise
+        try:
+            await download_many(
+                client, jobs(), stats=stats, concurrency=concurrency,
+                retries=retries, skip_existing=skip_existing,
+                chunk_concurrency=chunk_concurrency,
+                history=history, peer_id=int(entity.id),
+            )
+        except FloodWaitError as exc:
+            print(f"\nRate limited. Wait {exc.seconds}s then retry this channel.")
+            raise
+    finally:
+        if history is not None:
+            history.close()
 
     print(
         f"\nDone. saved={stats.saved} skipped={stats.skipped} failed={stats.failed} matched={scanned}"
@@ -278,10 +285,19 @@ async def _download_one(
     skip_existing: bool,
     stats: DownloadStats,
     chunk_concurrency: int = 1,
+    history: DownloadHistory | None = None,
+    peer_id: int | None = None,
 ) -> Path | None:
-    if skip_existing and any(dest_dir.glob(f"{base}.*")):
-        stats.skipped += 1
-        return None
+    if skip_existing:
+        if history is not None and peer_id is not None and history.contains(peer_id, message.id):
+            stats.skipped += 1
+            return None
+        existing = next(dest_dir.glob(f"{base}.*"), None) if dest_dir.exists() else None
+        if existing is not None:
+            if history is not None and peer_id is not None and existing.is_file():
+                history.mark_saved(peer_id, message.id, dest_dir.name, existing)
+            stats.skipped += 1
+            return None
     dest_dir.mkdir(parents=True, exist_ok=True)
     # Telethon writes using the original filename. Per-task directories avoid
     # collisions and allow failed/cancelled partial files to be cleaned up.
@@ -327,6 +343,8 @@ async def _download_one(
         if final_path.exists():
             final_path = unique_path(final_path)
         saved_path.replace(final_path)
+        if history is not None and peer_id is not None:
+            history.mark_saved(peer_id, message.id, dest_dir.name, final_path)
     stats.saved += 1
     return final_path
 
@@ -341,6 +359,8 @@ async def _download_with_retry(
     skip_existing: bool,
     retries: int,
     chunk_concurrency: int = 1,
+    history: DownloadHistory | None = None,
+    peer_id: int | None = None,
 ) -> Path | None:
     for attempt in range(retries + 1):
         try:
@@ -348,6 +368,7 @@ async def _download_with_retry(
                 client, message, dest_dir, base,
                 skip_existing=skip_existing, stats=stats,
                 chunk_concurrency=chunk_concurrency,
+                history=history, peer_id=peer_id,
             )
         except FloodWaitError:
             raise
@@ -372,6 +393,8 @@ async def download_many(
     retries: int = 2,
     skip_existing: bool = True,
     chunk_concurrency: int = 1,
+    history: DownloadHistory | None = None,
+    peer_id: int | None = None,
 ) -> list[Path]:
     """Bounded multi-file concurrency (not parallel chunks of one video)."""
     if not 1 <= concurrency <= 8:
@@ -403,6 +426,7 @@ async def download_many(
                         client, message, dest_dir, base, stats,
                         skip_existing=skip_existing, retries=retries,
                         chunk_concurrency=chunk_concurrency,
+                        history=history, peer_id=peer_id,
                     )
                 )
             )
