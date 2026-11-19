@@ -153,6 +153,7 @@ async def cmd_download(args: argparse.Namespace) -> None:
             client,
             target=args.channel,
             download_dir=settings.download_dir,
+            temp_download_dir=settings.temp_download_dir,
             types=parse_types(args.type),
             limit=args.limit,
             since=parse_day(args.since),

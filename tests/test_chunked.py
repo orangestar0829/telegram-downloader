@@ -85,6 +85,54 @@ def test_chunked_completion_includes_io_stage_timings(tmp_path):
     assert "分块4路" in logs[0]
     assert "文件准备" in logs[0] and "分块传输" in logs[0] and "最终保存" in logs[0]
 
+
+def test_ssd_staging_then_atomic_publish_to_other_volume(tmp_path, monkeypatch):
+    from tgdl import downloader
+    from types import SimpleNamespace
+
+    data = b"z" * (16 * 1024 * 1024 + 17)
+    client = FakeClient(data)
+    message = SimpleNamespace(
+        id=99, media=SimpleNamespace(document=Document(len(data)))
+    )
+    output = tmp_path / "hdd" / "videos"
+    staging = tmp_path / "ssd" / "staging"
+    monkeypatch.setattr(downloader, "same_volume", lambda src, dst: False)
+    logs = []
+    result = asyncio.run(downloader._download_one(
+        client, message, output, "20261119_99",
+        skip_existing=True, stats=downloader.DownloadStats(),
+        chunk_concurrency=4, on_saved=logs.append,
+        temp_download_dir=staging,
+    ))
+    assert result is not None and result.read_bytes() == data
+    assert "最终保存" in logs[0]
+    assert not list(staging.glob("tgdl-*"))
+    assert not list(output.glob(".tgdl-publishing-*"))
+
+
+def test_staging_without_enough_space_falls_back_to_destination(tmp_path, monkeypatch):
+    from tgdl import downloader
+    from types import SimpleNamespace
+
+    data = b"x" * (16 * 1024 * 1024)
+    client = FakeClient(data)
+    message = SimpleNamespace(id=17, media=SimpleNamespace(document=Document(len(data))))
+    staging = tmp_path / "ssd"
+    original_usage = downloader.shutil.disk_usage
+    monkeypatch.setattr(
+        downloader.shutil, "disk_usage",
+        lambda path: SimpleNamespace(free=0),
+    )
+    output = tmp_path / "hdd"
+    saved = asyncio.run(downloader._download_one(
+        client, message, output, "20261119_17",
+        skip_existing=True, stats=downloader.DownloadStats(),
+        chunk_concurrency=4, temp_download_dir=staging,
+    ))
+    assert saved is not None and saved.read_bytes() == data
+    assert not list(staging.glob("tgdl-*"))
+
 def test_truncated_download_rejected(tmp_path):
     data = b"x" * (REQUEST_BYTES * 4)
     client = FakeClient(data[:-100])

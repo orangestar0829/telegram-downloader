@@ -177,6 +177,7 @@ class _App:
         self.api_hash_var = tk.StringVar(value=env["api_hash"])
         self.phone_var = tk.StringVar(value=env["phone"])
         self.download_dir_var = tk.StringVar(value=env["download_dir"] or str(default_download_dir()))
+        self.temp_download_dir_var = tk.StringVar(value=env["temp_download_dir"])
         self.proxy_host_var = tk.StringVar(value=env["proxy_host"])
         self.proxy_port_var = tk.StringVar(value=env["proxy_port"])
         self.proxy_username_var = tk.StringVar(value=env["proxy_username"])
@@ -667,6 +668,7 @@ class _App:
                 concurrency=concurrency,
                 retries=retries,
                 chunk_concurrency=chunk_concurrency,
+                temp_download_dir=self.settings.temp_download_dir,
             )
             print("保存完成。点『打开下载文件夹』查看。\n")
 
@@ -1029,6 +1031,7 @@ class _App:
                     self.client,
                     target=target,
                     download_dir=self.settings.download_dir,
+                    temp_download_dir=self.settings.temp_download_dir,
                     types=parse_types(types_raw),
                     limit=int(limit) if limit else None,
                     since=None,
@@ -1212,6 +1215,7 @@ class _App:
             ("代理用户名（可空）", self.proxy_username_var, False),
             ("代理密码（可空）", self.proxy_password_var, True),
             ("下载目录", self.download_dir_var, False),
+            ("分块临时目录（建议 SSD，留空=下载目录）", self.temp_download_dir_var, False),
         )
         for row, (name, var, secret) in enumerate(fields):
             ttk.Label(win, text=name).grid(row=row, column=0, sticky="w", **pad)
@@ -1242,6 +1246,7 @@ class _App:
                 "api_hash": self.api_hash_var.get().strip(),
                 "phone": self.phone_var.get().strip(),
                 "download_dir": self.download_dir_var.get().strip() or str(default_download_dir()),
+                "temp_download_dir": self.temp_download_dir_var.get().strip(),
                 "proxy_host": host,
                 "proxy_port": port,
                 "proxy_username": self.proxy_username_var.get().strip(),

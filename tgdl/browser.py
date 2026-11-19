@@ -101,6 +101,7 @@ async def save_items(
     concurrency: int = 3,
     retries: int = 2,
     chunk_concurrency: int = 1,
+    temp_download_dir: Path | None = None,
 ) -> SaveResult:
     """Download the full-quality files for the selected media items."""
     folder = _folder_for(download_dir, title)
@@ -122,6 +123,7 @@ async def save_items(
         client, jobs(), stats=stats, concurrency=concurrency,
         retries=retries, skip_existing=skip_existing,
         chunk_concurrency=chunk_concurrency,
+        temp_download_dir=temp_download_dir,
     )
     result = SaveResult(
         saved=stats.saved, skipped=stats.skipped, failed=stats.failed,
