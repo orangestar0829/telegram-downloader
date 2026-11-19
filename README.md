@@ -290,6 +290,14 @@ telegram-media-downloader/
 更新时替换程序文件，保留整个 `data/` 目录。安装版仍将数据存入用户目录，
 避免写入 Program Files 失败。
 
+**多频道监控**：GUI 的「多频道监控」页可将当前选中或手动输入的频道
+加入监控列表，为每个频道设置独立的扫描间隔（1～1440 分钟）及媒体类型。
+列表可暂停、启用、删除频道。设置保存在 `data/monitored_channels.json`
+（安装版为用户数据目录），重启后保留；启动监控需要手动点击。
+所有频道共用一个 Telegram 客户端、下载队列和 SQLite 下载历史，
+同一时间只运行一个频道扫描；繁忙时到期的频道顺延执行。
+旧版单频道定时下载仍可使用，但两种定时模式不可同时运行。
+
 CHUNK_CONCURRENCY 默认 1，设置为 2/4/8 后对不小于 16 MiB 的 Telegram Document 启用 Telethon iter_download 的并行字节区间读取。每段有严格长度校验，只有全部区间下载成功才将临时文件移动为最终文件。纯字节拼接，不需 FFmpeg，不重新编码；较小文件及普通相册图片仍由标准下载流程处理。文件并发与分块并发独立，但会叠加网络请求；不保证速度提升。
 
 命令行：python -m tgdl download -c GROUP_ID --concurrency 3 --chunk-concurrency 4 --retries 2

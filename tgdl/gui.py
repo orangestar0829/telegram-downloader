@@ -18,6 +18,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from tgdl.browser import list_media, save_items
@@ -33,6 +34,7 @@ from tgdl.config import (
 )
 from tgdl.downloader import download_channel, resolve_channel
 from tgdl.log_format import TimestampedLines
+from tgdl.monitor import load_channels, save_channels
 
 from tgdl import downloader as _downloader
 from tgdl import http_fetch as _http_fetch
@@ -191,6 +193,14 @@ class _App:
         self._auto_job_id = None
         self._auto_config = None
         self._download_future = None
+        try:
+            self._monitored = load_channels()
+        except (ValueError, OSError) as exc:
+            self._monitored = []
+            self.log_queue.put(f"[监控] 配置读取失败：{exc}\n")
+        self._monitor_next: dict[str, float] = {}
+        self._monitor_job = None
+        self._monitor_active = False
 
         # gallery state
         self.g_limit = tk.StringVar(value="60")
@@ -285,6 +295,7 @@ class _App:
         )
         nb.add(self._build_gallery_tab(), text="浏览媒体(选图/视频)")
         nb.add(self._build_download_tab(), text="批量下载")
+        nb.add(self._build_monitor_tab(), text="多频道监控")
         nb.add(self._build_parse_tab(), text="解析链接(高级)")
 
         # Download folder row.
@@ -299,6 +310,127 @@ class _App:
         logframe.pack(fill="both", expand=True, **pad)
         self.log = self.scrolledtext.ScrolledText(logframe, height=8, wrap="word", state="disabled")
         self.log.pack(fill="both", expand=True, padx=4, pady=4)
+
+    def _build_monitor_tab(self):
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.Frame(self.root)
+        controls = ttk.Frame(frame)
+        controls.pack(fill="x", padx=6, pady=4)
+        ttk.Label(controls, text="扫描间隔(分钟)").pack(side="left")
+        self.monitor_minutes_var = tk.StringVar(value="15")
+        ttk.Entry(controls, textvariable=self.monitor_minutes_var, width=6).pack(side="left", padx=5)
+        ttk.Button(controls, text="添加当前频道", command=self._monitor_add).pack(side="left")
+        ttk.Button(controls, text="删除所选", command=self._monitor_remove).pack(side="left", padx=5)
+        ttk.Button(controls, text="启用/暂停所选", command=self._monitor_toggle).pack(side="left")
+        columns = ("target", "minutes", "enabled", "next")
+        self.monitor_tree = ttk.Treeview(frame, columns=columns, show="headings", height=7)
+        for column, label, width in (
+            ("target", "频道 ID / 用户名", 220),
+            ("minutes", "间隔(分钟)", 95),
+            ("enabled", "状态", 85),
+            ("next", "下次扫描", 145),
+        ):
+            self.monitor_tree.heading(column, text=label)
+            self.monitor_tree.column(column, width=width)
+        self.monitor_tree.pack(fill="both", expand=True, padx=6)
+        actions = ttk.Frame(frame)
+        actions.pack(fill="x", padx=6, pady=4)
+        self.monitor_button = ttk.Button(actions, text="启动全部监控", command=self._monitor_start_stop)
+        self.monitor_button.pack(side="left")
+        ttk.Label(actions, text="重启后保留频道配置；需手动启动监控", foreground="#555").pack(side="left", padx=10)
+        self._monitor_refresh()
+        return frame
+
+    def _monitor_refresh(self):
+        self.monitor_tree.delete(*self.monitor_tree.get_children())
+        for index, item in enumerate(self._monitored):
+            due = self._monitor_next.get(item["target"])
+            next_time = time.strftime("%H:%M:%S", time.localtime(due)) if due and item["enabled"] and self._monitor_active else "-"
+            self.monitor_tree.insert("", "end", iid=str(index), values=(
+                item["target"], item["minutes"],
+                "启用" if item["enabled"] else "暂停", next_time,
+            ))
+
+    def _monitor_add(self):
+        target = self._selected_target()
+        if not target:
+            self.messagebox.showwarning("监控", "请先选择或输入频道")
+            return
+        try:
+            minutes = int(self.monitor_minutes_var.get())
+            if not 1 <= minutes <= 1440:
+                raise ValueError
+        except ValueError:
+            self.messagebox.showwarning("监控", "间隔应为 1～1440 分钟")
+            return
+        types = self._types_string()
+        if not types:
+            self.messagebox.showwarning("监控", "至少选择一种下载类型")
+            return
+        self._monitored = [item for item in self._monitored if item["target"] != target]
+        self._monitored.append({"target": target, "minutes": minutes, "types": types, "enabled": True})
+        self._monitor_next[target] = time.time()
+        save_channels(self._monitored)
+        self._monitor_refresh()
+
+    def _monitor_selected_index(self):
+        selected = self.monitor_tree.selection()
+        return int(selected[0]) if selected else None
+
+    def _monitor_remove(self):
+        index = self._monitor_selected_index()
+        if index is not None:
+            item = self._monitored.pop(index)
+            self._monitor_next.pop(item["target"], None)
+            save_channels(self._monitored)
+            self._monitor_refresh()
+
+    def _monitor_toggle(self):
+        index = self._monitor_selected_index()
+        if index is not None:
+            item = self._monitored[index]
+            item["enabled"] = not item["enabled"]
+            self._monitor_next[item["target"]] = time.time()
+            save_channels(self._monitored)
+            self._monitor_refresh()
+
+    def _monitor_start_stop(self):
+        self._monitor_active = not self._monitor_active
+        if self._monitor_active:
+            self._stop_auto() if self._auto_config is not None else None
+            self._monitor_next = {item["target"]: time.time() for item in self._monitored}
+            self.monitor_button.config(text="停止全部监控")
+            self._log("[监控] 多频道监控已启动\n")
+            self._monitor_tick()
+        else:
+            if self._monitor_job is not None:
+                self.root.after_cancel(self._monitor_job)
+                self._monitor_job = None
+            self.monitor_button.config(text="启动全部监控")
+            self._log("[监控] 已停止调度，正在下载的任务不受影响\n")
+            self._monitor_refresh()
+
+    def _monitor_tick(self):
+        self._monitor_job = None
+        if not self._monitor_active:
+            return
+        now = time.time()
+        busy = self._download_future is not None and not self._download_future.done()
+        if not busy:
+            for item in self._monitored:
+                if not item["enabled"] or self._monitor_next.get(item["target"], 0) > now:
+                    continue
+                try:
+                    concurrency, retries, chunks = self._media_options()
+                except ValueError as exc:
+                    self._log(f"[监控] 设置错误：{exc}\n")
+                    break
+                self._monitor_next[item["target"]] = now + item["minutes"] * 60
+                self._log(f"[监控] 开始扫描 {item['target']}，间隔 {item['minutes']} 分钟\n")
+                self._start_channel_download(item["target"], item["types"], "", concurrency, retries, chunks)
+                break
+        self._monitor_refresh()
+        self._monitor_job = self.root.after(1000, self._monitor_tick)
 
     def _build_gallery_tab(self):
         tk, ttk = self.tk, self.ttk
@@ -759,6 +891,8 @@ class _App:
         if self._auto_config is not None:
             self._stop_auto()
             return
+        if self._monitor_active:
+            self._monitor_start_stop()
         target = self._selected_target()
         types_raw = self._types_string()
         if not target or not types_raw:
@@ -918,6 +1052,8 @@ class _App:
 
     # ---------- lifecycle ----------
     def _on_close(self) -> None:
+        if self._monitor_active:
+            self._monitor_start_stop()
         if self._auto_config is not None:
             self._stop_auto()
         sys.stdout, sys.stderr = self._stdout, self._stderr
