@@ -1,0 +1,48 @@
+name: Build Windows preview for PR
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-preview:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller pytest
+      - name: Run offline tests
+        run: python -m pytest -q
+      - name: Check cryptg and SOCKS5
+        run: python -c "import cryptg, python_socks, telethon; print('Telethon', telethon.__version__)"
+      - name: Build Windows executable
+        run: pyinstaller --noconfirm packaging/tgdl.spec
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+      - name: Package Windows installer and portable ZIP
+        shell: pwsh
+        run: |
+          $version = "pr-${{ github.event.pull_request.number || 'manual' }}-${{ github.run_number }}"
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) { $makensis = "makensis" }
+          & $makensis "/DVERSION=$version" packaging/installer.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path dist/TelegramDownloader -DestinationPath "TelegramDownloader-$version-portable-win64.zip" -Force
+      - name: Upload PR-only Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TelegramDownloader-PR-${{ github.event.pull_request.number || 'manual' }}-Windows
+          path: |
+            TelegramDownloader-Setup-pr-*.exe
+            TelegramDownloader-pr-*-portable-win64.zip
+          if-no-files-found: error
+          retention-days: 30

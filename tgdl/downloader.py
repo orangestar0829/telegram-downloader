@@ -24,7 +24,9 @@ from telethon.tl.types import (
 )
 from tqdm import tqdm
 
-from tgdl.chunked import chunkable_document, document_suffix, download_chunked
+from tgdl.chunked import (
+    ChunkDownloadStalled, chunkable_document, document_suffix, download_chunked,
+)
 
 PHOTO_TYPES = {"photo"}
 VIDEO_TYPES = {"video", "animation"}
@@ -293,10 +295,22 @@ async def _download_one(
             target = download_target(message)
             document = chunkable_document(target, chunk_concurrency)
             if document is not None and callable(getattr(client, "iter_download", None)):
-                saved = await download_chunked(
-                    client, document, Path(temporary) / ("data" + document_suffix(document)),
-                    parts=chunk_concurrency, on_bytes=bar.update,
-                )
+                print(f"[分块] 开始 {base}: {document.size / 1048576:.1f} MiB, "
+                      f"{chunk_concurrency} 路并发")
+                try:
+                    saved = await download_chunked(
+                        client, document, Path(temporary) / ("data" + document_suffix(document)),
+                        parts=chunk_concurrency, on_bytes=bar.update,
+                    )
+                except ChunkDownloadStalled as exc:
+                    print(f"[分块] {base} 超时/失败: {exc}; 自动退回普通下载")
+                    # Do not publish the preallocated/partial chunked file.
+                    saved = await client.download_media(
+                        target, file=str(Path(temporary) / ("normal" + document_suffix(document))),
+                        progress_callback=progress,
+                    )
+                else:
+                    print(f"[分块] {base} 完成，写入最终文件")
             else:
                 saved = await client.download_media(
                     target, file=str(temporary), progress_callback=progress,

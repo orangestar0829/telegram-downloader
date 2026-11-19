@@ -147,6 +147,8 @@ class _App:
         self.client = None
         self.settings: Settings | None = None
         self.log_queue: "queue.Queue[str]" = queue.Queue()
+        self._log_popup = None
+        self._log_popup_text = None
 
         self.root = tk.Tk()
         self.root.title("Telegram 下载器")
@@ -265,8 +267,13 @@ class _App:
         ttk.Entry(side, textvariable=self.manual_var, width=22).pack(fill="x", pady=2)
 
         # Download / advanced tabs.
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill="x", **pad)
+        tabs_row = ttk.Frame(self.root)
+        tabs_row.pack(fill="x", **pad)
+        nb = ttk.Notebook(tabs_row)
+        nb.pack(side="left", fill="x", expand=True)
+        ttk.Button(tabs_row, text="查看日志", command=self._open_log_window).pack(
+            side="right", padx=(8, 0)
+        )
         nb.add(self._build_gallery_tab(), text="浏览媒体(选图/视频)")
         nb.add(self._build_download_tab(), text="批量下载")
         nb.add(self._build_parse_tab(), text="解析链接(高级)")
@@ -467,13 +474,42 @@ class _App:
         try:
             while True:
                 chunk = self.log_queue.get_nowait()
-                self.log.configure(state="normal")
-                self.log.insert("end", chunk)
-                self.log.see("end")
-                self.log.configure(state="disabled")
+                self._append_to_log(self.log, chunk)
+                if self._log_popup_text is not None:
+                    self._append_to_log(self._log_popup_text, chunk)
         except queue.Empty:
             pass
         self.root.after(100, self._drain_log)
+
+    @staticmethod
+    def _append_to_log(widget, chunk: str) -> None:
+        widget.configure(state="normal")
+        widget.insert("end", chunk)
+        widget.see("end")
+        widget.configure(state="disabled")
+
+    def _open_log_window(self) -> None:
+        """Show complete live log even if the main window is short."""
+        if self._log_popup is not None and self._log_popup.winfo_exists():
+            self._log_popup.lift()
+            return
+        win = self.tk.Toplevel(self.root)
+        win.title("Telegram 下载器 - 实时日志")
+        win.geometry("850x480")
+        view = self.scrolledtext.ScrolledText(win, wrap="word", state="normal")
+        view.pack(fill="both", expand=True, padx=8, pady=8)
+        view.insert("1.0", self.log.get("1.0", "end-1c"))
+        view.see("end")
+        view.configure(state="disabled")
+        self._log_popup = win
+        self._log_popup_text = view
+
+        def on_close() -> None:
+            self._log_popup_text = None
+            self._log_popup = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
 
     def _set_status(self, text: str) -> None:
         self.root.after(0, lambda: self.status_var.set(text))

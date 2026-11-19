@@ -256,6 +256,16 @@ telegram-media-downloader/
 
 ### 单文件分块并发下载
 
+**PR 预览构建**：向 `main` 提交 Pull Request 时，`.github/workflows/pr-windows-build.yml`
+会在 Windows runner 上测试并生成安装版 EXE 与便携版 ZIP，作为 Actions Artifacts 保存 30 天，
+不修改 `main`，也不发布正式 Release。PR 包默认不包含 Telegram API 凭据；
+可沿用旧版的 `.env` 和有效 Session。
+
+**分块稳定性**：每个分块等待数据超过 45 秒会重试（最多两次），
+分块持续失败则自动退回 Telethon 普通下载。日志中显示分块累计已接收量与百分比，
+主界面新增「查看日志」独立窗口。预分配的 `data.mp4` 不代表下载完成；
+只有所有区间验证成功才会移入最终目录。
+
 CHUNK_CONCURRENCY 默认 1，设置为 2/4/8 后对不小于 16 MiB 的 Telegram Document 启用 Telethon iter_download 的并行字节区间读取。每段有严格长度校验，只有全部区间下载成功才将临时文件移动为最终文件。纯字节拼接，不需 FFmpeg，不重新编码；较小文件及普通相册图片仍由标准下载流程处理。文件并发与分块并发独立，但会叠加网络请求；不保证速度提升。
 
 命令行：python -m tgdl download -c GROUP_ID --concurrency 3 --chunk-concurrency 4 --retries 2
