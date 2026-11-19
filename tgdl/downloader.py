@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import re
+import tempfile
+from collections.abc import AsyncIterable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -197,6 +200,8 @@ async def download_channel(
     until: datetime | None,
     skip_existing: bool = True,
     dry_run: bool = False,
+    concurrency: int = 3,
+    retries: int = 2,
 ) -> DownloadStats:
     entity = await resolve_channel(client, target)
     title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
@@ -215,50 +220,42 @@ async def download_channel(
     print(f"Types:   {', '.join(sorted(types))}")
 
     stats = DownloadStats()
-    offset_date = until
     scanned = 0
 
-    async for message in client.iter_messages(entity, offset_date=offset_date):
-        if limit is not None and scanned >= limit:
-            break
-        if not isinstance(message, Message) or message.date is None:
-            continue
-        msg_date = message.date if message.date.tzinfo else message.date.replace(tzinfo=timezone.utc)
-        if since is not None and msg_date < since:
-            break
+    async def jobs():
+        nonlocal scanned
+        async for message in client.iter_messages(entity, offset_date=until):
+            if limit is not None and scanned >= limit:
+                break
+            if not isinstance(message, Message) or message.date is None:
+                continue
+            msg_date = message.date if message.date.tzinfo else message.date.replace(tzinfo=timezone.utc)
+            if since is not None and msg_date < since:
+                break
+            kind = classify_message(message)
+            if kind is None or kind not in types:
+                continue
+            scanned += 1
+            base = f"{msg_date.strftime('%Y%m%d')}_{message.id}"
+            if dry_run:
+                origin = media_origin(message)
+                sender = getattr(message, "sender", None)
+                sender_name = getattr(sender, "username", None) or getattr(sender, "first_name", None) or "-"
+                preview = (message.raw_text or "").replace("\n", " ")[:60]
+                print(f"{base}  {kind:<10}  {origin:<13}  @{sender_name}  {preview}")
+                stats.saved += 1
+                continue
+            dest_dir = photos_dir if kind == "photo" else videos_dir
+            yield message, dest_dir, base
 
-        kind = classify_message(message)
-        if kind is None or kind not in types:
-            continue
-
-        scanned += 1
-        origin = media_origin(message)
-        date_prefix = msg_date.strftime("%Y%m%d")
-        base = f"{date_prefix}_{message.id}"
-        if dry_run:
-            sender = getattr(message, "sender", None)
-            sender_name = getattr(sender, "username", None) or getattr(sender, "first_name", None) or "-"
-            preview = (message.raw_text or "").replace("\n", " ")[:60]
-            print(f"{base}  {kind:<10}  {origin:<13}  @{sender_name}  {preview}")
-            stats.saved += 1
-            continue
-
-        dest_dir = photos_dir if kind == "photo" else videos_dir
-        try:
-            await _download_one(
-                client,
-                message,
-                dest_dir,
-                base,
-                skip_existing=skip_existing,
-                stats=stats,
-            )
-        except FloodWaitError as exc:
-            print(f"\nRate limited. Wait {exc.seconds}s then retry this channel.")
-            raise
-        except Exception as exc:
-            stats.failed += 1
-            print(f"\nFailed message {message.id}: {exc}")
+    try:
+        await download_many(
+            client, jobs(), stats=stats, concurrency=concurrency,
+            retries=retries, skip_existing=skip_existing,
+        )
+    except FloodWaitError as exc:
+        print(f"\nRate limited. Wait {exc.seconds}s then retry this channel.")
+        raise
 
     print(
         f"\nDone. saved={stats.saved} skipped={stats.skipped} failed={stats.failed} matched={scanned}"
@@ -274,37 +271,115 @@ async def _download_one(
     *,
     skip_existing: bool,
     stats: DownloadStats,
-) -> None:
-    existing = list(dest_dir.glob(f"{base}.*"))
-    if skip_existing and existing:
+) -> Path | None:
+    if skip_existing and any(dest_dir.glob(f"{base}.*")):
         stats.skipped += 1
-        return
+        return None
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    # Telethon writes using the original filename. Per-task directories avoid
+    # collisions and allow failed/cancelled partial files to be cleaned up.
+    with tempfile.TemporaryDirectory(prefix="tgdl-", dir=dest_dir) as temporary:
+        with tqdm(unit="B", unit_scale=True, desc=base, leave=False) as bar:
+            def progress(current: int, total: int) -> None:
+                bar.total = total or bar.total
+                bar.n = current
+                bar.refresh()
 
-    with tqdm(unit="B", unit_scale=True, desc=base, leave=False) as bar:
-        def progress(current: int, total: int) -> None:
-            bar.total = total or bar.total
-            bar.n = current
-            bar.refresh()
-
-        saved = await client.download_media(
-            download_target(message),
-            file=str(dest_dir),
-            progress_callback=progress,
-        )
-
-    if not saved:
-        stats.failed += 1
-        return
-
-    saved_path = Path(saved)
-    suffix = saved_path.suffix or ".bin"
-    final_path = dest_dir / f"{base}{suffix}"
-    if skip_existing and final_path.exists() and saved_path != final_path:
-        saved_path.unlink(missing_ok=True)
-        stats.skipped += 1
-        return
-    if final_path.exists() and final_path != saved_path:
-        final_path = unique_path(final_path)
-    if saved_path != final_path:
+            saved = await client.download_media(
+                download_target(message),
+                file=str(temporary),
+                progress_callback=progress,
+            )
+        if not saved:
+            stats.failed += 1
+            return None
+        saved_path = Path(saved)
+        suffix = saved_path.suffix or ".bin"
+        final_path = dest_dir / f"{base}{suffix}"
+        if skip_existing and final_path.exists():
+            stats.skipped += 1
+            return None
+        if final_path.exists():
+            final_path = unique_path(final_path)
         saved_path.replace(final_path)
     stats.saved += 1
+    return final_path
+
+
+async def _download_with_retry(
+    client: TelegramClient,
+    message: Message,
+    dest_dir: Path,
+    base: str,
+    stats: DownloadStats,
+    *,
+    skip_existing: bool,
+    retries: int,
+) -> Path | None:
+    for attempt in range(retries + 1):
+        try:
+            return await _download_one(
+                client, message, dest_dir, base,
+                skip_existing=skip_existing, stats=stats,
+            )
+        except FloodWaitError:
+            raise
+        except Exception as exc:
+            if attempt >= retries:
+                stats.failed += 1
+                print(f"Failed message {getattr(message, 'id', '?')}: {exc}")
+                return None
+            delay = min(2 ** attempt, 8)
+            print(f"Retry message {getattr(message, 'id', '?')} "
+                  f"({attempt + 1}/{retries}) in {delay}s: {exc}")
+            await asyncio.sleep(delay)
+    return None
+
+
+async def download_many(
+    client: TelegramClient,
+    jobs: AsyncIterable[tuple[Message, Path, str]],
+    *,
+    stats: DownloadStats,
+    concurrency: int = 3,
+    retries: int = 2,
+    skip_existing: bool = True,
+) -> list[Path]:
+    """Bounded multi-file concurrency (not parallel chunks of one video)."""
+    if not 1 <= concurrency <= 8:
+        raise ValueError("concurrency must be between 1 and 8")
+    if not 0 <= retries <= 5:
+        raise ValueError("retries must be between 0 and 5")
+    pending: set[asyncio.Task[Path | None]] = set()
+    saved: list[Path] = []
+
+    async def collect_one() -> None:
+        nonlocal pending
+        finished, pending = await asyncio.wait(
+            pending, return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in finished:
+            path = task.result()  # propagate FloodWaitError; stop remaining work
+            if path is not None:
+                saved.append(path)
+
+    try:
+        async for message, dest_dir, base in jobs:
+            while len(pending) >= concurrency:
+                await collect_one()
+            pending.add(
+                asyncio.create_task(
+                    _download_with_retry(
+                        client, message, dest_dir, base, stats,
+                        skip_existing=skip_existing, retries=retries,
+                    )
+                )
+            )
+        while pending:
+            await collect_one()
+    finally:
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+    return saved
