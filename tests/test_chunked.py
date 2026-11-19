@@ -74,16 +74,23 @@ def test_chunked_completion_includes_io_stage_timings(tmp_path):
     message = SimpleNamespace(id=42, media=SimpleNamespace(document=document))
     stats = downloader.DownloadStats()
     logs = []
+    events = []
     target = asyncio.run(downloader._download_one(
         client, message, tmp_path, "20261119_42",
         skip_existing=True, stats=stats, chunk_concurrency=4,
         on_saved=logs.append,
+        on_progress=lambda *values: events.append(values),
     ))
     assert target is not None and target.read_bytes() == data
     assert not list(tmp_path.glob("tgdl-*"))
     assert stats.saved == 1
     assert "分块4路" in logs[0]
     assert "文件准备" in logs[0] and "分块传输" in logs[0] and "最终保存" in logs[0]
+    assert any(event[4] == "下载中" and event[2] > 0 for event in events)
+    assert any(event[4] == "正在保存" for event in events)
+    assert events[-1][4] == "完成"
+    assert events[-1][2] == len(data)
+    assert events[-1][3] == len(data)
 
 
 def test_ssd_staging_then_atomic_publish_to_other_volume(tmp_path, monkeypatch):

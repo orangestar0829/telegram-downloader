@@ -33,6 +33,7 @@ from tgdl.chunked import (
 )
 from tgdl.cache_budget import optional_staging_reservation
 from tgdl.history import DownloadHistory
+from tgdl.progress import ProgressCallback, TransferProgress
 from tgdl.temp_cleanup import own_temporary
 
 PHOTO_TYPES = {"photo"}
@@ -234,6 +235,7 @@ async def download_channel(
     stop_event: threading.Event | None = None,
     on_channel_resolved: Callable[[str, int], None] | None = None,
     temp_download_dir: Path | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> DownloadStats:
     entity = await resolve_channel(client, target)
     title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
@@ -324,6 +326,7 @@ async def download_channel(
                     skip_existing=True, retries=retries, chunk_concurrency=chunk_concurrency,
                     history=history, peer_id=peer_id, on_saved=saved_with_source,
                     temp_download_dir=temp_download_dir,
+                    on_progress=on_progress,
                 )
             except Exception as exc:
                 print(f"[监控] 重试消息 {failed_id} 失败：{exc}")
@@ -397,6 +400,7 @@ async def download_channel(
                 on_saved=saved_with_source,
                 stop_event=stop_event,
                 temp_download_dir=temp_download_dir,
+                on_progress=on_progress,
             )
             if monitored and history is not None:
                 # A failed download is durably queued before committing cursor.
@@ -444,6 +448,7 @@ async def _download_one(
     peer_id: int | None = None,
     on_saved: Callable[[str], None] | None = None,
     temp_download_dir: Path | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> Path | None:
     if skip_existing:
         if history is not None and peer_id is not None and history.contains(peer_id, message.id):
@@ -463,6 +468,13 @@ async def _download_one(
     target = download_target(message)
     document = chunkable_document(target, chunk_concurrency)
     use_chunks = document is not None and callable(getattr(client, "iter_download", None))
+    transfer = TransferProgress(
+        f"{peer_id or 0}:{message.id}:{base}",
+        f"{dest_dir.parent.name} / {base}",
+        on_progress,
+    )
+    transfer.emit("等待缓存" if use_chunks and temp_download_dir is not None else "准备下载",
+                  total=int(document.size) if document is not None else None, force=True)
     temp_parent = dest_dir
     if use_chunks and temp_download_dir is not None:
         candidate = Path(temp_download_dir).expanduser()
@@ -474,6 +486,7 @@ async def _download_one(
         temp_parent if use_chunks and temp_download_dir is not None else None,
         int(document.size) if use_chunks else 0,
     ) as cache_lease:
+        transfer.emit("准备文件")
         with tempfile.TemporaryDirectory(prefix="tgdl-", dir=temp_parent) as temporary:
             with own_temporary(Path(temporary)):
                 if cache_lease is not None:
@@ -483,17 +496,21 @@ async def _download_one(
                         bar.total = total or bar.total
                         bar.n = current
                         bar.refresh()
+                        transfer.emit("下载中", done=current, total=total)
 
                     if use_chunks:
                         chunk_output = Path(temporary) / ("data" + document_suffix(document))
                         try:
                             saved = await download_chunked(
                                 client, document, chunk_output,
-                                parts=chunk_concurrency, on_bytes=bar.update,
+                                parts=chunk_concurrency, on_bytes=lambda n: (
+                                    bar.update(n), transfer.advance(n)
+                                ),
                                 timings=chunk_timings,
                             )
                         except ChunkDownloadStalled as exc:
                             chunk_timings.clear()
+                            transfer.emit("普通下载回退", done=0, force=True)
                             print(f"[分块] {base} 超时/失败: {exc}; 自动退回普通下载")
                             # The chunked file is preallocated at full size.
                             # Delete it BEFORE normal fallback, so SSD staging
@@ -511,6 +528,7 @@ async def _download_one(
                         )
                 if not saved:
                     stats.failed += 1
+                    transfer.emit("失败", force=True)
                     return None
                 saved_path = Path(saved)
                 suffix = saved_path.suffix or ".bin"
@@ -521,6 +539,7 @@ async def _download_one(
                 if final_path.exists():
                     final_path = unique_path(final_path)
                 publish_started = time.monotonic()
+                transfer.emit("正在保存", force=True)
                 # Moving within a volume is a rename, not a full media copy.
                 if not same_volume(saved_path, dest_dir):
                     # On cross-volume moves, first copy sequentially to a hidden
@@ -547,6 +566,7 @@ async def _download_one(
                 if history is not None and peer_id is not None:
                     history.mark_saved(peer_id, message.id, dest_dir.name, final_path)
     stats.saved += 1
+    transfer.emit("完成", force=True)
     elapsed = max(time.monotonic() - started, 0.001)
     size_mib = final_path.stat().st_size / 1048576
     detail = (f"[下载完成] {final_path.name} | {size_mib:.1f} MiB | "
@@ -578,6 +598,7 @@ async def _download_with_retry(
     peer_id: int | None = None,
     on_saved: Callable[[str], None] | None = None,
     temp_download_dir: Path | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> Path | None:
     for attempt in range(retries + 1):
         try:
@@ -588,15 +609,30 @@ async def _download_with_retry(
                 history=history, peer_id=peer_id,
                 on_saved=on_saved,
                 temp_download_dir=temp_download_dir,
+                on_progress=on_progress,
             )
+        except asyncio.CancelledError:
+            if on_progress is not None:
+                on_progress(f"{peer_id or 0}:{message.id}:{base}",
+                            f"{dest_dir.parent.name} / {base}", 0, 0, "已取消")
+            raise
         except FloodWaitError:
+            if on_progress is not None:
+                on_progress(f"{peer_id or 0}:{message.id}:{base}",
+                            f"{dest_dir.parent.name} / {base}", 0, 0, "限流等待")
             raise
         except Exception as exc:
             if attempt >= retries:
                 stats.failed += 1
+                if on_progress is not None:
+                    on_progress(f"{peer_id or 0}:{message.id}:{base}",
+                                f"{dest_dir.parent.name} / {base}", 0, 0, "失败")
                 print(f"Failed message {getattr(message, 'id', '?')}: {exc}")
                 return None
             delay = min(2 ** attempt, 8)
+            if on_progress is not None:
+                on_progress(f"{peer_id or 0}:{message.id}:{base}",
+                            f"{dest_dir.parent.name} / {base}", 0, 0, "重试等待")
             print(f"Retry message {getattr(message, 'id', '?')} "
                   f"({attempt + 1}/{retries}) in {delay}s: {exc}")
             await asyncio.sleep(delay)
@@ -617,6 +653,7 @@ async def download_many(
     on_saved: Callable[[str], None] | None = None,
     stop_event: threading.Event | None = None,
     temp_download_dir: Path | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> list[Path]:
     """Bounded multi-file concurrency (not parallel chunks of one video)."""
     if not 1 <= concurrency <= 8:
@@ -653,6 +690,7 @@ async def download_many(
                         history=history, peer_id=peer_id,
                         on_saved=on_saved,
                         temp_download_dir=temp_download_dir,
+                        on_progress=on_progress,
                     )
                 )
             )

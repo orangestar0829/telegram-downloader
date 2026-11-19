@@ -161,6 +161,8 @@ class _App:
         self.settings: Settings | None = None
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.download_queue: "queue.Queue[str]" = queue.Queue()
+        self.progress_queue: "queue.Queue[tuple[str, str, int, int, str]]" = queue.Queue()
+        self._progress_entries: dict[str, dict] = {}
         self._log_popup = None
         self._log_popup_text = None
         self._download_popup = None
@@ -330,8 +332,26 @@ class _App:
         ttk.Button(folder, text="更改", command=self._change_dir).pack(side="left")
         ttk.Button(folder, text="打开下载文件夹", command=self._open_folder).pack(side="left", padx=6)
 
-        logframe = ttk.LabelFrame(self.root, text="日志")
+        logframe = ttk.LabelFrame(self.root, text="日志和实时进度")
         logframe.pack(fill="both", expand=True, **pad)
+        progress_frame = ttk.LabelFrame(logframe, text="当前下载进度（实时）")
+        progress_frame.pack(fill="x", padx=4, pady=(4, 2))
+        self.progress_summary = tk.StringVar(value="当前没有正在下载的文件")
+        ttk.Label(progress_frame, textvariable=self.progress_summary).pack(anchor="w", padx=5, pady=(2, 0))
+        progress_cols = ("file", "progress", "speed", "status")
+        self.progress_tree = ttk.Treeview(
+            progress_frame, columns=progress_cols, show="headings", height=3,
+            selectmode="none",
+        )
+        for column, title, width in (
+            ("file", "群组 / 文件", 270),
+            ("progress", "下载进度", 240),
+            ("speed", "速度", 100),
+            ("status", "状态", 100),
+        ):
+            self.progress_tree.heading(column, text=title)
+            self.progress_tree.column(column, width=width, stretch=(column == "file"))
+        self.progress_tree.pack(fill="x", padx=5, pady=(1, 4))
         toolbar = ttk.Frame(logframe)
         toolbar.pack(fill="x", padx=4, pady=(4, 0))
         self.log_tabs = ttk.Notebook(logframe)
@@ -340,9 +360,9 @@ class _App:
         downloads_tab = ttk.Frame(self.log_tabs)
         self.log_tabs.add(runtime_tab, text="运行日志")
         self.log_tabs.add(downloads_tab, text="下载记录")
-        self.log = self.scrolledtext.ScrolledText(runtime_tab, height=8, wrap="word", state="disabled")
+        self.log = self.scrolledtext.ScrolledText(runtime_tab, height=5, wrap="word", state="disabled")
         self.log.pack(fill="both", expand=True)
-        self.download_log = self.scrolledtext.ScrolledText(downloads_tab, height=8, wrap="word", state="disabled")
+        self.download_log = self.scrolledtext.ScrolledText(downloads_tab, height=5, wrap="word", state="disabled")
         self.download_log.pack(fill="both", expand=True)
         ttk.Button(toolbar, text="跳转最新", command=self._jump_to_latest_log).pack(side="right", padx=3)
         ttk.Button(toolbar, text="放大查看", command=self._open_active_log_window).pack(side="right", padx=3)
@@ -686,6 +706,7 @@ class _App:
                 retries=retries,
                 chunk_concurrency=chunk_concurrency,
                 temp_download_dir=self.settings.temp_download_dir,
+                on_progress=self._update_download_progress,
             )
             print("保存完成。点『打开下载文件夹』查看。\n")
 
@@ -754,7 +775,67 @@ class _App:
     def _log_download(self, text: str) -> None:
         self.download_queue.put(self._download_timestamp_formatter.format(text + "\n"))
 
+    def _update_download_progress(self, key: str, label: str, done: int, total: int, status: str) -> None:
+        """Called from background downloads; only enqueue, never touch Tk."""
+        self.progress_queue.put((key, label, done, total, status))
+
+    def _drain_progress(self) -> None:
+        now = time.monotonic()
+        latest = {}
+        try:
+            while True:
+                event = self.progress_queue.get_nowait()
+                latest[event[0]] = event
+        except queue.Empty:
+            pass
+        for key, label, done, total, status in latest.values():
+            old = self._progress_entries.get(key)
+            if old is None:
+                old = {"last_bytes": 0, "last_time": now, "speed": 0.0}
+                self._progress_entries[key] = old
+            interval = max(now - old["last_time"], 0.001)
+            if status == "下载中" and done >= old["last_bytes"]:
+                measured = (done - old["last_bytes"]) / interval
+                old["speed"] = measured if old["speed"] == 0 else old["speed"] * 0.5 + measured * 0.5
+            elif status in ("普通下载回退", "重试等待", "等待缓存", "准备文件"):
+                old["speed"] = 0.0
+            old.update(label=label, done=done, total=total, status=status,
+                       last_bytes=done, last_time=now)
+            if status in ("完成", "失败", "限流等待", "已取消"):
+                old["expires"] = now + 5
+            else:
+                old.pop("expires", None)
+        for key, entry in list(self._progress_entries.items()):
+            if entry.get("expires", float("inf")) <= now:
+                self._progress_entries.pop(key)
+                if self.progress_tree.exists(key):
+                    self.progress_tree.delete(key)
+                continue
+            total = entry["total"]
+            done = entry["done"]
+            ratio = min(1.0, done / total) if total else 0
+            cells = int(ratio * 10)
+            bar = "━" * cells + "─" * (10 - cells)
+            portion = f"{done / 1048576:.1f}/{total / 1048576:.1f} MiB  {ratio:.0%}" if total else f"{done / 1048576:.1f} MiB"
+            speed = (
+                f"{entry['speed'] / 1048576:.2f} MiB/s"
+                if entry["status"] == "下载中" and now - entry["last_time"] < 3
+                else "—"
+            )
+            values = (entry["label"], f"{bar} {portion}", speed, entry["status"])
+            if self.progress_tree.exists(key):
+                self.progress_tree.item(key, values=values)
+            else:
+                self.progress_tree.insert("", "end", iid=key, values=values)
+        active = [v for v in self._progress_entries.values() if v["status"] not in ("完成", "失败", "限流等待", "已取消")]
+        self.progress_summary.set(
+            f"正在处理 {len(active)} 个文件，合计速度 "
+            f"{sum(v['speed'] for v in active if v['status'] == '下载中' and now - v['last_time'] < 3) / 1048576:.2f} MiB/s"
+            if active else "当前没有正在下载的文件"
+        )
+
     def _drain_log(self) -> None:
+        self._drain_progress()
         try:
             while True:
                 chunk = self.log_queue.get_nowait()
@@ -1059,6 +1140,7 @@ class _App:
                     retries=retries,
                     chunk_concurrency=chunk_concurrency,
                     on_saved=self._log_download,
+                    on_progress=self._update_download_progress,
                     monitor_direction=monitor_item.get("direction", "newest") if monitor_item else None,
                     monitor_batch_size=100,
                     stop_event=self._stop_download,

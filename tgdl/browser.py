@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
+from tgdl.progress import ProgressCallback
 
 from tgdl.downloader import (
     DownloadStats,
@@ -102,6 +103,7 @@ async def save_items(
     retries: int = 2,
     chunk_concurrency: int = 1,
     temp_download_dir: Path | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> SaveResult:
     """Download the full-quality files for the selected media items."""
     folder = _folder_for(download_dir, title)
@@ -124,6 +126,7 @@ async def save_items(
         retries=retries, skip_existing=skip_existing,
         chunk_concurrency=chunk_concurrency,
         temp_download_dir=temp_download_dir,
+        on_progress=on_progress,
     )
     result = SaveResult(
         saved=stats.saved, skipped=stats.skipped, failed=stats.failed,
