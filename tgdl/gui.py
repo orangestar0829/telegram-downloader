@@ -713,6 +713,9 @@ class _App:
         self._run_task(coro(), self.load_gallery_btn)
 
     def on_save_selected(self) -> None:
+        if self._download_future is not None and not self._download_future.done():
+            self._log("[下载] 已有下载任务在执行，请先完成或取消当前任务。\n")
+            return
         selected = [item for var, item in self.gallery_cells if var.get()]
         if not selected:
             self.messagebox.showwarning("未选择", "请先勾选要保存的图片/视频。")
@@ -723,22 +726,46 @@ class _App:
             self.messagebox.showwarning("设置错误", str(exc))
             return
 
-        async def coro():
-            await self._ensure_client()
-            await save_items(
-                self.client,
-                selected,
-                download_dir=self.settings.download_dir,
-                title=self._gallery_title or "gallery",
-                concurrency=concurrency,
-                retries=retries,
-                chunk_concurrency=chunk_concurrency,
-                temp_download_dir=self.settings.temp_download_dir,
-                on_progress=self._update_download_progress,
-            )
-            print("保存完成。点『打开下载文件夹』查看。\n")
+        self._stop_download.clear()
 
-        self._run_task(coro(), self.save_sel_btn)
+        async def coro():
+            self._download_task = asyncio.current_task()
+            try:
+                await self._ensure_client()
+                await save_items(
+                    self.client,
+                    selected,
+                    download_dir=self.settings.download_dir,
+                    title=self._gallery_title or "gallery",
+                    concurrency=concurrency,
+                    retries=retries,
+                    chunk_concurrency=chunk_concurrency,
+                    temp_download_dir=self.settings.temp_download_dir,
+                    on_progress=self._update_download_progress,
+                )
+                print("保存完成。点『打开下载文件夹』查看。\n")
+            finally:
+                self._download_task = None
+
+        self.save_sel_btn.config(state="disabled")
+        future = self.loop.submit(coro())
+        self._download_future = future
+
+        def finished(fut: concurrent.futures.Future) -> None:
+            try:
+                fut.result()
+            except concurrent.futures.CancelledError:
+                self._log("[下载] 已取消浏览媒体中选定的下载任务\n")
+            except Exception as exc:
+                self._log(f"[下载错误] 保存所选失败：{exc}\n")
+            finally:
+                def on_ui() -> None:
+                    self.save_sel_btn.config(state="normal")
+                    if self._closing:
+                        self._finish_close()
+                self.root.after(0, on_ui)
+
+        future.add_done_callback(finished)
 
     def _build_download_tab(self):
         ttk = self.ttk
@@ -1440,6 +1467,8 @@ class _App:
         if self._download_future is not None and not self._download_future.done():
             self._download_future.cancel()
             self._log("[下载] 正在取消当前扫描及未完成文件；已成功的文件不会删除\n")
+        else:
+            self._log("[下载] 当前没有可取消的下载任务\n")
 
     def _finish_close(self) -> None:
         if self._download_future is not None and not self._download_future.done():
