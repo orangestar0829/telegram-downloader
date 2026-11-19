@@ -111,7 +111,7 @@ def test_ssd_staging_then_atomic_publish_to_other_volume(tmp_path, monkeypatch):
     assert not list(output.glob(".tgdl-publishing-*"))
 
 
-def test_staging_without_enough_space_falls_back_to_destination(tmp_path, monkeypatch):
+def test_staging_without_enough_space_waits_and_can_be_cancelled(tmp_path, monkeypatch):
     from tgdl import downloader
     from types import SimpleNamespace
 
@@ -119,18 +119,24 @@ def test_staging_without_enough_space_falls_back_to_destination(tmp_path, monkey
     client = FakeClient(data)
     message = SimpleNamespace(id=17, media=SimpleNamespace(document=Document(len(data))))
     staging = tmp_path / "ssd"
-    original_usage = downloader.shutil.disk_usage
     monkeypatch.setattr(
-        downloader.shutil, "disk_usage",
+        __import__("tgdl.cache_budget", fromlist=["shutil"]).shutil, "disk_usage",
         lambda path: SimpleNamespace(free=0),
     )
     output = tmp_path / "hdd"
-    saved = asyncio.run(downloader._download_one(
-        client, message, output, "20261119_17",
-        skip_existing=True, stats=downloader.DownloadStats(),
-        chunk_concurrency=4, temp_download_dir=staging,
-    ))
-    assert saved is not None and saved.read_bytes() == data
+    async def check_wait():
+        task = asyncio.create_task(downloader._download_one(
+            client, message, output, "20261119_17",
+            skip_existing=True, stats=downloader.DownloadStats(),
+            chunk_concurrency=4, temp_download_dir=staging,
+        ))
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        assert not list(output.glob("tgdl-*"))
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    asyncio.run(check_wait())
     assert not list(staging.glob("tgdl-*"))
 
 def test_truncated_download_rejected(tmp_path):
@@ -166,10 +172,12 @@ def test_stalled_parallel_download_falls_back_to_regular(tmp_path, monkeypatch):
 
         async def download_media(self, message, *, file, progress_callback):
             path = __import__("pathlib").Path(file)
+            assert not (path.parent / "data.mp4").exists()
             path.write_bytes(b"complete-regular-download")
             return str(path)
 
     async def fail_chunks(*args, **kwargs):
+        args[2].write_bytes(b"partial preallocated chunk")
         raise ChunkDownloadStalled("simulated chunk timeout")
 
     monkeypatch.setattr(downloader, "download_chunked", fail_chunks)

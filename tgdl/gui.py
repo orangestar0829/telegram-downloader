@@ -1222,6 +1222,11 @@ class _App:
             ttk.Entry(win, textvariable=var, width=43, show="*" if secret else "").grid(
                 row=row, column=1, sticky="we", **pad
             )
+        ttk.Label(
+            win,
+            text="SSD 缓存：最大 20 GiB，至少保留 10 GiB 可用空间；满额排队等待，不回退机械盘",
+            foreground="#555",
+        ).grid(row=len(fields), column=0, columnspan=2, sticky="w", **pad)
 
         def save_and_close():
             host = self.proxy_host_var.get().strip()

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import os
 import re
-import shutil
 import tempfile
 import time
 import threading
@@ -32,6 +31,7 @@ from tqdm import tqdm
 from tgdl.chunked import (
     ChunkDownloadStalled, chunkable_document, document_suffix, download_chunked,
 )
+from tgdl.cache_budget import optional_staging_reservation
 from tgdl.history import DownloadHistory
 
 PHOTO_TYPES = {"photo"}
@@ -466,79 +466,85 @@ async def _download_one(
     if use_chunks and temp_download_dir is not None:
         candidate = Path(temp_download_dir).expanduser()
         candidate.mkdir(parents=True, exist_ok=True)
-        required = int(document.size) + 64 * 1024 * 1024
-        if shutil.disk_usage(candidate).free >= required:
-            temp_parent = candidate
-        else:
-            print(f"[分块] 临时盘空间不足，改用下载目录：{candidate}")
+        temp_parent = candidate
     # Telethon writes using the original filename. Per-task directories avoid
     # collisions and allow failed/cancelled partial files to be cleaned up.
-    with tempfile.TemporaryDirectory(prefix="tgdl-", dir=temp_parent) as temporary:
-        with tqdm(unit="B", unit_scale=True, desc=base, leave=False) as bar:
-            def progress(current: int, total: int) -> None:
-                bar.total = total or bar.total
-                bar.n = current
-                bar.refresh()
+    async with optional_staging_reservation(
+        temp_parent if use_chunks and temp_download_dir is not None else None,
+        int(document.size) if use_chunks else 0,
+    ) as cache_lease:
+        with tempfile.TemporaryDirectory(prefix="tgdl-", dir=temp_parent) as temporary:
+            if cache_lease is not None:
+                cache_lease.track(Path(temporary))
+            with tqdm(unit="B", unit_scale=True, desc=base, leave=False) as bar:
+                def progress(current: int, total: int) -> None:
+                    bar.total = total or bar.total
+                    bar.n = current
+                    bar.refresh()
 
-            if use_chunks:
-                try:
-                    saved = await download_chunked(
-                        client, document, Path(temporary) / ("data" + document_suffix(document)),
-                        parts=chunk_concurrency, on_bytes=bar.update,
-                        timings=chunk_timings,
-                    )
-                except ChunkDownloadStalled as exc:
-                    chunk_timings.clear()
-                    print(f"[分块] {base} 超时/失败: {exc}; 自动退回普通下载")
-                    # Do not publish the preallocated/partial chunked file.
-                    saved = await client.download_media(
-                        target, file=str(Path(temporary) / ("normal" + document_suffix(document))),
-                        progress_callback=progress,
-                    )
+                if use_chunks:
+                    chunk_output = Path(temporary) / ("data" + document_suffix(document))
+                    try:
+                        saved = await download_chunked(
+                            client, document, chunk_output,
+                            parts=chunk_concurrency, on_bytes=bar.update,
+                            timings=chunk_timings,
+                        )
+                    except ChunkDownloadStalled as exc:
+                        chunk_timings.clear()
+                        print(f"[分块] {base} 超时/失败: {exc}; 自动退回普通下载")
+                        # The chunked file is preallocated at full size.
+                        # Delete it BEFORE normal fallback, so SSD staging
+                        # never needs space for two full copies of one media.
+                        chunk_output.unlink(missing_ok=True)
+                        saved = await client.download_media(
+                            target, file=str(Path(temporary) / ("normal" + document_suffix(document))),
+                            progress_callback=progress,
+                        )
+                    else:
+                        mode = f"分块{chunk_concurrency}路"
                 else:
-                    mode = f"分块{chunk_concurrency}路"
+                    saved = await client.download_media(
+                        target, file=str(temporary), progress_callback=progress,
+                    )
+            if not saved:
+                stats.failed += 1
+                return None
+            saved_path = Path(saved)
+            suffix = saved_path.suffix or ".bin"
+            final_path = dest_dir / f"{base}{suffix}"
+            if skip_existing and final_path.exists():
+                stats.skipped += 1
+                return None
+            if final_path.exists():
+                final_path = unique_path(final_path)
+            publish_started = time.monotonic()
+            # Moving within a volume is a rename, not a full media copy.
+            if not same_volume(saved_path, dest_dir):
+                # On cross-volume moves, first copy sequentially to a hidden
+                # incomplete destination, and publish only after full verification.
+                partial = dest_dir / f".tgdl-publishing-{base}-{time.time_ns()}{suffix}"
+                # Never interleave large file copies on a mechanical disk:
+                # one sequential publishing pass at a time.
+                async with _STAGED_PUBLISH_LOCK:
+                    try:
+                        with saved_path.open("rb") as source, partial.open("xb") as sink:
+                            while True:
+                                data = source.read(4 * 1024 * 1024)
+                                if not data:
+                                    break
+                                sink.write(data)
+                                await asyncio.sleep(0)
+                        if partial.stat().st_size != saved_path.stat().st_size:
+                            raise IOError("Staged media copy size mismatch")
+                        partial.replace(final_path)
+                    finally:
+                        partial.unlink(missing_ok=True)
             else:
-                saved = await client.download_media(
-                    target, file=str(temporary), progress_callback=progress,
-                )
-        if not saved:
-            stats.failed += 1
-            return None
-        saved_path = Path(saved)
-        suffix = saved_path.suffix or ".bin"
-        final_path = dest_dir / f"{base}{suffix}"
-        if skip_existing and final_path.exists():
-            stats.skipped += 1
-            return None
-        if final_path.exists():
-            final_path = unique_path(final_path)
-        publish_started = time.monotonic()
-        # Moving within a volume is a rename, not a full media copy.
-        if not same_volume(saved_path, dest_dir):
-            # On cross-volume moves, first copy sequentially to a hidden
-            # incomplete destination, and publish only after full verification.
-            partial = dest_dir / f".tgdl-publishing-{base}-{time.time_ns()}{suffix}"
-            # Never interleave large file copies on a mechanical disk:
-            # one sequential publishing pass at a time.
-            async with _STAGED_PUBLISH_LOCK:
-                try:
-                    with saved_path.open("rb") as source, partial.open("xb") as sink:
-                        while True:
-                            data = source.read(4 * 1024 * 1024)
-                            if not data:
-                                break
-                            sink.write(data)
-                            await asyncio.sleep(0)
-                    if partial.stat().st_size != saved_path.stat().st_size:
-                        raise IOError("Staged media copy size mismatch")
-                    partial.replace(final_path)
-                finally:
-                    partial.unlink(missing_ok=True)
-        else:
-            saved_path.replace(final_path)
-        publish_seconds = time.monotonic() - publish_started
-        if history is not None and peer_id is not None:
-            history.mark_saved(peer_id, message.id, dest_dir.name, final_path)
+                saved_path.replace(final_path)
+            publish_seconds = time.monotonic() - publish_started
+            if history is not None and peer_id is not None:
+                history.mark_saved(peer_id, message.id, dest_dir.name, final_path)
     stats.saved += 1
     elapsed = max(time.monotonic() - started, 0.001)
     size_mib = final_path.stat().st_size / 1048576
