@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="photo, video, animation — comma separated (default: photo,video)",
     )
     download.add_argument("--limit", "-n", type=int, default=None, help="Max files to save")
+    download.add_argument("--concurrency", type=int, default=None, help="Concurrent media files (1-8)")
+    download.add_argument("--retries", type=int, default=None, help="Retries per media file (0-5)")
     download.add_argument("--since", help="Only media on/after this date, YYYY-MM-DD")
     download.add_argument("--until", help="Only media on/before this date, YYYY-MM-DD")
     download.add_argument(
@@ -156,6 +158,8 @@ async def cmd_download(args: argparse.Namespace) -> None:
             until=parse_day(args.until, end_of_day=True),
             skip_existing=not args.no_skip,
             dry_run=args.dry_run,
+            concurrency=getattr(args, "concurrency", None) if getattr(args, "concurrency", None) is not None else settings.media_concurrency,
+            retries=getattr(args, "retries", None) if getattr(args, "retries", None) is not None else settings.media_retries,
         )
 
 

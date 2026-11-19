@@ -706,12 +706,9 @@ class _App:
             self.download_dir_var.set(chosen)
             self._save_dir_only()
             if self.settings is not None:
-                self.settings = Settings(
-                    api_id=self.settings.api_id,
-                    api_hash=self.settings.api_hash,
-                    phone=self.settings.phone,
-                    download_dir=Path(chosen),
-                )
+                from dataclasses import replace
+
+                self.settings = replace(self.settings, download_dir=Path(chosen))
 
     def _open_folder(self) -> None:
         folder = self._current_download_dir()
