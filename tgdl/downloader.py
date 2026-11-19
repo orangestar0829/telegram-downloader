@@ -462,6 +462,8 @@ async def _download_one(
             return None
     dest_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    flood_snapshot = getattr(client, "flood_snapshot", None)
+    flood_before = flood_snapshot() if callable(flood_snapshot) else None
     mode = "普通下载"
     chunk_timings: dict[str, float] = {}
     publish_seconds = 0.0
@@ -491,6 +493,7 @@ async def _download_one(
             with own_temporary(Path(temporary)):
                 if cache_lease is not None:
                     cache_lease.track(Path(temporary))
+                media_started = time.monotonic()
                 with tqdm(unit="B", unit_scale=True, desc=base, leave=False) as bar:
                     def progress(current: int, total: int) -> None:
                         bar.total = total or bar.total
@@ -527,6 +530,7 @@ async def _download_one(
                         saved = await client.download_media(
                             target, file=str(temporary), progress_callback=progress,
                         )
+                media_elapsed = max(time.monotonic() - media_started, 0.001)
                 if not saved:
                     stats.failed += 1
                     transfer.emit("失败", force=True)
@@ -571,7 +575,19 @@ async def _download_one(
     elapsed = max(time.monotonic() - started, 0.001)
     size_mib = final_path.stat().st_size / 1048576
     detail = (f"[下载完成] {final_path.name} | {size_mib:.1f} MiB | "
-              f"{elapsed:.1f}秒 | {size_mib / elapsed:.2f} MiB/s | {mode}")
+              f"{elapsed:.1f}秒 | 全程均速{size_mib / elapsed:.2f} MiB/s | {mode}"
+              f" | 传输阶段{media_elapsed:.1f}秒，均速{size_mib / media_elapsed:.2f} MiB/s")
+    if flood_before is not None and callable(flood_snapshot):
+        flood_after = flood_snapshot()
+        changes = []
+        for kind in ("FLOOD_WAIT", "FLOOD_PREMIUM_WAIT"):
+            prev = flood_before.get(kind, (0, 0))
+            new = flood_after.get(kind, (0, 0))
+            count, seconds = new[0] - prev[0], new[1] - prev[1]
+            if count:
+                changes.append(f"{kind}={count}次/{seconds}s")
+        if changes:
+            detail += " | 同期全局限流响应：" + "，".join(changes) + "（并发任务可能重叠，非实际总停顿）"
     if chunk_timings:
         detail += (
             f" | 文件准备{chunk_timings.get('prepare_s', 0):.2f}秒"

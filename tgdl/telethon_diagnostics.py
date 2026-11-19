@@ -19,7 +19,11 @@ def diagnostic_message(record: logging.LogRecord) -> str | None:
         if message.startswith("Sleeping") and "flood wait" in message:
             matched = re.search(r"for (\d+)s .* on (\w+) flood wait", message)
             if matched:
-                return f"[网络诊断] FloodWait {matched.group(1)}s，方法={matched.group(2)}，Telethon 自动等待"
+                return (
+                    f"[网络诊断] Telethon 自动等待 {matched.group(1)}s，"
+                    f"方法={matched.group(2)}；此处日志不区分普通/Premium，"
+                    "具体类型请看服务端原始响应"
+                )
         if message.startswith("Telegram is having internal issues"):
             return "[网络诊断] Telegram RPC 内部错误，Telethon 自动重试"
     elif record.name.endswith("mtprotosender"):

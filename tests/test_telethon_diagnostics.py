@@ -13,7 +13,7 @@ def test_flood_wait_and_connection_events_have_safe_summaries():
         "Sleeping%s for %ds (%s) on %s flood wait",
         ("", 12, "0:00:12", "GetFileRequest"),
     )
-    assert "FloodWait 12s" in diagnostic_message(flood)
+    assert "自动等待 12s" in diagnostic_message(flood)
     assert "GetFileRequest" in diagnostic_message(flood)
     reconnect = record("telethon.network.mtprotosender", "Closing current connection to begin reconnect...")
     assert "自动重连开始" in diagnostic_message(reconnect)
@@ -29,7 +29,7 @@ def test_log_hook_captures_info_and_restores_logger_level():
     uninstall = install_telethon_diagnostics(messages.append)
     try:
         logger.info("Sleeping%s for %ds (%s) on %s flood wait", "", 5, "0:00:05", "GetFileRequest")
-        assert any("FloodWait 5s" in msg for msg in messages)
+        assert any("自动等待 5s" in msg for msg in messages)
     finally:
         uninstall()
     assert logger.level == old
