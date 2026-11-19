@@ -253,3 +253,9 @@ telegram-media-downloader/
 - **批量下载与画廊保存**：并发 1–8（默认 3），每个失败文件最多重试 0–5 次（默认 2），每个文件使用独立临时目录防止文件名冲突。遇到 Telegram FloodWait 时停止并发任务，不强制重试。
 - **CLI**：`python -m tgdl download -c GROUP_ID --concurrency 3 --retries 2`。
 - **重要**：这里实现的是多个文件之间的并发，不对单个视频做分块并行；如家宽到代理节点的线路本身受限，并发与 `cryptg` 不一定提速。
+
+### 单文件分块并发下载
+
+CHUNK_CONCURRENCY 默认 1，设置为 2/4/8 后对不小于 16 MiB 的 Telegram Document 启用 Telethon iter_download 的并行字节区间读取。每段有严格长度校验，只有全部区间下载成功才将临时文件移动为最终文件。纯字节拼接，不需 FFmpeg，不重新编码；较小文件及普通相册图片仍由标准下载流程处理。文件并发与分块并发独立，但会叠加网络请求；不保证速度提升。
+
+命令行：python -m tgdl download -c GROUP_ID --concurrency 3 --chunk-concurrency 4 --retries 2

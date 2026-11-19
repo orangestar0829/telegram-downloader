@@ -21,6 +21,7 @@ _ENV_KEYS = {
     "SOCKS5_PASSWORD": "proxy_password",
     "MEDIA_CONCURRENCY": "media_concurrency",
     "MEDIA_RETRIES": "media_retries",
+    "CHUNK_CONCURRENCY": "chunk_concurrency",
 }
 
 
@@ -36,6 +37,7 @@ class Settings:
     proxy_password: str | None = None
     media_concurrency: int = 3
     media_retries: int = 2
+    chunk_concurrency: int = 1
 
 
 def default_download_dir() -> Path:
@@ -89,6 +91,7 @@ def read_env_values() -> dict[str, str]:
         "proxy_host": "", "proxy_port": "",
         "proxy_username": "", "proxy_password": "",
         "media_concurrency": "3", "media_retries": "2",
+        "chunk_concurrency": "1",
     }
     if ENV_PATH.exists():
         for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
@@ -119,6 +122,7 @@ def update_env(values: dict[str, str]) -> Path:
         ("SOCKS5_PASSWORD", "proxy_password"),
         ("MEDIA_CONCURRENCY", "media_concurrency"),
         ("MEDIA_RETRIES", "media_retries"),
+        ("CHUNK_CONCURRENCY", "chunk_concurrency"),
     ):
         if name in values:
             desired[key] = values[name]
@@ -179,6 +183,9 @@ def load_settings() -> Settings:
         ),
         media_retries=_bounded_int(
             os.getenv("MEDIA_RETRIES", "2"), "MEDIA_RETRIES", 0, 5
+        ),
+        chunk_concurrency=_bounded_int(
+            os.getenv("CHUNK_CONCURRENCY", "1"), "CHUNK_CONCURRENCY", 1, 8
         ),
     )
 

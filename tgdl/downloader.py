@@ -24,6 +24,8 @@ from telethon.tl.types import (
 )
 from tqdm import tqdm
 
+from tgdl.chunked import chunkable_document, document_suffix, download_chunked
+
 PHOTO_TYPES = {"photo"}
 VIDEO_TYPES = {"video", "animation"}
 ALL_TYPES = PHOTO_TYPES | VIDEO_TYPES
@@ -202,6 +204,7 @@ async def download_channel(
     dry_run: bool = False,
     concurrency: int = 3,
     retries: int = 2,
+    chunk_concurrency: int = 1,
 ) -> DownloadStats:
     entity = await resolve_channel(client, target)
     title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
@@ -252,6 +255,7 @@ async def download_channel(
         await download_many(
             client, jobs(), stats=stats, concurrency=concurrency,
             retries=retries, skip_existing=skip_existing,
+            chunk_concurrency=chunk_concurrency,
         )
     except FloodWaitError as exc:
         print(f"\nRate limited. Wait {exc.seconds}s then retry this channel.")
@@ -271,6 +275,7 @@ async def _download_one(
     *,
     skip_existing: bool,
     stats: DownloadStats,
+    chunk_concurrency: int = 1,
 ) -> Path | None:
     if skip_existing and any(dest_dir.glob(f"{base}.*")):
         stats.skipped += 1
@@ -285,11 +290,17 @@ async def _download_one(
                 bar.n = current
                 bar.refresh()
 
-            saved = await client.download_media(
-                download_target(message),
-                file=str(temporary),
-                progress_callback=progress,
-            )
+            target = download_target(message)
+            document = chunkable_document(target, chunk_concurrency)
+            if document is not None and callable(getattr(client, "iter_download", None)):
+                saved = await download_chunked(
+                    client, document, Path(temporary) / ("data" + document_suffix(document)),
+                    parts=chunk_concurrency, on_bytes=bar.update,
+                )
+            else:
+                saved = await client.download_media(
+                    target, file=str(temporary), progress_callback=progress,
+                )
         if not saved:
             stats.failed += 1
             return None
@@ -315,12 +326,14 @@ async def _download_with_retry(
     *,
     skip_existing: bool,
     retries: int,
+    chunk_concurrency: int = 1,
 ) -> Path | None:
     for attempt in range(retries + 1):
         try:
             return await _download_one(
                 client, message, dest_dir, base,
                 skip_existing=skip_existing, stats=stats,
+                chunk_concurrency=chunk_concurrency,
             )
         except FloodWaitError:
             raise
@@ -344,12 +357,15 @@ async def download_many(
     concurrency: int = 3,
     retries: int = 2,
     skip_existing: bool = True,
+    chunk_concurrency: int = 1,
 ) -> list[Path]:
     """Bounded multi-file concurrency (not parallel chunks of one video)."""
     if not 1 <= concurrency <= 8:
         raise ValueError("concurrency must be between 1 and 8")
     if not 0 <= retries <= 5:
         raise ValueError("retries must be between 0 and 5")
+    if not 1 <= chunk_concurrency <= 8:
+        raise ValueError("chunk_concurrency must be between 1 and 8")
     pending: set[asyncio.Task[Path | None]] = set()
     saved: list[Path] = []
 
@@ -372,6 +388,7 @@ async def download_many(
                     _download_with_retry(
                         client, message, dest_dir, base, stats,
                         skip_existing=skip_existing, retries=retries,
+                        chunk_concurrency=chunk_concurrency,
                     )
                 )
             )

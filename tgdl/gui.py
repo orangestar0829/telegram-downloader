@@ -173,6 +173,7 @@ class _App:
         self.proxy_password_var = tk.StringVar(value=env["proxy_password"])
         self.media_concurrency_var = tk.StringVar(value=env["media_concurrency"])
         self.media_retries_var = tk.StringVar(value=env["media_retries"])
+        self.chunk_concurrency_var = tk.StringVar(value=env["chunk_concurrency"])
         self.status_var = tk.StringVar(value="未登录")
         self.manual_var = tk.StringVar()
 
@@ -391,7 +392,7 @@ class _App:
             self.messagebox.showwarning("未选择", "请先勾选要保存的图片/视频。")
             return
         try:
-            concurrency, retries = self._media_options()
+            concurrency, retries, chunk_concurrency = self._media_options()
         except ValueError as exc:
             self.messagebox.showwarning("设置错误", str(exc))
             return
@@ -405,6 +406,7 @@ class _App:
                 title=self._gallery_title or "gallery",
                 concurrency=concurrency,
                 retries=retries,
+                chunk_concurrency=chunk_concurrency,
             )
             print("保存完成。点『打开下载文件夹』查看。\n")
 
@@ -431,6 +433,10 @@ class _App:
         ttk.Label(frame, text="失败重试 (0-5)").grid(row=2, column=2, sticky="w", **pad)
         ttk.Entry(frame, textvariable=self.media_retries_var, width=8).grid(
             row=2, column=3, sticky="w", **pad
+        )
+        ttk.Label(frame, text="单文件分块并发 (1-8)").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Entry(frame, textvariable=self.chunk_concurrency_var, width=8).grid(
+            row=3, column=1, sticky="w", **pad
         )
         frame.columnconfigure(2, weight=1)
         return frame
@@ -476,19 +482,20 @@ class _App:
         raw = self.download_dir_var.get().strip()
         return Path(raw).expanduser() if raw else default_download_dir()
 
-    def _media_options(self) -> tuple[int, int]:
+    def _media_options(self) -> tuple[int, int, int]:
         try:
             workers = int(self.media_concurrency_var.get().strip())
             retries = int(self.media_retries_var.get().strip())
-            if not 1 <= workers <= 8 or not 0 <= retries <= 5:
+            chunks = int(self.chunk_concurrency_var.get().strip())
+            if not 1 <= workers <= 8 or not 0 <= retries <= 5 or not 1 <= chunks <= 8:
                 raise ValueError
         except ValueError as exc:
-            raise ValueError("并发数必须为 1-8，失败重试必须为 0-5") from exc
-        # Persist the choices without changing the stored credentials or proxy.
+            raise ValueError("文件/分块并发数必须为 1-8，失败重试必须为 0-5") from exc
         values = read_env_values()
-        values.update(media_concurrency=str(workers), media_retries=str(retries))
+        values.update(media_concurrency=str(workers), media_retries=str(retries),
+                      chunk_concurrency=str(chunks))
         update_env(values)
-        return workers, retries
+        return workers, retries, chunks
 
     def _selected_target(self) -> str | None:
         sel = self.tree.selection()
@@ -643,7 +650,7 @@ class _App:
             return
         limit = self.dl_limit.get().strip()
         try:
-            concurrency, retries = self._media_options()
+            concurrency, retries, chunk_concurrency = self._media_options()
         except ValueError as exc:
             self.messagebox.showwarning("设置错误", str(exc))
             return
@@ -662,6 +669,7 @@ class _App:
                 dry_run=False,
                 concurrency=concurrency,
                 retries=retries,
+                chunk_concurrency=chunk_concurrency,
             )
             print("下载完成。点『打开下载文件夹』查看。\n")
 
