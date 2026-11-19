@@ -55,10 +55,35 @@ def test_exact_parallel_assembly(tmp_path):
     data = bytes(range(256)) * (REQUEST_BYTES // 256 * 5) + b"tail"
     client = FakeClient(data)
     dest = tmp_path / "video.mp4"
-    asyncio.run(download_chunked(client, Document(len(data)), dest, parts=4))
+    timings = {}
+    asyncio.run(download_chunked(client, Document(len(data)), dest, parts=4, timings=timings))
     assert dest.read_bytes() == data
+    assert timings["prepare_s"] >= 0
+    assert timings["transfer_s"] >= 0
     assert len(client.streams) >= 2
     assert all(stream.closed for stream in client.streams)
+
+
+def test_chunked_completion_includes_io_stage_timings(tmp_path):
+    from tgdl import downloader
+    from types import SimpleNamespace
+
+    data = b"x" * (16 * 1024 * 1024 + 3)
+    document = Document(len(data))
+    client = FakeClient(data)
+    message = SimpleNamespace(id=42, media=SimpleNamespace(document=document))
+    stats = downloader.DownloadStats()
+    logs = []
+    target = asyncio.run(downloader._download_one(
+        client, message, tmp_path, "20261119_42",
+        skip_existing=True, stats=stats, chunk_concurrency=4,
+        on_saved=logs.append,
+    ))
+    assert target is not None and target.read_bytes() == data
+    assert not list(tmp_path.glob("tgdl-*"))
+    assert stats.saved == 1
+    assert "分块4路" in logs[0]
+    assert "文件准备" in logs[0] and "分块传输" in logs[0] and "最终保存" in logs[0]
 
 def test_truncated_download_rejected(tmp_path):
     data = b"x" * (REQUEST_BYTES * 4)

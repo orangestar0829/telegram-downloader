@@ -443,6 +443,8 @@ async def _download_one(
     dest_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     mode = "普通下载"
+    chunk_timings: dict[str, float] = {}
+    publish_seconds = 0.0
     # Telethon writes using the original filename. Per-task directories avoid
     # collisions and allow failed/cancelled partial files to be cleaned up.
     with tempfile.TemporaryDirectory(prefix="tgdl-", dir=dest_dir) as temporary:
@@ -459,8 +461,10 @@ async def _download_one(
                     saved = await download_chunked(
                         client, document, Path(temporary) / ("data" + document_suffix(document)),
                         parts=chunk_concurrency, on_bytes=bar.update,
+                        timings=chunk_timings,
                     )
                 except ChunkDownloadStalled as exc:
+                    chunk_timings.clear()
                     print(f"[分块] {base} 超时/失败: {exc}; 自动退回普通下载")
                     # Do not publish the preallocated/partial chunked file.
                     saved = await client.download_media(
@@ -484,7 +488,9 @@ async def _download_one(
             return None
         if final_path.exists():
             final_path = unique_path(final_path)
+        publish_started = time.monotonic()
         saved_path.replace(final_path)
+        publish_seconds = time.monotonic() - publish_started
         if history is not None and peer_id is not None:
             history.mark_saved(peer_id, message.id, dest_dir.name, final_path)
     stats.saved += 1
@@ -492,6 +498,12 @@ async def _download_one(
     size_mib = final_path.stat().st_size / 1048576
     detail = (f"[下载完成] {final_path.name} | {size_mib:.1f} MiB | "
               f"{elapsed:.1f}秒 | {size_mib / elapsed:.2f} MiB/s | {mode}")
+    if chunk_timings:
+        detail += (
+            f" | 文件准备{chunk_timings.get('prepare_s', 0):.2f}秒"
+            f" / 分块传输{chunk_timings.get('transfer_s', 0):.2f}秒"
+            f" / 最终保存{publish_seconds:.2f}秒"
+        )
     if on_saved is not None:
         on_saved(detail)
     else:

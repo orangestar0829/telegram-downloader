@@ -10,6 +10,7 @@ import asyncio
 import math
 import mimetypes
 import re
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -17,6 +18,7 @@ REQUEST_BYTES = 512 * 1024
 MIN_CHUNKED_BYTES = 16 * 1024 * 1024
 CHUNK_IDLE_TIMEOUT = 45
 CHUNK_RETRIES = 2
+RANGE_FILE_BUFFER_BYTES = 1024 * 1024
 
 
 class ChunkDownloadStalled(IOError):
@@ -77,6 +79,7 @@ async def download_chunked(
     on_bytes: Callable[[int], None] | None = None,
     idle_timeout: float = CHUNK_IDLE_TIMEOUT,
     retries: int = CHUNK_RETRIES,
+    timings: dict[str, float] | None = None,
 ) -> Path:
     """Download exact ranges and reject any truncated part before publishing."""
     size = getattr(document, "size", None)
@@ -86,9 +89,12 @@ async def download_chunked(
         raise ValueError("idle_timeout must be positive and retries nonnegative")
     ranges = byte_ranges(size, parts)
     output = Path(output)
+    prepare_started = time.perf_counter()
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as handle:
         handle.truncate(size)
+    if timings is not None:
+        timings["prepare_s"] = time.perf_counter() - prepare_started
 
     completed = 0
     def report_progress(amount: int) -> None:
@@ -107,7 +113,10 @@ async def download_chunked(
                 file_size=size,
             )
             try:
-                with output.open("r+b") as handle:
+                # Each range has an independent buffered file handle and seeks
+                # only within its own non-overlapping byte range. Keep the
+                # original single-file layout; no expensive part merging.
+                with output.open("r+b", buffering=RANGE_FILE_BUFFER_BYTES) as handle:
                     handle.seek(offset)
                     iterator = aiter(stream)
                     while offset < end:
@@ -146,6 +155,7 @@ async def download_chunked(
                         # The next attempt or outer fallback still owns recovery.
                         pass
 
+    transfer_started = time.perf_counter()
     tasks = [asyncio.create_task(fetch_range(a, b)) for a, b in ranges]
     try:
         await asyncio.gather(*tasks)
@@ -157,4 +167,6 @@ async def download_chunked(
 
     if output.stat().st_size != size:
         raise IOError(f"File size mismatch: {output.stat().st_size} != {size}")
+    if timings is not None:
+        timings["transfer_s"] = time.perf_counter() - transfer_started
     return output
