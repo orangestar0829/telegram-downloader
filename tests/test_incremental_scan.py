@@ -159,6 +159,7 @@ def test_failed_media_retried_when_no_new_messages(tmp_path, monkeypatch):
 
 
 def test_download_completion_includes_channel_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(downloader, "DownloadHistory", lambda: DownloadHistory(tmp_path / "history.sqlite3"))
     monkeypatch.setattr(downloader, "Message", FakeMessage)
     monkeypatch.setattr(downloader, "classify_message", lambda msg: "video")
 
