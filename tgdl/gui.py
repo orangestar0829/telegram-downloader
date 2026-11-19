@@ -35,6 +35,9 @@ from tgdl.config import (
 from tgdl.downloader import download_channel, resolve_channel
 from tgdl.log_format import TimestampedLines
 from tgdl.monitor import load_channels, save_channels
+from tgdl.paths import data_dir
+from tgdl.single_instance import AlreadyRunning, gui_instance_guard
+from tgdl.temp_cleanup import inspect_cleanup
 
 from tgdl import downloader as _downloader
 from tgdl import http_fetch as _http_fetch
@@ -134,7 +137,12 @@ def run_gui() -> None:
         raise SystemExit(1)
 
     _silence_progress_bars()
-    _App().run()
+    try:
+        with gui_instance_guard(data_dir()):
+            _App().run()
+    except AlreadyRunning as exc:
+        from tkinter import messagebox
+        messagebox.showinfo("已在运行", str(exc))
 
 
 class _App:
@@ -178,6 +186,15 @@ class _App:
         self.phone_var = tk.StringVar(value=env["phone"])
         self.download_dir_var = tk.StringVar(value=env["download_dir"] or str(default_download_dir()))
         self.temp_download_dir_var = tk.StringVar(value=env["temp_download_dir"])
+        # The GUI lock is acquired before initialization; no other GUI
+        # process can race our startup orphan cleanup.
+        startup_cache = inspect_cleanup(
+            self._cleanup_path(env["temp_download_dir"]),
+            self._cleanup_path(env["download_dir"]),
+        )
+        self.log_queue.put(startup_cache.summary() + "\n")
+        for error in startup_cache.failed:
+            self.log_queue.put(f"[缓存清理] {error}\n")
         self.proxy_host_var = tk.StringVar(value=env["proxy_host"])
         self.proxy_port_var = tk.StringVar(value=env["proxy_port"])
         self.proxy_username_var = tk.StringVar(value=env["proxy_username"])
@@ -1227,6 +1244,9 @@ class _App:
             text="SSD 缓存：最大 20 GiB，至少保留 10 GiB 可用空间；满额排队等待，不回退机械盘",
             foreground="#555",
         ).grid(row=len(fields), column=0, columnspan=2, sticky="w", **pad)
+        ttk.Button(win, text="检查并清理残留缓存", command=self._manual_cache_cleanup).grid(
+            row=len(fields) + 1, column=1, sticky="e", **pad
+        )
 
         def save_and_close():
             host = self.proxy_host_var.get().strip()
@@ -1269,6 +1289,42 @@ class _App:
         )
 
     # ---------- lifecycle ----------
+    @staticmethod
+    def _cleanup_path(raw: str) -> Path | None:
+        if not raw.strip():
+            return None
+        path = Path(raw.strip()).expanduser()
+        return path if path.is_absolute() else data_dir() / path
+
+    def _manual_cache_cleanup(self):
+        ssd_raw = self.temp_download_dir_var.get().strip()
+        hdd_raw = self.download_dir_var.get().strip()
+        ssd = self._cleanup_path(ssd_raw)
+        hdd = self._cleanup_path(hdd_raw)
+        # Work outside Tk's event loop: scanning a large HDD folder can block.
+        def worker():
+            report = inspect_cleanup(ssd, hdd)
+            def finish():
+                self._log(report.summary() + "\n")
+                if report.legacy:
+                    total = len(report.legacy)
+                    confirmed = self.messagebox.askyesno(
+                        "旧版临时文件",
+                        f"发现 {total} 项没有所有权标记的旧临时文件。"
+                        "\n无法确认是否仍有旧版本进程在写入。"
+                        "\n请先确保旧版本已关闭。\n\n仍要清理这些文件吗？",
+                    )
+                    if confirmed:
+                        threading.Thread(target=legacy_worker, daemon=True).start()
+                for error in report.failed:
+                    self._log(f"[缓存清理] {error}\n")
+            self.root.after(0, finish)
+
+        def legacy_worker():
+            result = inspect_cleanup(ssd, hdd, include_legacy=True)
+            self.root.after(0, lambda: self._log(result.summary() + "\n"))
+        threading.Thread(target=worker, daemon=True).start()
+
     def _cancel_current_download(self) -> None:
         self._stop_download.set()
         if self._download_future is not None and not self._download_future.done():
