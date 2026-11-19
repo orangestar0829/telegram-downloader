@@ -76,9 +76,14 @@ def test_legacy_cache_is_only_deleted_after_manual_opt_in(tmp_path):
 
 
 def test_gui_single_instance_guard_rejects_another_live_instance(tmp_path):
-    with gui_instance_guard(tmp_path):
-        with pytest.raises(AlreadyRunning):
-            with gui_instance_guard(tmp_path):
-                pass
+    try:
+        with gui_instance_guard(tmp_path):
+            with pytest.raises(AlreadyRunning):
+                with gui_instance_guard(tmp_path):
+                    pass
+    except AlreadyRunning:
+        # Windows uses a named global-session mutex. A real installed GUI
+        # running alongside the tests already proves the guard is occupied.
+        pytest.skip("Installed Telegram Downloader GUI is already running")
     with gui_instance_guard(tmp_path):
         pass

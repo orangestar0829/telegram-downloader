@@ -170,8 +170,8 @@ class _App:
 
         self.root = tk.Tk()
         self.root.title("Telegram 下载器")
-        self.root.geometry("820x680")
-        self.root.minsize(720, 560)
+        self.root.geometry("1080x820")
+        self.root.minsize(790, 620)
         self._app_icon = None
         try:
             icon = _icon_path()
@@ -291,11 +291,20 @@ class _App:
         ttk.Label(login, text="状态:").grid(row=0, column=4, sticky="e", **pad)
         ttk.Label(login, textvariable=self.status_var, foreground="#0a6").grid(row=0, column=5, sticky="w", **pad)
 
+        # Let the user give the log panel more room without enlarging
+        # the entire window. Pack the outer login row above the splitter.
+        self.main_split = ttk.Panedwindow(self.root, orient="vertical")
+        self.main_split.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        main_panel = ttk.Frame(self.main_split)
+        log_panel = ttk.Frame(self.main_split)
+        self.main_split.add(main_panel, weight=1)
+        self.main_split.add(log_panel, weight=1)
+
         # Your chats.
-        chats = ttk.LabelFrame(self.root, text="我的群组 / 频道(登录后自动加载)")
+        chats = ttk.LabelFrame(main_panel, text="我的群组 / 频道(登录后自动加载)")
         chats.pack(fill="both", expand=True, **pad)
         cols = ("id", "kind", "name")
-        self.tree = ttk.Treeview(chats, columns=cols, show="headings", height=9, selectmode="browse")
+        self.tree = ttk.Treeview(chats, columns=cols, show="headings", height=5, selectmode="browse")
         self.tree.heading("id", text="ID")
         self.tree.heading("kind", text="类型")
         self.tree.heading("name", text="名称")
@@ -315,7 +324,7 @@ class _App:
         ttk.Entry(side, textvariable=self.manual_var, width=22).pack(fill="x", pady=2)
 
         # Download / advanced tabs.
-        tabs_row = ttk.Frame(self.root)
+        tabs_row = ttk.Frame(main_panel)
         tabs_row.pack(fill="x", **pad)
         nb = ttk.Notebook(tabs_row)
         nb.pack(side="left", fill="x", expand=True)
@@ -325,14 +334,14 @@ class _App:
         nb.add(self._build_parse_tab(), text="解析链接(高级)")
 
         # Download folder row.
-        folder = ttk.Frame(self.root)
+        folder = ttk.Frame(main_panel)
         folder.pack(fill="x", **pad)
         ttk.Label(folder, text="下载到:").pack(side="left")
         ttk.Label(folder, textvariable=self.download_dir_var, foreground="#333").pack(side="left", padx=6)
         ttk.Button(folder, text="更改", command=self._change_dir).pack(side="left")
         ttk.Button(folder, text="打开下载文件夹", command=self._open_folder).pack(side="left", padx=6)
 
-        logframe = ttk.LabelFrame(self.root, text="日志和实时进度")
+        logframe = ttk.LabelFrame(log_panel, text="日志和实时进度（拖动上方分隔线调整高度）")
         logframe.pack(fill="both", expand=True, **pad)
         progress_frame = ttk.LabelFrame(logframe, text="当前下载进度（实时）")
         progress_frame.pack(fill="x", padx=4, pady=(4, 2))
@@ -360,12 +369,28 @@ class _App:
         downloads_tab = ttk.Frame(self.log_tabs)
         self.log_tabs.add(runtime_tab, text="运行日志")
         self.log_tabs.add(downloads_tab, text="下载记录")
-        self.log = self.scrolledtext.ScrolledText(runtime_tab, height=5, wrap="word", state="disabled")
+        self.log = self.scrolledtext.ScrolledText(runtime_tab, height=8, wrap="word", state="disabled", font=("Consolas", 10))
         self.log.pack(fill="both", expand=True)
-        self.download_log = self.scrolledtext.ScrolledText(downloads_tab, height=5, wrap="word", state="disabled")
+        self.download_log = self.scrolledtext.ScrolledText(downloads_tab, height=8, wrap="word", state="disabled", font=("Consolas", 10))
         self.download_log.pack(fill="both", expand=True)
         ttk.Button(toolbar, text="跳转最新", command=self._jump_to_latest_log).pack(side="right", padx=3)
         ttk.Button(toolbar, text="放大查看", command=self._open_active_log_window).pack(side="right", padx=3)
+        self.root.after_idle(self._set_initial_log_split)
+
+    @staticmethod
+    def _initial_split_position(height: int) -> int:
+        """Give logs roughly half the window; keep both panes usable."""
+        return max(180, min(int(height * 0.52), height - 220))
+
+    def _set_initial_log_split(self) -> None:
+        """Set the sash once; later user adjustments remain untouched."""
+        if not self.main_split.winfo_exists():
+            return
+        height = self.main_split.winfo_height()
+        if height <= 1:
+            self.root.after(100, self._set_initial_log_split)
+            return
+        self.main_split.sashpos(0, self._initial_split_position(height))
 
     def _active_log_widget(self):
         return self.download_log if self.log_tabs.index("current") == 1 else self.log
@@ -398,7 +423,7 @@ class _App:
         ttk.Button(controls, text="删除所选", command=self._monitor_remove).pack(side="left", padx=5)
         ttk.Button(controls, text="启用/暂停所选", command=self._monitor_toggle).pack(side="left")
         columns = ("name", "target", "minutes", "direction", "enabled", "next")
-        self.monitor_tree = ttk.Treeview(frame, columns=columns, show="headings", height=7)
+        self.monitor_tree = ttk.Treeview(frame, columns=columns, show="headings", height=4)
         for column, label, width in (
             ("name", "群组 / 频道名称", 210),
             ("target", "频道 ID / 用户名", 165),

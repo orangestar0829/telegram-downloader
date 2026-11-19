@@ -8,6 +8,14 @@ def test_gui_exposes_run_gui() -> None:
     assert callable(gui.run_gui)
 
 
+def test_vertical_split_initial_position_keeps_both_panes_visible() -> None:
+    assert gui._App._initial_split_position(760) == 395
+    for height in (420, 500, 680, 900, 1200):
+        position = gui._App._initial_split_position(height)
+        assert position >= 180
+        assert position <= height - 220
+
+
 def test_silent_bar_supports_tqdm_surface() -> None:
     bar = gui._SilentBar(total=100, unit="B")
     # attribute assignment used by the core modules
