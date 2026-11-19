@@ -6,10 +6,22 @@ from tgdl.config import SESSION_PATH, Settings
 
 
 def build_client(settings: Settings) -> TelegramClient:
+    # Telethon 1.x accepts a SOCKS5 proxy tuple. Use python-socks for async sockets.
+    proxy = None
+    if settings.proxy_host:
+        proxy = (
+            "socks5",
+            settings.proxy_host,
+            settings.proxy_port or 1080,
+            True,
+            settings.proxy_username,
+            settings.proxy_password,
+        )
     return TelegramClient(
         str(SESSION_PATH),
         settings.api_id,
         settings.api_hash,
+        proxy=proxy,
         device_model="TG Media Downloader",
         app_version="1.0.0",
         system_version="Windows",
