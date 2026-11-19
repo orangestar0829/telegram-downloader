@@ -38,6 +38,7 @@ from tgdl.monitor import load_channels, save_channels
 from tgdl.paths import data_dir
 from tgdl.single_instance import AlreadyRunning, gui_instance_guard
 from tgdl.temp_cleanup import inspect_cleanup
+from tgdl.telethon_diagnostics import install_telethon_diagnostics
 
 from tgdl import downloader as _downloader
 from tgdl import http_fetch as _http_fetch
@@ -251,6 +252,8 @@ class _App:
         writer = _QueueWriter(self.log_queue, self._timestamp_formatter)
         sys.stdout = writer
         sys.stderr = writer
+        self._telethon_diag_uninstall = install_telethon_diagnostics(self._log)
+        self._log("[网络诊断] 已启用 Telethon FloodWait、连接恢复和分块停顿诊断\n")
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._drain_log)
@@ -1441,6 +1444,7 @@ class _App:
     def _finish_close(self) -> None:
         if self._download_future is not None and not self._download_future.done():
             return
+        self._telethon_diag_uninstall()
         sys.stdout, sys.stderr = self._stdout, self._stderr
 
         async def disconnect():

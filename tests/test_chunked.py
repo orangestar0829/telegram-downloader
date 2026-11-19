@@ -64,6 +64,61 @@ def test_exact_parallel_assembly(tmp_path):
     assert all(stream.closed for stream in client.streams)
 
 
+def test_idle_diagnostic_reports_pause_and_recovery(tmp_path, capsys):
+    class DelayedStream(Stream):
+        async def __anext__(self):
+            await asyncio.sleep(0.045)
+            return await super().__anext__()
+
+    class DelayedClient(FakeClient):
+        def iter_download(self, document, *, offset, limit, chunk_size, request_size, file_size):
+            stream = DelayedStream(self.data, offset, limit)
+            self.streams.append(stream)
+            return stream
+
+    data = b"a" * REQUEST_BYTES
+    output = tmp_path / "delayed.mp4"
+    asyncio.run(download_chunked(
+        DelayedClient(data), Document(len(data)), output,
+        parts=1, idle_timeout=0.5, diagnostic_label="test/11",
+        diagnostic_idle_seconds=0.01, diagnostic_repeat_seconds=0.2,
+    ))
+    report = capsys.readouterr().out
+    assert "连续" in report and "未收到数据" in report
+    assert "数据恢复" in report
+    assert output.read_bytes() == data
+
+
+def test_idle_diagnostic_watcher_stops_when_cancelled(tmp_path):
+    class NeverStream(Stream):
+        async def __anext__(self):
+            await asyncio.sleep(60)
+            return await super().__anext__()
+
+    class NeverClient(FakeClient):
+        def iter_download(self, document, *, offset, limit, chunk_size, request_size, file_size):
+            stream = NeverStream(self.data, offset, limit)
+            self.streams.append(stream)
+            return stream
+
+    async def run():
+        task = asyncio.create_task(download_chunked(
+            NeverClient(b"x" * REQUEST_BYTES), Document(REQUEST_BYTES),
+            tmp_path / "cancel.mp4", parts=1, idle_timeout=50,
+            diagnostic_idle_seconds=0.01,
+        ))
+        await asyncio.sleep(0.03)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not any(
+            "monitor_ranges" in repr(t.get_coro()) for t in asyncio.all_tasks()
+            if t is not asyncio.current_task()
+        )
+
+    asyncio.run(run())
+
+
 def test_chunked_completion_includes_io_stage_timings(tmp_path):
     from tgdl import downloader
     from types import SimpleNamespace

@@ -507,6 +507,7 @@ async def _download_one(
                                     bar.update(n), transfer.advance(n)
                                 ),
                                 timings=chunk_timings,
+                                diagnostic_label=f"{dest_dir.parent.name}/{base}",
                             )
                         except ChunkDownloadStalled as exc:
                             chunk_timings.clear()

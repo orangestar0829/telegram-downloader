@@ -80,6 +80,9 @@ async def download_chunked(
     idle_timeout: float = CHUNK_IDLE_TIMEOUT,
     retries: int = CHUNK_RETRIES,
     timings: dict[str, float] | None = None,
+    diagnostic_label: str = "",
+    diagnostic_idle_seconds: float = 10.0,
+    diagnostic_repeat_seconds: float = 20.0,
 ) -> Path:
     """Download exact ranges and reject any truncated part before publishing."""
     size = getattr(document, "size", None)
@@ -87,6 +90,8 @@ async def download_chunked(
         raise ValueError("Unknown Telegram document size")
     if idle_timeout <= 0 or retries < 0:
         raise ValueError("idle_timeout must be positive and retries nonnegative")
+    if diagnostic_idle_seconds <= 0 or diagnostic_repeat_seconds <= 0:
+        raise ValueError("diagnostic intervals must be positive")
     ranges = byte_ranges(size, parts)
     output = Path(output)
     prepare_started = time.perf_counter()
@@ -97,15 +102,22 @@ async def download_chunked(
         timings["prepare_s"] = time.perf_counter() - prepare_started
 
     completed = 0
+    states = [
+        {"start": start, "end": end, "last": time.monotonic(), "bytes": 0,
+         "attempt": 0, "done": False, "warned": False, "next_log": 0.0}
+        for start, end in ranges
+    ]
     def report_progress(amount: int) -> None:
         nonlocal completed
         completed += amount
         if on_bytes:
             on_bytes(amount)
 
-    async def fetch_range(start: int, end: int) -> None:
+    async def fetch_range(index: int, start: int, end: int) -> None:
+        state = states[index]
         offset = start
         for attempt in range(retries + 1):
+            state["attempt"] = attempt + 1
             stream = client.iter_download(
                 document, offset=offset,
                 limit=math.ceil((end - offset) / REQUEST_BYTES),
@@ -133,9 +145,25 @@ async def download_chunked(
                             raise ChunkDownloadStalled("Telegram returned an empty chunk")
                         handle.write(memoryview(chunk)[:take])
                         offset += take
+                        now = time.monotonic()
+                        if state["warned"]:
+                            print(
+                                f"[分块诊断] {diagnostic_label} 路{index + 1} 数据恢复，"
+                                f"此前等待{now - state['last']:.1f}s"
+                            )
+                        state["last"] = now
+                        state["bytes"] += take
+                        state["warned"] = False
+                        state["next_log"] = 0.0
                         report_progress(take)
+                state["done"] = True
                 return
             except (TimeoutError, OSError) as exc:
+                print(
+                    f"[分块诊断] {diagnostic_label} 路{index + 1} 请求异常："
+                    f"{type(exc).__name__}，已收{state['bytes'] / 1048576:.1f} MiB，"
+                    f"重试={attempt}/{retries}"
+                )
                 if attempt >= retries:
                     raise ChunkDownloadStalled(
                         f"Range {start}:{end} stalled at {offset} "
@@ -155,8 +183,27 @@ async def download_chunked(
                         # The next attempt or outer fallback still owns recovery.
                         pass
 
+    async def monitor_ranges() -> None:
+        while True:
+            await asyncio.sleep(min(1.0, diagnostic_idle_seconds / 2))
+            now = time.monotonic()
+            for index, state in enumerate(states):
+                if state["done"]:
+                    continue
+                idle = now - state["last"]
+                if idle < diagnostic_idle_seconds or now < state["next_log"]:
+                    continue
+                print(
+                    f"[分块诊断] {diagnostic_label} 路{index + 1}/{len(ranges)} "
+                    f"连续{idle:.1f}s未收到数据，累计{state['bytes'] / 1048576:.1f} MiB，"
+                    f"尝试次数{state['attempt']}"
+                )
+                state["warned"] = True
+                state["next_log"] = now + diagnostic_repeat_seconds
+
     transfer_started = time.perf_counter()
-    tasks = [asyncio.create_task(fetch_range(a, b)) for a, b in ranges]
+    tasks = [asyncio.create_task(fetch_range(i, a, b)) for i, (a, b) in enumerate(ranges)]
+    monitor = asyncio.create_task(monitor_ranges())
     try:
         await asyncio.gather(*tasks)
     except BaseException:
@@ -164,6 +211,9 @@ async def download_chunked(
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
+    finally:
+        monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
 
     if output.stat().st_size != size:
         raise IOError(f"File size mismatch: {output.stat().st_size} != {size}")
