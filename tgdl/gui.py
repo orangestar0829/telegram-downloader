@@ -167,6 +167,13 @@ class _App:
         self.api_hash_var = tk.StringVar(value=env["api_hash"])
         self.phone_var = tk.StringVar(value=env["phone"])
         self.download_dir_var = tk.StringVar(value=env["download_dir"] or str(default_download_dir()))
+        self.proxy_host_var = tk.StringVar(value=env["proxy_host"])
+        self.proxy_port_var = tk.StringVar(value=env["proxy_port"])
+        self.proxy_username_var = tk.StringVar(value=env["proxy_username"])
+        self.proxy_password_var = tk.StringVar(value=env["proxy_password"])
+        self.media_concurrency_var = tk.StringVar(value=env["media_concurrency"])
+        self.media_retries_var = tk.StringVar(value=env["media_retries"])
+        self.chunk_concurrency_var = tk.StringVar(value=env["chunk_concurrency"])
         self.status_var = tk.StringVar(value="未登录")
         self.manual_var = tk.StringVar()
 
@@ -384,6 +391,11 @@ class _App:
         if not selected:
             self.messagebox.showwarning("未选择", "请先勾选要保存的图片/视频。")
             return
+        try:
+            concurrency, retries, chunk_concurrency = self._media_options()
+        except ValueError as exc:
+            self.messagebox.showwarning("设置错误", str(exc))
+            return
 
         async def coro():
             await self._ensure_client()
@@ -392,6 +404,9 @@ class _App:
                 selected,
                 download_dir=self.settings.download_dir,
                 title=self._gallery_title or "gallery",
+                concurrency=concurrency,
+                retries=retries,
+                chunk_concurrency=chunk_concurrency,
             )
             print("保存完成。点『打开下载文件夹』查看。\n")
 
@@ -411,6 +426,18 @@ class _App:
         ttk.Entry(frame, textvariable=self.dl_limit, width=10).grid(row=1, column=1, sticky="w", **pad)
         self.download_btn = ttk.Button(frame, text="下载所选", command=self.on_download)
         self.download_btn.grid(row=1, column=3, sticky="e", **pad)
+        ttk.Label(frame, text="并发数 (1-8)").grid(row=2, column=0, sticky="w", **pad)
+        ttk.Entry(frame, textvariable=self.media_concurrency_var, width=8).grid(
+            row=2, column=1, sticky="w", **pad
+        )
+        ttk.Label(frame, text="失败重试 (0-5)").grid(row=2, column=2, sticky="w", **pad)
+        ttk.Entry(frame, textvariable=self.media_retries_var, width=8).grid(
+            row=2, column=3, sticky="w", **pad
+        )
+        ttk.Label(frame, text="单文件分块并发 (1-8)").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Entry(frame, textvariable=self.chunk_concurrency_var, width=8).grid(
+            row=3, column=1, sticky="w", **pad
+        )
         frame.columnconfigure(2, weight=1)
         return frame
 
@@ -454,6 +481,21 @@ class _App:
     def _current_download_dir(self) -> Path:
         raw = self.download_dir_var.get().strip()
         return Path(raw).expanduser() if raw else default_download_dir()
+
+    def _media_options(self) -> tuple[int, int, int]:
+        try:
+            workers = int(self.media_concurrency_var.get().strip())
+            retries = int(self.media_retries_var.get().strip())
+            chunks = int(self.chunk_concurrency_var.get().strip())
+            if not 1 <= workers <= 8 or not 0 <= retries <= 5 or not 1 <= chunks <= 8:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("文件/分块并发数必须为 1-8，失败重试必须为 0-5") from exc
+        values = read_env_values()
+        values.update(media_concurrency=str(workers), media_retries=str(retries),
+                      chunk_concurrency=str(chunks))
+        update_env(values)
+        return workers, retries, chunks
 
     def _selected_target(self) -> str | None:
         sel = self.tree.selection()
@@ -607,6 +649,11 @@ class _App:
             self.messagebox.showwarning("未选择", "至少选择一种下载类型。")
             return
         limit = self.dl_limit.get().strip()
+        try:
+            concurrency, retries, chunk_concurrency = self._media_options()
+        except ValueError as exc:
+            self.messagebox.showwarning("设置错误", str(exc))
+            return
 
         async def coro():
             await self._ensure_client()
@@ -620,6 +667,9 @@ class _App:
                 until=None,
                 skip_existing=True,
                 dry_run=False,
+                concurrency=concurrency,
+                retries=retries,
+                chunk_concurrency=chunk_concurrency,
             )
             print("下载完成。点『打开下载文件夹』查看。\n")
 
@@ -664,12 +714,9 @@ class _App:
             self.download_dir_var.set(chosen)
             self._save_dir_only()
             if self.settings is not None:
-                self.settings = Settings(
-                    api_id=self.settings.api_id,
-                    api_hash=self.settings.api_hash,
-                    phone=self.settings.phone,
-                    download_dir=Path(chosen),
-                )
+                from dataclasses import replace
+
+                self.settings = replace(self.settings, download_dir=Path(chosen))
 
     def _open_folder(self) -> None:
         folder = self._current_download_dir()
@@ -687,21 +734,62 @@ class _App:
     def _open_settings(self) -> None:
         tk, ttk = self.tk, self.ttk
         win = tk.Toplevel(self.root)
-        win.title("设置")
+        win.title("设置：Telegram API / SOCKS5 代理")
         win.transient(self.root)
         pad = {"padx": 8, "pady": 6}
-        ttk.Label(win, text="api_id").grid(row=0, column=0, sticky="w", **pad)
-        ttk.Entry(win, textvariable=self.api_id_var, width=20).grid(row=0, column=1, **pad)
-        ttk.Label(win, text="api_hash").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(win, textvariable=self.api_hash_var, width=42).grid(row=1, column=1, **pad)
-        ttk.Label(win, text="下载目录").grid(row=2, column=0, sticky="w", **pad)
-        ttk.Entry(win, textvariable=self.download_dir_var, width=42).grid(row=2, column=1, **pad)
+        fields = (
+            ("api_id", self.api_id_var, False),
+            ("api_hash", self.api_hash_var, False),
+            ("SOCKS5 主机（留空则不用代理）", self.proxy_host_var, False),
+            ("SOCKS5 端口（例如 1080）", self.proxy_port_var, False),
+            ("代理用户名（可空）", self.proxy_username_var, False),
+            ("代理密码（可空）", self.proxy_password_var, True),
+            ("下载目录", self.download_dir_var, False),
+        )
+        for row, (name, var, secret) in enumerate(fields):
+            ttk.Label(win, text=name).grid(row=row, column=0, sticky="w", **pad)
+            ttk.Entry(win, textvariable=var, width=43, show="*" if secret else "").grid(
+                row=row, column=1, sticky="we", **pad
+            )
 
         def save_and_close():
-            self.on_save_creds()
+            host = self.proxy_host_var.get().strip()
+            port = self.proxy_port_var.get().strip()
+            if port and not host:
+                self.messagebox.showwarning("代理设置", "填写端口时必须填写 SOCKS5 主机。")
+                return
+            if host:
+                try:
+                    port_number = int(port or "1080")
+                    if not 1 <= port_number <= 65535:
+                        raise ValueError
+                except ValueError:
+                    self.messagebox.showwarning("代理设置", "SOCKS5 端口必须在 1-65535 之间。")
+                    return
+                port = str(port_number)
+            else:
+                port = ""
+            values = read_env_values()
+            values.update({
+                "api_id": self.api_id_var.get().strip(),
+                "api_hash": self.api_hash_var.get().strip(),
+                "phone": self.phone_var.get().strip(),
+                "download_dir": self.download_dir_var.get().strip() or str(default_download_dir()),
+                "proxy_host": host,
+                "proxy_port": port,
+                "proxy_username": self.proxy_username_var.get().strip(),
+                "proxy_password": self.proxy_password_var.get(),
+            })
+            update_env(values)
             win.destroy()
+            if self.client is not None:
+                self.messagebox.showinfo("设置已保存", "代理设置在重启下载器后生效。")
+            else:
+                self._log("设置已保存。\n")
 
-        ttk.Button(win, text="保存", command=save_and_close).grid(row=3, column=1, sticky="e", **pad)
+        ttk.Button(win, text="保存", command=save_and_close).grid(
+            row=len(fields), column=1, sticky="e", **pad
+        )
 
     # ---------- lifecycle ----------
     def _on_close(self) -> None:

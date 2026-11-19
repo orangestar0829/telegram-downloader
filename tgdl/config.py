@@ -15,6 +15,13 @@ _ENV_KEYS = {
     "TELEGRAM_API_HASH": "api_hash",
     "TELEGRAM_PHONE": "phone",
     "DOWNLOAD_DIR": "download_dir",
+    "SOCKS5_HOST": "proxy_host",
+    "SOCKS5_PORT": "proxy_port",
+    "SOCKS5_USERNAME": "proxy_username",
+    "SOCKS5_PASSWORD": "proxy_password",
+    "MEDIA_CONCURRENCY": "media_concurrency",
+    "MEDIA_RETRIES": "media_retries",
+    "CHUNK_CONCURRENCY": "chunk_concurrency",
 }
 
 
@@ -24,6 +31,13 @@ class Settings:
     api_hash: str
     phone: str | None
     download_dir: Path
+    proxy_host: str | None = None
+    proxy_port: int | None = None
+    proxy_username: str | None = None
+    proxy_password: str | None = None
+    media_concurrency: int = 3
+    media_retries: int = 2
+    chunk_concurrency: int = 1
 
 
 def default_download_dir() -> Path:
@@ -71,7 +85,14 @@ def credentials_available() -> bool:
 
 def read_env_values() -> dict[str, str]:
     """Read raw .env values for pre-filling the GUI (no validation)."""
-    values = {"api_id": "", "api_hash": "", "phone": "", "download_dir": str(default_download_dir())}
+    values = {
+        "api_id": "", "api_hash": "", "phone": "",
+        "download_dir": str(default_download_dir()),
+        "proxy_host": "", "proxy_port": "",
+        "proxy_username": "", "proxy_password": "",
+        "media_concurrency": "3", "media_retries": "2",
+        "chunk_concurrency": "1",
+    }
     if ENV_PATH.exists():
         for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
@@ -93,6 +114,18 @@ def update_env(values: dict[str, str]) -> Path:
         "TELEGRAM_PHONE": values.get("phone", ""),
         "DOWNLOAD_DIR": values.get("download_dir", "") or "./downloads",
     }
+    # Preserve existing optional settings when a caller updates only credentials or directory.
+    for key, name in (
+        ("SOCKS5_HOST", "proxy_host"),
+        ("SOCKS5_PORT", "proxy_port"),
+        ("SOCKS5_USERNAME", "proxy_username"),
+        ("SOCKS5_PASSWORD", "proxy_password"),
+        ("MEDIA_CONCURRENCY", "media_concurrency"),
+        ("MEDIA_RETRIES", "media_retries"),
+        ("CHUNK_CONCURRENCY", "chunk_concurrency"),
+    ):
+        if name in values:
+            desired[key] = values[name]
     existing_lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
     seen: set[str] = set()
     out: list[str] = []
@@ -130,9 +163,38 @@ def load_settings() -> Settings:
     except ValueError as exc:
         raise SystemExit("TELEGRAM_API_ID must be a number.") from exc
 
+    host = os.getenv("SOCKS5_HOST", "").strip() or None
+    raw_port = os.getenv("SOCKS5_PORT", "").strip()
+    if raw_port and host is None:
+        raise SystemExit("SOCKS5_PORT requires SOCKS5_HOST.")
+    proxy_port = _bounded_int(raw_port or "1080", "SOCKS5_PORT", 1, 65535) if host else None
+
     return Settings(
         api_id=api_id,
         api_hash=api_hash,
         phone=phone,
         download_dir=download_dir,
+        proxy_host=host,
+        proxy_port=proxy_port,
+        proxy_username=os.getenv("SOCKS5_USERNAME", "").strip() or None,
+        proxy_password=os.getenv("SOCKS5_PASSWORD", "") or None,
+        media_concurrency=_bounded_int(
+            os.getenv("MEDIA_CONCURRENCY", "3"), "MEDIA_CONCURRENCY", 1, 8
+        ),
+        media_retries=_bounded_int(
+            os.getenv("MEDIA_RETRIES", "2"), "MEDIA_RETRIES", 0, 5
+        ),
+        chunk_concurrency=_bounded_int(
+            os.getenv("CHUNK_CONCURRENCY", "1"), "CHUNK_CONCURRENCY", 1, 8
+        ),
     )
+
+
+def _bounded_int(raw: str, name: str, minimum: int, maximum: int) -> int:
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"{name} must be a number.") from exc
+    if not minimum <= value <= maximum:
+        raise SystemExit(f"{name} must be between {minimum} and {maximum}.")
+    return value

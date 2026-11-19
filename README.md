@@ -245,3 +245,17 @@ telegram-media-downloader/
 
 **只下到一部分就停了**  
 遇到限流。看终端里的秒数，等结束再执行同一条命令（会跳过已有文件）。
+
+## 本 Fork 的 SOCKS5 / 媒体性能改进
+
+- **代理**：GUI → 设置 → SOCKS5 主机、端口（例如 Karing 本地监听的 `127.0.0.1:1080`）。保存后重启下载器，所有 Telegram MTProto 登录和媒体请求会通过该 SOCKS5 代理。不设置则维持原来的直接连接或系统 TUN 路由。这里应填写 Karing **实际 SOCKS5 监听端口**，而不是代理节点的远端端口。
+- **加解密**：安装 `cryptg`，由 Telethon 自动优先使用；提升幅度依设备及网络条件而异。
+- **批量下载与画廊保存**：并发 1–8（默认 3），每个失败文件最多重试 0–5 次（默认 2），每个文件使用独立临时目录防止文件名冲突。遇到 Telegram FloodWait 时停止并发任务，不强制重试。
+- **CLI**：`python -m tgdl download -c GROUP_ID --concurrency 3 --retries 2`。
+- **重要**：这里实现的是多个文件之间的并发，不对单个视频做分块并行；如家宽到代理节点的线路本身受限，并发与 `cryptg` 不一定提速。
+
+### 单文件分块并发下载
+
+CHUNK_CONCURRENCY 默认 1，设置为 2/4/8 后对不小于 16 MiB 的 Telegram Document 启用 Telethon iter_download 的并行字节区间读取。每段有严格长度校验，只有全部区间下载成功才将临时文件移动为最终文件。纯字节拼接，不需 FFmpeg，不重新编码；较小文件及普通相册图片仍由标准下载流程处理。文件并发与分块并发独立，但会叠加网络请求；不保证速度提升。
+
+命令行：python -m tgdl download -c GROUP_ID --concurrency 3 --chunk-concurrency 4 --retries 2

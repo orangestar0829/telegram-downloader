@@ -1,0 +1,33 @@
+name: Test Telegram downloader
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [feature/native-socks5-cryptg-media-downloads]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        telethon-version: ['1.44.0', '1.46.0']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+          python -m pip install "telethon==${{ matrix.telethon-version }}"
+      - name: Compile sources
+        run: python -m compileall -q tgdl tests
+      - name: Run offline tests
+        run: python -m pytest -q

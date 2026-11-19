@@ -17,7 +17,7 @@ from typing import Iterable
 
 from tgdl.downloader import (
     DownloadStats,
-    _download_one,
+    download_many,
     classify_message,
     safe_name,
 )
@@ -98,6 +98,9 @@ async def save_items(
     download_dir: Path,
     title: str,
     skip_existing: bool = True,
+    concurrency: int = 3,
+    retries: int = 2,
+    chunk_concurrency: int = 1,
 ) -> SaveResult:
     """Download the full-quality files for the selected media items."""
     folder = _folder_for(download_dir, title)
@@ -106,26 +109,23 @@ async def save_items(
     photos.mkdir(parents=True, exist_ok=True)
     videos.mkdir(parents=True, exist_ok=True)
 
-    result = SaveResult()
-    for item in items:
-        dest = photos if item.kind == "photo" else videos
-        date = item.date or datetime.now(timezone.utc)
-        base = f"{date.strftime('%Y%m%d')}_{item.id}"
-        stats = DownloadStats()
-        try:
-            await _download_one(
-                client, item.message, dest, base, skip_existing=skip_existing, stats=stats
-            )
-        except Exception as exc:  # noqa: BLE001
-            result.failed += 1
-            print(f"save failed {item.id}: {exc}")
-            continue
-        result.saved += stats.saved
-        result.skipped += stats.skipped
-        result.failed += stats.failed
-        if stats.saved:
-            found = sorted(dest.glob(f"{base}.*"))
-            if found:
-                result.files.append(found[-1])
+    stats = DownloadStats()
+
+    async def jobs():
+        for item in items:
+            dest = photos if item.kind == "photo" else videos
+            date = item.date or datetime.now(timezone.utc)
+            base = f"{date.strftime('%Y%m%d')}_{item.id}"
+            yield item.message, dest, base
+
+    saved_paths = await download_many(
+        client, jobs(), stats=stats, concurrency=concurrency,
+        retries=retries, skip_existing=skip_existing,
+        chunk_concurrency=chunk_concurrency,
+    )
+    result = SaveResult(
+        saved=stats.saved, skipped=stats.skipped, failed=stats.failed,
+        files=sorted(saved_paths),
+    )
     print(f"[gallery] saved={result.saved} skipped={result.skipped} failed={result.failed}")
     return result
