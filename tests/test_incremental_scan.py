@@ -75,7 +75,11 @@ def test_full_then_incremental_and_offline_resume(tmp_path, monkeypatch, directi
         )
 
     asyncio.run(scan())
-    asyncio.run(scan())
+    second = asyncio.run(scan())
+    assert second.first_message_id != 0
+    assert second.last_message_id != 0
+    assert second.scan_upper == 5
+    assert second.matched == 2
     asyncio.run(scan())
     history = DownloadHistory(file_path)
     assert history.scan_state(123) == (5, 0, 0, direction)
@@ -152,3 +156,33 @@ def test_failed_media_retried_when_no_new_messages(tmp_path, monkeypatch):
     assert hist.contains(123, 2)
     assert hist.failures(123) == []
     hist.close()
+
+
+def test_download_completion_includes_channel_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(downloader, "Message", FakeMessage)
+    monkeypatch.setattr(downloader, "classify_message", lambda msg: "video")
+
+    async def resolve(client, target):
+        return SimpleNamespace(id=321, title="群组名称")
+
+    monkeypatch.setattr(downloader, "resolve_channel", resolve)
+    labels = []
+    resolved = []
+
+    async def fake_many(client, jobs, *, on_saved, **kwargs):
+        async for msg, _folder, _base in jobs:
+            on_saved(f"[下载完成] 20261119_{msg.id}.mp4")
+
+    monkeypatch.setattr(downloader, "download_many", fake_many)
+
+    async def run():
+        await downloader.download_channel(
+            FakeTelegram([12]), target="test", download_dir=tmp_path,
+            types={"video"}, limit=None, since=None, until=None,
+            dry_run=False, on_saved=labels.append,
+            on_channel_resolved=lambda title, peer_id: resolved.append((title, peer_id)),
+        )
+
+    asyncio.run(run())
+    assert resolved == [("群组名称", 321)]
+    assert labels == ["[群组名称] [下载完成] 20261119_12.mp4"]

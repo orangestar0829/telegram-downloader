@@ -31,6 +31,7 @@ def load_channels(path: Path | None = None) -> list[dict]:
                 "types": str(item.get("types", "photo,video")),
                 "enabled": bool(item.get("enabled", True)),
                 "direction": item.get("direction", "newest") if item.get("direction") in ("newest", "oldest") else "newest",
+                "name": str(item.get("name", "")).strip(),
             })
     return result
 

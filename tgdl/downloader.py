@@ -196,6 +196,11 @@ class DownloadStats:
         self.skipped = 0
         self.failed = 0
         self.more_pending = False
+        self.matched = 0
+        self.first_message_id = 0
+        self.last_message_id = 0
+        self.scan_upper = 0
+        self.scan_completed = 0
 
 
 async def download_channel(
@@ -216,9 +221,18 @@ async def download_channel(
     monitor_direction: str | None = None,
     monitor_batch_size: int = 100,
     stop_event: threading.Event | None = None,
+    on_channel_resolved: Callable[[str, int], None] | None = None,
 ) -> DownloadStats:
     entity = await resolve_channel(client, target)
     title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
+    if on_channel_resolved is not None:
+        on_channel_resolved(str(title), int(entity.id))
+    def saved_with_source(detail: str) -> None:
+        labeled = f"[{title}] {detail}"
+        if on_saved is not None:
+            on_saved(labeled)
+        else:
+            print(labeled)
     folder = download_dir / safe_name(str(title))
     photos_dir = folder / "photos"
     videos_dir = folder / "videos"
@@ -269,6 +283,12 @@ async def download_channel(
                 scan_upper = 0
             else:
                 history.save_scan_state(peer_id, scan_completed, scan_upper, 0, monitor_direction, media_types)
+        stats.scan_upper = scan_upper
+        stats.scan_completed = scan_completed
+        print(
+            f"[监控] {title}: 方向={'旧→新' if monitor_direction == 'oldest' else '新→旧'}"
+            f"，已完成检查点={scan_completed}，区间上限={scan_upper}"
+        )
 
         # Retry failures once per scan window, including when nothing new
         # arrived; do not retry the same failures on every 100-item batch.
@@ -290,7 +310,7 @@ async def download_channel(
                 await _download_with_retry(
                     client, failed_message, failed_dir, failed_base, stats,
                     skip_existing=True, retries=retries, chunk_concurrency=chunk_concurrency,
-                    history=history, peer_id=peer_id, on_saved=on_saved,
+                    history=history, peer_id=peer_id, on_saved=saved_with_source,
                 )
             except Exception as exc:
                 print(f"[监控] 重试消息 {failed_id} 失败：{exc}")
@@ -329,6 +349,9 @@ async def download_channel(
             if not isinstance(message, Message) or message.date is None:
                 continue
             last_seen = int(message.id)
+            if not stats.first_message_id:
+                stats.first_message_id = last_seen
+            stats.last_message_id = last_seen
             msg_date = message.date if message.date.tzinfo else message.date.replace(tzinfo=timezone.utc)
             if since is not None and msg_date < since:
                 break
@@ -336,6 +359,7 @@ async def download_channel(
             if kind is None or kind not in types:
                 continue
             scanned += 1
+            stats.matched += 1
             if monitored:
                 batch_ids.append(int(message.id))
             base = f"{msg_date.strftime('%Y%m%d')}_{message.id}"
@@ -357,7 +381,7 @@ async def download_channel(
                 retries=retries, skip_existing=skip_existing,
                 chunk_concurrency=chunk_concurrency,
                 history=history, peer_id=peer_id,
-                on_saved=on_saved,
+                on_saved=saved_with_source,
                 stop_event=stop_event,
             )
             if monitored and history is not None:
@@ -369,11 +393,17 @@ async def download_channel(
                     scan_cursor = last_seen
                 if not interrupted and not reached_batch_limit:
                     history.save_scan_state(peer_id, scan_upper, 0, 0, monitor_direction, media_types)
-                    print(f"[监控] {title}: 本轮区间扫描完成，检查点 {scan_upper}")
+                    print(
+                        f"[监控] {title}: 本轮区间扫描完成，检查点={scan_upper}，"
+                        f"本批消息ID={stats.first_message_id or '-'}→{stats.last_message_id or '-'}"
+                    )
                 elif last_seen and not interrupted:
                     history.save_scan_state(peer_id, scan_completed, scan_upper, scan_cursor, monitor_direction, media_types)
                     stats.more_pending = True
-                    print(f"[监控] {title}: 批次完成，处理媒体 {scanned} 条，等待下一批")
+                    print(
+                        f"[监控] {title}: 批次完成，消息ID={stats.first_message_id}→{stats.last_message_id}，"
+                        f"游标={scan_cursor}，匹配媒体={scanned}，等待下一批"
+                    )
         except FloodWaitError as exc:
             print(f"\nRate limited. Wait {exc.seconds}s then retry this channel.")
             raise

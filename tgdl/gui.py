@@ -206,6 +206,7 @@ class _App:
             self._monitored = []
             self.log_queue.put(f"[监控] 配置读取失败：{exc}\n")
         self._monitor_next: dict[str, float] = {}
+        self._monitor_totals: dict[str, dict[str, int]] = {}
         self._monitor_job = None
         self._monitor_active = False
 
@@ -358,10 +359,11 @@ class _App:
         ttk.Button(controls, text="更新所选", command=self._monitor_update).pack(side="left", padx=4)
         ttk.Button(controls, text="删除所选", command=self._monitor_remove).pack(side="left", padx=5)
         ttk.Button(controls, text="启用/暂停所选", command=self._monitor_toggle).pack(side="left")
-        columns = ("target", "minutes", "direction", "enabled", "next")
+        columns = ("name", "target", "minutes", "direction", "enabled", "next")
         self.monitor_tree = ttk.Treeview(frame, columns=columns, show="headings", height=7)
         for column, label, width in (
-            ("target", "频道 ID / 用户名", 220),
+            ("name", "群组 / 频道名称", 210),
+            ("target", "频道 ID / 用户名", 165),
             ("minutes", "间隔(分钟)", 95),
             ("direction", "扫描方向", 105),
             ("enabled", "状态", 85),
@@ -389,7 +391,7 @@ class _App:
             due = self._monitor_next.get(item["target"])
             next_time = time.strftime("%H:%M:%S", time.localtime(due)) if due and item["enabled"] and self._monitor_active else "-"
             values = (
-                item["target"], item["minutes"],
+                item.get("name") or "（待获取）", item["target"], item["minutes"],
                 "旧→新" if item.get("direction") == "oldest" else "新→旧",
                 "启用" if item["enabled"] else "暂停", next_time,
             )
@@ -399,6 +401,15 @@ class _App:
                     self.monitor_tree.item(iid, values=values)
             else:
                 self.monitor_tree.insert("", "end", iid=iid, values=values)
+
+    def _monitor_set_name(self, target: str, title: str) -> None:
+        """Called only on Tk's main thread, never directly from Telethon."""
+        for item in self._monitored:
+            if item["target"] == target and title and title != item.get("name"):
+                item["name"] = title
+                save_channels(self._monitored)
+                self._monitor_refresh()
+                break
 
     def _monitor_add(self):
         target = self._selected_target()
@@ -416,11 +427,22 @@ class _App:
         if not types:
             self.messagebox.showwarning("监控", "至少选择一种下载类型")
             return
+        existing_name = next(
+            (item.get("name", "") for item in self._monitored if item["target"] == target),
+            "",
+        )
+        if not existing_name:
+            selected = self.tree.selection()
+            if selected:
+                values = self.tree.item(selected[0], "values")
+                if values and str(values[0]) == target and len(values) > 2:
+                    existing_name = str(values[2])
         self.monitor_tree.selection_remove(self.monitor_tree.selection())
         self._monitored = [item for item in self._monitored if item["target"] != target]
         self._monitored.append({
             "target": target, "minutes": minutes, "types": types, "enabled": True,
             "direction": "oldest" if self.monitor_direction_var.get() == "从旧到新" else "newest",
+            "name": existing_name,
         })
         self._monitor_next[target] = time.time()
         save_channels(self._monitored)
@@ -512,7 +534,8 @@ class _App:
                     break
                 self._monitor_cursor = (index + 1) % total
                 self._monitor_next[item["target"]] = now + item["minutes"] * 60
-                self._log(f"[监控] 开始扫描 {item['target']}，间隔 {item['minutes']} 分钟\n")
+                display = item.get("name") or item["target"]
+                self._log(f"[监控] 开始扫描 {display} ({item['target']})，间隔 {item['minutes']} 分钟\n")
                 self._start_channel_download(
                     item["target"], item["types"], "", concurrency, retries, chunks,
                     monitor_item=item,
@@ -936,6 +959,16 @@ class _App:
             self.tree.delete(*self.tree.get_children())
             for row in rows:
                 self.tree.insert("", "end", values=row)
+            names = {str(row[0]): str(row[2]) for row in rows if row[2]}
+            changed = False
+            for item in self._monitored:
+                title = names.get(str(item["target"]))
+                if title and title != item.get("name"):
+                    item["name"] = title
+                    changed = True
+            if changed:
+                save_channels(self._monitored)
+                self._monitor_refresh()
 
         self.root.after(0, apply)
         print(f"已加载 {len(rows)} 个群组/频道。点选一个,然后『下载所选』。")
@@ -984,6 +1017,10 @@ class _App:
 
         self._stop_download.clear()
 
+        def channel_resolved(title: str, peer_id: int) -> None:
+            if monitor_item is not None:
+                self.root.after(0, lambda: self._monitor_set_name(target, title))
+
         async def coro():
             self._download_task = asyncio.current_task()
             try:
@@ -1005,6 +1042,7 @@ class _App:
                     monitor_direction=monitor_item.get("direction", "newest") if monitor_item else None,
                     monitor_batch_size=100,
                     stop_event=self._stop_download,
+                    on_channel_resolved=channel_resolved,
                 )
                 print("下载完成。点『打开下载文件夹』查看。\n")
                 return result
@@ -1021,6 +1059,8 @@ class _App:
                 if monitor_item is not None and result.more_pending:
                     # Run the next bounded batch soon, after giving other channels a turn.
                     self._monitor_next[target] = time.time()
+                if monitor_item is not None:
+                    self.root.after(0, lambda: self._monitor_log_progress(target, result))
             except concurrent.futures.CancelledError:
                 self._log("[下载] 已取消当前任务\n")
             except Exception as exc:
@@ -1033,6 +1073,27 @@ class _App:
                 self.root.after(0, on_ui)
 
         future.add_done_callback(finished)
+
+    def _monitor_log_progress(self, target: str, result) -> None:
+        """Aggregate one scan window's batches in the running GUI session."""
+        total = self._monitor_totals.setdefault(
+            target, {"matched": 0, "saved": 0, "skipped": 0, "failed": 0, "batches": 0},
+        )
+        total["batches"] += 1
+        for key in ("matched", "saved", "skipped", "failed"):
+            total[key] += getattr(result, key)
+        name = next(
+            (item.get("name") or target for item in self._monitored if item["target"] == target),
+            target,
+        )
+        status = "还有下一批" if result.more_pending else "本轮扫描已结束"
+        self._log(
+            f"[监控进度] {name}: {status}；本次运行累计 {total['batches']} 批，"
+            f"匹配={total['matched']} 下载={total['saved']} "
+            f"跳过={total['skipped']} 失败={total['failed']}\n"
+        )
+        if not result.more_pending:
+            self._monitor_totals.pop(target, None)
 
     def on_toggle_auto(self) -> None:
         if self._auto_config is not None:
