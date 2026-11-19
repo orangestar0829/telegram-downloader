@@ -12,6 +12,7 @@ to it and receives log output through a thread-safe queue.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import os
 import queue
 import subprocess
@@ -183,6 +184,11 @@ class _App:
         self.type_video = tk.BooleanVar(value=True)
         self.type_anim = tk.BooleanVar(value=False)
         self.dl_limit = tk.StringVar()
+        self.auto_minutes_var = tk.StringVar(value="30")
+        self.auto_status_var = tk.StringVar(value="定时下载：未启动")
+        self._auto_job_id = None
+        self._auto_config = None
+        self._download_future = None
 
         # gallery state
         self.g_limit = tk.StringVar(value="60")
@@ -433,6 +439,15 @@ class _App:
         ttk.Entry(frame, textvariable=self.dl_limit, width=10).grid(row=1, column=1, sticky="w", **pad)
         self.download_btn = ttk.Button(frame, text="下载所选", command=self.on_download)
         self.download_btn.grid(row=1, column=3, sticky="e", **pad)
+        ttk.Label(frame, text="自动下载间隔(分钟)").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Entry(frame, textvariable=self.auto_minutes_var, width=8).grid(
+            row=4, column=1, sticky="w", **pad
+        )
+        self.auto_btn = ttk.Button(frame, text="启动定时", command=self.on_toggle_auto)
+        self.auto_btn.grid(row=4, column=2, sticky="w", **pad)
+        ttk.Label(frame, textvariable=self.auto_status_var).grid(
+            row=5, column=0, columnspan=4, sticky="w", **pad
+        )
         ttk.Label(frame, text="并发数 (1-8)").grid(row=2, column=0, sticky="w", **pad)
         ttk.Entry(frame, textvariable=self.media_concurrency_var, width=8).grid(
             row=2, column=1, sticky="w", **pad
@@ -676,6 +691,9 @@ class _App:
         )
 
     def on_download(self) -> None:
+        if self._download_future is not None and not self._download_future.done():
+            self._log("[下载] 已有批量任务在执行，本次跳过。\n")
+            return
         target = self._selected_target()
         if not target:
             self.messagebox.showwarning("未选择", "请先在列表里选一个群组/频道,或手动输入。")
@@ -689,6 +707,17 @@ class _App:
             concurrency, retries, chunk_concurrency = self._media_options()
         except ValueError as exc:
             self.messagebox.showwarning("设置错误", str(exc))
+            return
+
+        self._start_channel_download(
+            target, types_raw, limit, concurrency, retries, chunk_concurrency
+        )
+
+    def _start_channel_download(
+        self, target, types_raw, limit, concurrency, retries, chunk_concurrency
+    ) -> None:
+        if self._download_future is not None and not self._download_future.done():
+            self._log("[定时] 上一次下载尚未结束，跳过本轮。\n")
             return
 
         async def coro():
@@ -709,7 +738,64 @@ class _App:
             )
             print("下载完成。点『打开下载文件夹』查看。\n")
 
-        self._run_task(coro(), self.download_btn)
+        self.download_btn.config(state="disabled")
+        future = self.loop.submit(coro())
+        self._download_future = future
+
+        def finished(fut: concurrent.futures.Future) -> None:
+            try:
+                fut.result()
+            except Exception as exc:
+                self._log(f"[下载错误] {exc}\n")
+            finally:
+                self.root.after(0, lambda: self.download_btn.config(state="normal"))
+
+        future.add_done_callback(finished)
+
+    def on_toggle_auto(self) -> None:
+        if self._auto_config is not None:
+            self._stop_auto()
+            return
+        target = self._selected_target()
+        types_raw = self._types_string()
+        if not target or not types_raw:
+            self.messagebox.showwarning("定时下载", "请先选择频道和下载类型。")
+            return
+        try:
+            minutes = int(self.auto_minutes_var.get().strip())
+            if not 1 <= minutes <= 1440:
+                raise ValueError("间隔必须在 1-1440 分钟之间")
+            limit = self.dl_limit.get().strip()
+            if limit and int(limit) <= 0:
+                raise ValueError("数量上限必须为正整数")
+            concurrency, retries, chunks = self._media_options()
+        except ValueError as exc:
+            self.messagebox.showwarning("定时下载", f"参数错误：{exc}")
+            return
+        self._auto_config = (target, types_raw, limit, concurrency, retries, chunks)
+        self._auto_interval_ms = minutes * 60 * 1000
+        self.auto_btn.config(text="停止定时")
+        self._log(f"[定时] 已启动：频道 {target}，每 {minutes} 分钟检查一次，立即执行首轮。\n")
+        self._auto_tick()
+
+    def _auto_tick(self) -> None:
+        if self._auto_config is None:
+            return
+        self._auto_job_id = None
+        self._start_channel_download(*self._auto_config)
+        self.auto_status_var.set(
+            f"定时下载：运行中（{self._auto_config[0]}，每 {self._auto_interval_ms // 60000} 分钟）"
+        )
+        self._auto_job_id = self.root.after(self._auto_interval_ms, self._auto_tick)
+
+    def _stop_auto(self) -> None:
+        if self._auto_job_id is not None:
+            self.root.after_cancel(self._auto_job_id)
+            self._auto_job_id = None
+        self._auto_config = None
+        self.auto_btn.config(text="启动定时")
+        self.auto_status_var.set("定时下载：未启动")
+        self._log("[定时] 已停止后续检查；当前下载不会中断。\n")
 
     def on_parse(self) -> None:
         target = self._selected_target()
@@ -829,6 +915,8 @@ class _App:
 
     # ---------- lifecycle ----------
     def _on_close(self) -> None:
+        if self._auto_config is not None:
+            self._stop_auto()
         sys.stdout, sys.stderr = self._stdout, self._stderr
         try:
             if self.client is not None:
