@@ -4,18 +4,13 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from tgdl.paths import prepare_data_dir
 
 def default_history_path() -> Path:
-    """Stable user data path, outside PyInstaller's replaceable _internal tree."""
-    if sys.platform == "win32":
-        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        return Path(base) / "TelegramDownloader" / "tgdl_download_history.sqlite3"
-    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-    return Path(base) / "TelegramDownloader" / "tgdl_download_history.sqlite3"
+    """Use the portable data folder, or the installed user's writable data."""
+    return prepare_data_dir() / "tgdl_download_history.sqlite3"
 
 
 class DownloadHistory:

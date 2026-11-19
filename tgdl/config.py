@@ -5,10 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
+from tgdl.paths import prepare_data_dir
 
 ROOT = Path(__file__).resolve().parent.parent
-SESSION_PATH = ROOT / "tgdl_session"
-ENV_PATH = ROOT / ".env"
+DATA_DIR = prepare_data_dir()
+SESSION_PATH = DATA_DIR / "tgdl_session"
+ENV_PATH = DATA_DIR / ".env"
 
 _ENV_KEYS = {
     "TELEGRAM_API_ID": "api_id",
@@ -149,7 +151,7 @@ def load_settings() -> Settings:
     dd_raw = os.getenv("DOWNLOAD_DIR", "").strip()
     download_dir = Path(dd_raw).expanduser() if dd_raw else default_download_dir()
     if not download_dir.is_absolute():
-        download_dir = ROOT / download_dir
+        download_dir = DATA_DIR / download_dir
 
     if creds is None:
         raise SystemExit(

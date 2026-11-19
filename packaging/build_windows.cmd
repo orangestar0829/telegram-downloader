@@ -20,6 +20,7 @@ where makensis >nul 2>nul || set "MAKENSIS=%PROGRAMFILES(x86)%\NSIS\makensis.exe
 "%MAKENSIS%" /DVERSION=%VERSION% packaging\installer.nsi || goto :err
 
 echo === Packaging portable ZIP ===
+powershell -NoProfile -Command "New-Item -ItemType File -Path dist/TelegramDownloader/portable.flag -Force | Out-Null; New-Item -ItemType Directory -Path dist/TelegramDownloader/data -Force | Out-Null; Set-Content -Path dist/TelegramDownloader/data/README.txt -Value 'Keep this folder when upgrading: .env, tgdl_session.session, tgdl_download_history.sqlite3'" || goto :err
 powershell -NoProfile -Command "Compress-Archive -Path dist/TelegramDownloader -DestinationPath TelegramDownloader-%VERSION%-portable-win64.zip -Force" || goto :err
 
 echo.

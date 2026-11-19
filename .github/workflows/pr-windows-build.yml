@@ -36,6 +36,9 @@ jobs:
           if (-not (Test-Path $makensis)) { $makensis = "makensis" }
           & $makensis "/DVERSION=$version" packaging/installer.nsi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType File -Path dist/TelegramDownloader/portable.flag -Force | Out-Null
+          New-Item -ItemType Directory -Path dist/TelegramDownloader/data -Force | Out-Null
+          Set-Content -Path dist/TelegramDownloader/data/README.txt -Value "Portable user data: .env, tgdl_session.session, tgdl_download_history.sqlite3. Keep this folder when upgrading."
           Compress-Archive -Path dist/TelegramDownloader -DestinationPath "TelegramDownloader-$version-portable-win64.zip" -Force
       - name: Upload PR-only Windows artifacts
         uses: actions/upload-artifact@v4

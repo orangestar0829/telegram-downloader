@@ -282,6 +282,14 @@ telegram-media-downloader/
 不要将它与清理媒体文件一起删除；数据库独立于程序安装目录，升级便携版无需迁移它。
 下载失败不会被标记为成功。手动选择图库媒体的保存流程仍使用原有文件去重。
 
+**便携版数据目录**：Windows 便携 ZIP 内的 `portable.flag` 标记便携模式。
+启动后所有用户状态保存在 `TelegramDownloader.exe` 同级的 `data/`：
+`data/.env`、`data/tgdl_session.session` 和
+`data/tgdl_download_history.sqlite3`。从旧版升级时会尝试从旧目录和
+`%LOCALAPPDATA%\TelegramDownloader` 复制现有数据（不会覆盖 `data/` 内已有文件）。
+更新时替换程序文件，保留整个 `data/` 目录。安装版仍将数据存入用户目录，
+避免写入 Program Files 失败。
+
 CHUNK_CONCURRENCY 默认 1，设置为 2/4/8 后对不小于 16 MiB 的 Telegram Document 启用 Telethon iter_download 的并行字节区间读取。每段有严格长度校验，只有全部区间下载成功才将临时文件移动为最终文件。纯字节拼接，不需 FFmpeg，不重新编码；较小文件及普通相册图片仍由标准下载流程处理。文件并发与分块并发独立，但会叠加网络请求；不保证速度提升。
 
 命令行：python -m tgdl download -c GROUP_ID --concurrency 3 --chunk-concurrency 4 --retries 2
