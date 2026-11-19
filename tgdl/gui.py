@@ -32,6 +32,7 @@ from tgdl.config import (
     update_env,
 )
 from tgdl.downloader import download_channel, resolve_channel
+from tgdl.log_format import TimestampedLines
 
 from tgdl import downloader as _downloader
 from tgdl import http_fetch as _http_fetch
@@ -105,12 +106,13 @@ class AsyncLoop:
 
 
 class _QueueWriter:
-    def __init__(self, sink: "queue.Queue[str]") -> None:
+    def __init__(self, sink: "queue.Queue[str]", formatter: TimestampedLines | None = None) -> None:
         self._sink = sink
+        self._formatter = formatter or TimestampedLines()
 
     def write(self, text: str) -> int:
         if text:
-            self._sink.put(text)
+            self._sink.put(self._formatter.format(text))
         return len(text)
 
     def flush(self) -> None:
@@ -206,7 +208,8 @@ class _App:
         self._build_ui()
 
         self._stdout, self._stderr = sys.stdout, sys.stderr
-        writer = _QueueWriter(self.log_queue)
+        self._timestamp_formatter = TimestampedLines()
+        writer = _QueueWriter(self.log_queue, self._timestamp_formatter)
         sys.stdout = writer
         sys.stderr = writer
 
@@ -483,7 +486,7 @@ class _App:
 
     # ---------- helpers ----------
     def _log(self, text: str) -> None:
-        self.log_queue.put(text)
+        self.log_queue.put(self._timestamp_formatter.format(text))
 
     def _drain_log(self) -> None:
         try:
