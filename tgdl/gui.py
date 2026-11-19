@@ -152,8 +152,11 @@ class _App:
         self.client = None
         self.settings: Settings | None = None
         self.log_queue: "queue.Queue[str]" = queue.Queue()
+        self.download_queue: "queue.Queue[str]" = queue.Queue()
         self._log_popup = None
         self._log_popup_text = None
+        self._download_popup = None
+        self._download_popup_text = None
 
         self.root = tk.Tk()
         self.root.title("Telegram 下载器")
@@ -290,7 +293,10 @@ class _App:
         tabs_row.pack(fill="x", **pad)
         nb = ttk.Notebook(tabs_row)
         nb.pack(side="left", fill="x", expand=True)
-        ttk.Button(tabs_row, text="查看日志", command=self._open_log_window).pack(
+        ttk.Button(tabs_row, text="运行日志", command=self._open_log_window).pack(
+            side="right", padx=(8, 0)
+        )
+        ttk.Button(tabs_row, text="下载记录", command=self._open_download_window).pack(
             side="right", padx=(8, 0)
         )
         nb.add(self._build_gallery_tab(), text="浏览媒体(选图/视频)")
@@ -306,10 +312,15 @@ class _App:
         ttk.Button(folder, text="更改", command=self._change_dir).pack(side="left")
         ttk.Button(folder, text="打开下载文件夹", command=self._open_folder).pack(side="left", padx=6)
 
-        logframe = ttk.LabelFrame(self.root, text="日志")
+        logframe = ttk.LabelFrame(self.root, text="运行日志")
         logframe.pack(fill="both", expand=True, **pad)
         self.log = self.scrolledtext.ScrolledText(logframe, height=8, wrap="word", state="disabled")
         self.log.pack(fill="both", expand=True, padx=4, pady=4)
+        ttk.Button(logframe, text="跳转最新", command=lambda: self.log.see("end")).pack(anchor="e", padx=4, pady=2)
+        # Download completions have their own buffer and window; stdout/stderr
+        # remain in the runtime log above.
+        self.download_log = self.scrolledtext.ScrolledText(logframe, height=1, wrap="word", state="disabled")
+        self.download_log.pack_forget()
 
     def _build_monitor_tab(self):
         tk, ttk = self.tk, self.ttk
@@ -620,6 +631,9 @@ class _App:
     def _log(self, text: str) -> None:
         self.log_queue.put(self._timestamp_formatter.format(text))
 
+    def _log_download(self, text: str) -> None:
+        self.download_queue.put(self._timestamp_formatter.format(text + "\n"))
+
     def _drain_log(self) -> None:
         try:
             while True:
@@ -629,13 +643,23 @@ class _App:
                     self._append_to_log(self._log_popup_text, chunk)
         except queue.Empty:
             pass
+        try:
+            while True:
+                chunk = self.download_queue.get_nowait()
+                self._append_to_log(self.download_log, chunk)
+                if self._download_popup_text is not None:
+                    self._append_to_log(self._download_popup_text, chunk)
+        except queue.Empty:
+            pass
         self.root.after(100, self._drain_log)
 
     @staticmethod
     def _append_to_log(widget, chunk: str) -> None:
+        follow = widget.yview()[1] >= 0.999
         widget.configure(state="normal")
         widget.insert("end", chunk)
-        widget.see("end")
+        if follow:
+            widget.see("end")
         widget.configure(state="disabled")
 
     def _open_log_window(self) -> None:
@@ -648,6 +672,7 @@ class _App:
         win.geometry("850x480")
         view = self.scrolledtext.ScrolledText(win, wrap="word", state="normal")
         view.pack(fill="both", expand=True, padx=8, pady=8)
+        self.ttk.Button(win, text="跳转最新", command=lambda: view.see("end")).pack(anchor="e", padx=8, pady=4)
         view.insert("1.0", self.log.get("1.0", "end-1c"))
         view.see("end")
         view.configure(state="disabled")
@@ -657,6 +682,29 @@ class _App:
         def on_close() -> None:
             self._log_popup_text = None
             self._log_popup = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+    def _open_download_window(self) -> None:
+        if self._download_popup is not None and self._download_popup.winfo_exists():
+            self._download_popup.lift()
+            return
+        win = self.tk.Toplevel(self.root)
+        win.title("Telegram 下载器 - 下载记录")
+        win.geometry("850x480")
+        view = self.scrolledtext.ScrolledText(win, wrap="word", state="normal")
+        view.pack(fill="both", expand=True, padx=8, pady=8)
+        self.ttk.Button(win, text="跳转最新", command=lambda: view.see("end")).pack(anchor="e", padx=8, pady=4)
+        view.insert("1.0", self.download_log.get("1.0", "end-1c"))
+        view.see("end")
+        view.configure(state="disabled")
+        self._download_popup = win
+        self._download_popup_text = view
+
+        def on_close() -> None:
+            self._download_popup_text = None
+            self._download_popup = None
             win.destroy()
 
         win.protocol("WM_DELETE_WINDOW", on_close)
@@ -870,6 +918,7 @@ class _App:
                 concurrency=concurrency,
                 retries=retries,
                 chunk_concurrency=chunk_concurrency,
+                on_saved=self._log_download,
             )
             print("下载完成。点『打开下载文件夹』查看。\n")
 

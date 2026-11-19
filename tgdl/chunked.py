@@ -10,7 +10,6 @@ import asyncio
 import math
 import mimetypes
 import re
-import time
 from pathlib import Path
 from typing import Callable
 
@@ -92,18 +91,11 @@ async def download_chunked(
         handle.truncate(size)
 
     completed = 0
-    last_report = time.monotonic()
-
     def report_progress(amount: int) -> None:
-        nonlocal completed, last_report
+        nonlocal completed
         completed += amount
         if on_bytes:
             on_bytes(amount)
-        now = time.monotonic()
-        if now - last_report >= 5 or completed == size:
-            print(f"[分块] {completed / 1048576:.1f}/{size / 1048576:.1f} MiB "
-                  f"({completed * 100 // size}%)")
-            last_report = now
 
     async def fetch_range(start: int, end: int) -> None:
         offset = start

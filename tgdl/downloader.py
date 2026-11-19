@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import re
 import tempfile
+import time
 from collections.abc import AsyncIterable
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -208,6 +210,7 @@ async def download_channel(
     concurrency: int = 3,
     retries: int = 2,
     chunk_concurrency: int = 1,
+    on_saved: Callable[[str], None] | None = None,
 ) -> DownloadStats:
     entity = await resolve_channel(client, target)
     title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
@@ -262,6 +265,7 @@ async def download_channel(
                 retries=retries, skip_existing=skip_existing,
                 chunk_concurrency=chunk_concurrency,
                 history=history, peer_id=int(entity.id),
+                on_saved=on_saved,
             )
         except FloodWaitError as exc:
             print(f"\nRate limited. Wait {exc.seconds}s then retry this channel.")
@@ -287,6 +291,7 @@ async def _download_one(
     chunk_concurrency: int = 1,
     history: DownloadHistory | None = None,
     peer_id: int | None = None,
+    on_saved: Callable[[str], None] | None = None,
 ) -> Path | None:
     if skip_existing:
         if history is not None and peer_id is not None and history.contains(peer_id, message.id):
@@ -299,6 +304,8 @@ async def _download_one(
             stats.skipped += 1
             return None
     dest_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    mode = "普通下载"
     # Telethon writes using the original filename. Per-task directories avoid
     # collisions and allow failed/cancelled partial files to be cleaned up.
     with tempfile.TemporaryDirectory(prefix="tgdl-", dir=dest_dir) as temporary:
@@ -311,8 +318,6 @@ async def _download_one(
             target = download_target(message)
             document = chunkable_document(target, chunk_concurrency)
             if document is not None and callable(getattr(client, "iter_download", None)):
-                print(f"[分块] 开始 {base}: {document.size / 1048576:.1f} MiB, "
-                      f"{chunk_concurrency} 路并发")
                 try:
                     saved = await download_chunked(
                         client, document, Path(temporary) / ("data" + document_suffix(document)),
@@ -326,7 +331,7 @@ async def _download_one(
                         progress_callback=progress,
                     )
                 else:
-                    print(f"[分块] {base} 完成，写入最终文件")
+                    mode = f"分块{chunk_concurrency}路"
             else:
                 saved = await client.download_media(
                     target, file=str(temporary), progress_callback=progress,
@@ -346,6 +351,14 @@ async def _download_one(
         if history is not None and peer_id is not None:
             history.mark_saved(peer_id, message.id, dest_dir.name, final_path)
     stats.saved += 1
+    elapsed = max(time.monotonic() - started, 0.001)
+    size_mib = final_path.stat().st_size / 1048576
+    detail = (f"[下载完成] {final_path.name} | {size_mib:.1f} MiB | "
+              f"{elapsed:.1f}秒 | {size_mib / elapsed:.2f} MiB/s | {mode}")
+    if on_saved is not None:
+        on_saved(detail)
+    else:
+        print(detail)
     return final_path
 
 
@@ -361,6 +374,7 @@ async def _download_with_retry(
     chunk_concurrency: int = 1,
     history: DownloadHistory | None = None,
     peer_id: int | None = None,
+    on_saved: Callable[[str], None] | None = None,
 ) -> Path | None:
     for attempt in range(retries + 1):
         try:
@@ -369,6 +383,7 @@ async def _download_with_retry(
                 skip_existing=skip_existing, stats=stats,
                 chunk_concurrency=chunk_concurrency,
                 history=history, peer_id=peer_id,
+                on_saved=on_saved,
             )
         except FloodWaitError:
             raise
@@ -395,6 +410,7 @@ async def download_many(
     chunk_concurrency: int = 1,
     history: DownloadHistory | None = None,
     peer_id: int | None = None,
+    on_saved: Callable[[str], None] | None = None,
 ) -> list[Path]:
     """Bounded multi-file concurrency (not parallel chunks of one video)."""
     if not 1 <= concurrency <= 8:
@@ -427,6 +443,7 @@ async def download_many(
                         skip_existing=skip_existing, retries=retries,
                         chunk_concurrency=chunk_concurrency,
                         history=history, peer_id=peer_id,
+                        on_saved=on_saved,
                     )
                 )
             )
