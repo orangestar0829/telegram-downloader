@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from telethon import TelegramClient
 from telethon.errors import FloodPremiumWaitError, FloodWaitError
+from telethon import errors
 from telethon.tl.functions.upload import GetFileRequest
 
 from tgdl.config import SESSION_PATH, Settings
@@ -17,10 +18,14 @@ class DiagnosticTelegramClient(TelegramClient):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._tgdl_flood_counts = {"FLOOD_WAIT": [0, 0], "FLOOD_PREMIUM_WAIT": [0, 0]}
+        self._tgdl_rpc_counts: dict[str, int] = {}
         self._tgdl_observe_sender(self._sender)
 
     def flood_snapshot(self) -> dict[str, tuple[int, int]]:
         return {name: tuple(values) for name, values in self._tgdl_flood_counts.items()}
+
+    def rpc_snapshot(self) -> dict[str, int]:
+        return dict(self._tgdl_rpc_counts)
 
     def _tgdl_observe_sender(self, sender) -> None:
         if getattr(sender, "_tgdl_observed", False):
@@ -43,6 +48,19 @@ class DiagnosticTelegramClient(TelegramClient):
         if future.cancelled():
             return
         exc = future.exception()
+        if isinstance(exc, (
+            errors.ServerError, errors.RpcCallFailError,
+            errors.RpcMcgetFailError, errors.InterdcCallErrorError,
+            errors.TimedOutError, errors.InterdcCallRichErrorError,
+        )):
+            kind = type(exc).__name__
+            count = self._tgdl_rpc_counts.get(kind, 0) + 1
+            self._tgdl_rpc_counts[kind] = count
+            print(
+                f"[网络诊断] GetFileRequest RPC异常 {kind}，累计{count}次；"
+                "Telethon 将按原策略等待约2s后重试（非实际阻塞计时）"
+            )
+            return
         if not isinstance(exc, (FloodWaitError, FloodPremiumWaitError)):
             return
         kind = "FLOOD_PREMIUM_WAIT" if isinstance(exc, FloodPremiumWaitError) else "FLOOD_WAIT"

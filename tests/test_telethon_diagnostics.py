@@ -33,3 +33,13 @@ def test_log_hook_captures_info_and_restores_logger_level():
     finally:
         uninstall()
     assert logger.level == old
+
+
+def test_generic_telethon_rpc_log_is_not_misreported_as_specific_server_failure():
+    assert diagnostic_message(
+        record(
+            "telethon.client.users",
+            "Telegram is having internal issues %s: %s",
+            ("TimedOutError", "request timed out"),
+        )
+    ) is None

@@ -24,8 +24,11 @@ def diagnostic_message(record: logging.LogRecord) -> str | None:
                     f"方法={matched.group(2)}；此处日志不区分普通/Premium，"
                     "具体类型请看服务端原始响应"
                 )
+        # GetFileRequest RPC retry errors are emitted from the original
+        # server response future with their concrete exception class.
+        # Telethon's generic log cannot identify the request safely.
         if message.startswith("Telegram is having internal issues"):
-            return "[网络诊断] Telegram RPC 内部错误，Telethon 自动重试"
+            return None
     elif record.name.endswith("mtprotosender"):
         if message.startswith("Closing current connection to begin reconnect"):
             return "[网络诊断] MTProto 自动重连开始"

@@ -1,7 +1,7 @@
 """Record original RPC errors without changing the Telethon future result."""
 import asyncio
 
-from telethon.errors import FloodPremiumWaitError, FloodWaitError
+from telethon.errors import FloodPremiumWaitError, FloodWaitError, RpcCallFailError, TimedOutError
 from telethon.tl.functions.upload import GetFileRequest
 from tgdl.client import DiagnosticTelegramClient
 
@@ -21,6 +21,7 @@ def test_flood_types_are_counted_separately(capsys):
         # Skip live credentials/network; inspect the sender-future hook only.
         client = object.__new__(DiagnosticTelegramClient)
         client._tgdl_flood_counts = {"FLOOD_WAIT": [0, 0], "FLOOD_PREMIUM_WAIT": [0, 0]}
+        client._tgdl_rpc_counts = {}
         sender = FakeSender()
         client._tgdl_observe_sender(sender)
         req = object.__new__(GetFileRequest)
@@ -46,6 +47,7 @@ def test_ordinary_getfile_result_and_other_requests_not_counted():
     async def run():
         client = object.__new__(DiagnosticTelegramClient)
         client._tgdl_flood_counts = {"FLOOD_WAIT": [0, 0], "FLOOD_PREMIUM_WAIT": [0, 0]}
+        client._tgdl_rpc_counts = {}
         sender = FakeSender()
         client._tgdl_observe_sender(sender)
         future = sender.send(object())
@@ -58,3 +60,28 @@ def test_ordinary_getfile_result_and_other_requests_not_counted():
         }
 
     asyncio.run(run())
+
+
+def test_rpc_failures_identify_real_class_and_count_each_response(capsys):
+    async def run():
+        client = object.__new__(DiagnosticTelegramClient)
+        client._tgdl_flood_counts = {"FLOOD_WAIT": [0, 0], "FLOOD_PREMIUM_WAIT": [0, 0]}
+        client._tgdl_rpc_counts = {}
+        sender = FakeSender()
+        client._tgdl_observe_sender(sender)
+        request = object.__new__(GetFileRequest)
+        for kind in (TimedOutError, RpcCallFailError, TimedOutError):
+            future = sender.send(request)
+            exc = (kind(request=request) if kind is RpcCallFailError
+                   else kind(request=request, message="diagnostic test"))
+            future.set_exception(exc)
+            await asyncio.sleep(0)
+            assert isinstance(future.exception(), kind)
+        assert client.rpc_snapshot() == {"TimedOutError": 2, "RpcCallFailError": 1}
+        assert client.flood_snapshot() == {"FLOOD_WAIT": (0, 0), "FLOOD_PREMIUM_WAIT": (0, 0)}
+
+    asyncio.run(run())
+    logged = capsys.readouterr().out
+    assert "GetFileRequest RPC异常 TimedOutError，累计2次" in logged
+    assert "GetFileRequest RPC异常 RpcCallFailError，累计1次" in logged
+    assert "等待约2s" in logged

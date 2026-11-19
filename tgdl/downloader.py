@@ -464,6 +464,8 @@ async def _download_one(
     started = time.monotonic()
     flood_snapshot = getattr(client, "flood_snapshot", None)
     flood_before = flood_snapshot() if callable(flood_snapshot) else None
+    rpc_snapshot = getattr(client, "rpc_snapshot", None)
+    rpc_before = rpc_snapshot() if callable(rpc_snapshot) else None
     mode = "普通下载"
     chunk_timings: dict[str, float] = {}
     publish_seconds = 0.0
@@ -588,6 +590,21 @@ async def _download_one(
                 changes.append(f"{kind}={count}次/{seconds}s")
         if changes:
             detail += " | 同期全局限流响应：" + "，".join(changes) + "（并发任务可能重叠，非实际总停顿）"
+    if rpc_before is not None and callable(rpc_snapshot):
+        rpc_after = rpc_snapshot()
+        changes = {
+            kind: count - rpc_before.get(kind, 0)
+            for kind, count in rpc_after.items()
+            if count > rpc_before.get(kind, 0)
+        }
+        if changes:
+            total = sum(changes.values())
+            classes = "，".join(f"{kind}={count}" for kind, count in sorted(changes.items()))
+            detail += (
+                f" | 同期全局GetFile RPC异常{total}次（{classes}），"
+                f"名义重试等待约{total * 2}s"
+                "（并发或内部重试可重叠，非实际阻塞时间）"
+            )
     if chunk_timings:
         detail += (
             f" | 文件准备{chunk_timings.get('prepare_s', 0):.2f}秒"
