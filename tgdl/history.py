@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from tgdl.config import ROOT
-
-DEFAULT_HISTORY_PATH = ROOT / "tgdl_download_history.sqlite3"
+def default_history_path() -> Path:
+    """Stable user data path, outside PyInstaller's replaceable _internal tree."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "TelegramDownloader" / "tgdl_download_history.sqlite3"
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "TelegramDownloader" / "tgdl_download_history.sqlite3"
 
 
 class DownloadHistory:
@@ -19,8 +25,8 @@ class DownloadHistory:
     file after cloud backup does not remove the row.
     """
 
-    def __init__(self, path: Path = DEFAULT_HISTORY_PATH) -> None:
-        self.path = Path(path)
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = Path(path) if path is not None else default_history_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._connection = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
