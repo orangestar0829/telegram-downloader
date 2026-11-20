@@ -32,9 +32,10 @@ from tgdl.config import (
     read_env_values,
     update_env,
 )
-from tgdl.downloader import download_channel, resolve_channel
+from tgdl.downloader import download_channel, resolve_channel, scan_monitor_slice
+from tgdl.history import DownloadHistory
 from tgdl.log_format import TimestampedLines
-from tgdl.monitor import load_channels, save_channels
+from tgdl.monitor import load_channels, next_due_channel, save_channels
 from tgdl.paths import data_dir
 from tgdl.single_instance import AlreadyRunning, gui_instance_guard
 from tgdl.temp_cleanup import inspect_cleanup
@@ -228,6 +229,16 @@ class _App:
             self.log_queue.put(f"[监控] 配置读取失败：{exc}\n")
         self._monitor_next: dict[str, float] = {}
         self._monitor_totals: dict[str, dict[str, int]] = {}
+        self._monitor_scan_future = None
+        self._monitor_download_future = None
+        self._monitor_worker_task = None
+        self._monitor_scan_stop = threading.Event()
+        self._monitor_download_stop = threading.Event()
+        self._monitor_slice_cursor = 0
+        self._monitor_batch_used: dict[str, int] = {}
+        self._monitor_scan_inflight = False
+        self._monitor_active_transfers = 0
+        self._monitor_worker_retry_at = 0.0
         self._monitor_job = None
         self._monitor_active = False
 
@@ -415,22 +426,32 @@ class _App:
         ttk.Label(controls, text="扫描间隔(分钟)").pack(side="left")
         self.monitor_minutes_var = tk.StringVar(value="15")
         ttk.Entry(controls, textvariable=self.monitor_minutes_var, width=6).pack(side="left", padx=5)
+        ttk.Label(controls, text="优先级").pack(side="left", padx=4)
+        self.monitor_priority_var = tk.StringVar(value="0")
+        ttk.Entry(controls, textvariable=self.monitor_priority_var, width=5).pack(side="left")
+        ttk.Label(controls, text="每轮数量").pack(side="left", padx=4)
+        self.monitor_batch_var = tk.StringVar(value="100")
+        ttk.Entry(controls, textvariable=self.monitor_batch_var, width=7).pack(side="left")
         ttk.Label(controls, text="方向").pack(side="left", padx=4)
         self.monitor_direction_var = tk.StringVar(value="从新到旧")
         ttk.Combobox(
             controls, textvariable=self.monitor_direction_var, state="readonly", width=10,
             values=("从新到旧", "从旧到新"),
         ).pack(side="left", padx=4)
-        ttk.Button(controls, text="添加当前频道", command=self._monitor_add).pack(side="left")
-        ttk.Button(controls, text="更新所选", command=self._monitor_update).pack(side="left", padx=4)
-        ttk.Button(controls, text="删除所选", command=self._monitor_remove).pack(side="left", padx=5)
-        ttk.Button(controls, text="启用/暂停所选", command=self._monitor_toggle).pack(side="left")
-        columns = ("name", "target", "minutes", "direction", "enabled", "next")
+        edit_actions = ttk.Frame(frame)
+        edit_actions.pack(fill="x", padx=6, pady=2)
+        ttk.Button(edit_actions, text="添加当前频道", command=self._monitor_add).pack(side="left")
+        ttk.Button(edit_actions, text="更新所选", command=self._monitor_update).pack(side="left", padx=4)
+        ttk.Button(edit_actions, text="删除所选", command=self._monitor_remove).pack(side="left", padx=5)
+        ttk.Button(edit_actions, text="启用/暂停所选", command=self._monitor_toggle).pack(side="left")
+        columns = ("name", "target", "minutes", "priority", "batch_size", "direction", "enabled", "next")
         self.monitor_tree = ttk.Treeview(frame, columns=columns, show="headings", height=4)
         for column, label, width in (
             ("name", "群组 / 频道名称", 210),
             ("target", "频道 ID / 用户名", 165),
             ("minutes", "间隔(分钟)", 95),
+            ("priority", "优先级", 75),
+            ("batch_size", "每轮数量", 85),
             ("direction", "扫描方向", 105),
             ("enabled", "状态", 85),
             ("next", "下次扫描", 145),
@@ -458,6 +479,7 @@ class _App:
             next_time = time.strftime("%H:%M:%S", time.localtime(due)) if due and item["enabled"] and self._monitor_active else "-"
             values = (
                 item.get("name") or "（待获取）", item["target"], item["minutes"],
+                item.get("priority", 0), item.get("batch_size", 100),
                 "旧→新" if item.get("direction") == "oldest" else "新→旧",
                 "启用" if item["enabled"] else "暂停", next_time,
             )
@@ -467,6 +489,11 @@ class _App:
                     self.monitor_tree.item(iid, values=values)
             else:
                 self.monitor_tree.insert("", "end", iid=iid, values=values)
+        for rank, index in enumerate(sorted(
+            range(len(self._monitored)),
+            key=lambda i: -int(self._monitored[i].get("priority", 0)),
+        )):
+            self.monitor_tree.move(str(index), "", rank)
 
     def _monitor_set_name(self, target: str, title: str) -> None:
         """Called only on Tk's main thread, never directly from Telethon."""
@@ -483,11 +510,9 @@ class _App:
             self.messagebox.showwarning("监控", "请先选择或输入频道")
             return
         try:
-            minutes = int(self.monitor_minutes_var.get())
-            if not 1 <= minutes <= 1440:
-                raise ValueError
-        except ValueError:
-            self.messagebox.showwarning("监控", "间隔应为 1～1440 分钟")
+            minutes, priority, batch_size = self._monitor_form_values()
+        except ValueError as exc:
+            self.messagebox.showwarning("监控", str(exc))
             return
         types = self._types_string()
         if not types:
@@ -508,7 +533,7 @@ class _App:
         self._monitored.append({
             "target": target, "minutes": minutes, "types": types, "enabled": True,
             "direction": "oldest" if self.monitor_direction_var.get() == "从旧到新" else "newest",
-            "name": existing_name,
+            "name": existing_name, "priority": priority, "batch_size": batch_size,
         })
         self._monitor_next[target] = time.time()
         save_channels(self._monitored)
@@ -523,6 +548,8 @@ class _App:
         if index is not None and index < len(self._monitored):
             item = self._monitored[index]
             self.monitor_minutes_var.set(str(item["minutes"]))
+            self.monitor_priority_var.set(str(item.get("priority", 0)))
+            self.monitor_batch_var.set(str(item.get("batch_size", 100)))
             self.monitor_direction_var.set(
                 "从旧到新" if item.get("direction") == "oldest" else "从新到旧"
             )
@@ -533,18 +560,33 @@ class _App:
             self.messagebox.showwarning("监控", "请先在监控列表中选一个频道")
             return
         try:
-            minutes = int(self.monitor_minutes_var.get())
-            if not 1 <= minutes <= 1440:
-                raise ValueError
-        except ValueError:
-            self.messagebox.showwarning("监控", "间隔应为 1～1440 分钟")
+            minutes, priority, batch_size = self._monitor_form_values()
+        except ValueError as exc:
+            self.messagebox.showwarning("监控", str(exc))
             return
         item = self._monitored[index]
         item["minutes"] = minutes
+        item["priority"] = priority
+        item["batch_size"] = batch_size
         item["direction"] = "oldest" if self.monitor_direction_var.get() == "从旧到新" else "newest"
+        self._monitor_batch_used.pop(item["target"], None)
+        self._monitor_totals.pop(item["target"], None)
         self._monitor_next[item["target"]] = time.time()
         save_channels(self._monitored)
         self._monitor_refresh()
+
+    def _monitor_form_values(self) -> tuple[int, int, int]:
+        try:
+            minutes = int(self.monitor_minutes_var.get().strip())
+            priority = int(self.monitor_priority_var.get().strip())
+            batch_size = int(self.monitor_batch_var.get().strip())
+        except ValueError as exc:
+            raise ValueError("间隔、优先级及每轮数量必须填写整数") from exc
+        if not 1 <= minutes <= 1440:
+            raise ValueError("扫描间隔应为 1～1440 分钟")
+        if not 1 <= batch_size <= 100_000:
+            raise ValueError("每轮数量应为 1～100000")
+        return minutes, priority, batch_size
 
     def _monitor_remove(self):
         index = self._monitor_selected_index()
@@ -552,6 +594,8 @@ class _App:
             self.monitor_tree.selection_remove(self.monitor_tree.selection())
             item = self._monitored.pop(index)
             self._monitor_next.pop(item["target"], None)
+            self._monitor_batch_used.pop(item["target"], None)
+            self._monitor_totals.pop(item["target"], None)
             save_channels(self._monitored)
             self._monitor_refresh()
 
@@ -560,6 +604,7 @@ class _App:
         if index is not None:
             item = self._monitored[index]
             item["enabled"] = not item["enabled"]
+            self._monitor_batch_used.pop(item["target"], None)
             self._monitor_next[item["target"]] = time.time()
             save_channels(self._monitored)
             self._monitor_refresh()
@@ -568,11 +613,16 @@ class _App:
         self._monitor_active = not self._monitor_active
         if self._monitor_active:
             self._stop_auto() if self._auto_config is not None else None
+            self._monitor_scan_stop.clear()
+            self._monitor_download_stop.clear()
+            self._monitor_batch_used.clear()
             self._monitor_next = {item["target"]: time.time() for item in self._monitored}
             self.monitor_button.config(text="停止全部监控")
             self._log("[监控] 多频道监控已启动\n")
             self._monitor_tick()
         else:
+            self._monitor_scan_stop.set()
+            self._monitor_download_stop.set()
             if self._monitor_job is not None:
                 self.root.after_cancel(self._monitor_job)
                 self._monitor_job = None
@@ -585,30 +635,198 @@ class _App:
         if not self._monitor_active:
             return
         now = time.time()
-        busy = self._download_future is not None and not self._download_future.done()
-        if not busy:
-            total = len(self._monitored)
-            for offset in range(total):
-                index = (self._monitor_cursor + offset) % total
-                item = self._monitored[index]
-                if not item["enabled"] or self._monitor_next.get(item["target"], 0) > now:
-                    continue
-                try:
-                    concurrency, retries, chunks = self._media_options()
-                except ValueError as exc:
-                    self._log(f"[监控] 设置错误：{exc}\n")
-                    break
-                self._monitor_cursor = (index + 1) % total
-                self._monitor_next[item["target"]] = now + item["minutes"] * 60
-                display = item.get("name") or item["target"]
-                self._log(f"[监控] 开始扫描 {display} ({item['target']})，间隔 {item['minutes']} 分钟\n")
-                self._start_channel_download(
-                    item["target"], item["types"], "", concurrency, retries, chunks,
-                    monitor_item=item,
+        scan_busy = self._monitor_scan_inflight
+        if not scan_busy:
+            # Rotate a 20-message slice per channel, not a complete 500-media
+            # batch. Sort by numeric priority, with cyclic fairness among
+            # channels eligible in this tick.
+            item = next_due_channel(
+                self._monitored, self._monitor_next, now, self._monitor_slice_cursor
+            )
+            if item is not None:
+                self._monitor_slice_cursor += 1
+                target = item["target"]
+                quota = int(item.get("batch_size", 100))
+                used = self._monitor_batch_used.get(target, 0)
+                remaining = max(1, quota - used)
+                def resolved(title, peer_id):
+                    self.root.after(0, lambda: self._monitor_set_name(target, title))
+                async def scan():
+                    await self._ensure_client()
+                    return await scan_monitor_slice(
+                        self.client, target=target, types=parse_types(item["types"]),
+                        monitor_direction=item.get("direction", "newest"),
+                        slice_size=20, match_limit=min(20, remaining),
+                        stop_event=self._monitor_scan_stop,
+                        on_channel_resolved=resolved,
+                    )
+                # Reserve a slice for this channel without blocking Tk or
+                # waiting for the media file downloads to finish.
+                future = self.loop.submit(scan())
+                self._monitor_scan_future = future
+                self._monitor_scan_inflight = True
+                def scanned(done):
+                    try:
+                        result = done.result()
+                    except concurrent.futures.CancelledError:
+                        return
+                    except Exception as exc:
+                        self.root.after(0, lambda exc=exc: self._monitor_scan_error(target, exc))
+                        return
+                    self.root.after(0, lambda: self._monitor_slice_done(target, result))
+                future.add_done_callback(scanned)
+        if self._monitor_download_future is not None and self._monitor_download_future.done():
+            try:
+                self._monitor_download_future.result()
+            except concurrent.futures.CancelledError:
+                pass
+            except Exception as exc:
+                self._monitor_worker_retry_at = now + 30
+                self._log(f"[监控下载错误] {exc}；30 秒后尝试恢复\n")
+            self._monitor_download_future = None
+        worker = self._monitor_worker_task
+        download_busy = (
+            self._monitor_download_future is not None
+            and not self._monitor_download_future.done()
+        ) or (worker is not None and not worker.done())
+        if (not download_busy and not self._monitor_download_stop.is_set()
+                and now >= self._monitor_worker_retry_at):
+            try:
+                concurrency, retries, chunks = self._media_options()
+            except ValueError as exc:
+                self._log(f"[监控] 下载设置错误：{exc}\n")
+            else:
+                self._monitor_download_future = self.loop.submit(
+                    self._monitor_download_worker(concurrency, retries, chunks)
                 )
-                break
         self._monitor_refresh()
         self._monitor_job = self.root.after(1000, self._monitor_tick)
+
+    def _monitor_scan_error(self, target: str, exc: Exception) -> None:
+        self._monitor_scan_inflight = False
+        if not self._monitor_active:
+            return
+        self._monitor_next[target] = time.time() + 60
+        self._log(f"[监控] 扫描 {target} 失败，60秒后再试：{exc}\n")
+
+    def _monitor_slice_done(self, target: str, result) -> None:
+        self._monitor_scan_inflight = False
+        if not self._monitor_active:
+            return
+        item = next((x for x in self._monitored if x["target"] == target), None)
+        if item is None:
+            return
+        self._monitor_batch_used[target] = self._monitor_batch_used.get(target, 0) + result.matched
+        self._monitor_log_progress(target, result)
+        if not result.more_pending or self._monitor_batch_used[target] >= int(item.get("batch_size", 100)):
+            self._monitor_batch_used[target] = 0
+            self._monitor_next[target] = time.time() + item["minutes"] * 60
+        else:
+            self._monitor_next[target] = time.time()
+
+    async def _monitor_download_worker(self, concurrency: int, retries: int, chunks: int):
+        """Consume durable media jobs independently from the channel scanner."""
+        from tgdl.downloader import DownloadStats, _download_with_retry, safe_name
+        self._monitor_worker_task = asyncio.current_task()
+        history = DownloadHistory()
+        active = {}
+        consecutive_target = None
+        streak = 0
+        cancelled = False
+        try:
+            await self._ensure_client()
+            while not self._monitor_download_stop.is_set():
+                self._monitor_active_transfers = len(active)
+                finished = [key for key, task in active.items() if task.done()]
+                for key in finished:
+                    task = active.pop(key)
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        print(f"[监控] 下载任务 {key} 异常：{exc}")
+                # Preserve the existing manual download behaviour: don't
+                # launch new monitor transfers while a manual job is running.
+                manual_busy = self._download_future is not None and not self._download_future.done()
+                if not manual_busy and len(active) < concurrency:
+                    candidates = sorted(
+                        (item for item in self._monitored if item["enabled"]),
+                        key=lambda item: -int(item.get("priority", 0)),
+                    )
+                    # After three selections from one channel give another
+                    # pending channel a turn, regardless of priority.
+                    if streak >= 3 and len(candidates) > 1:
+                        candidates = [x for x in candidates if x["target"] != consecutive_target] + [
+                            x for x in candidates if x["target"] == consecutive_target
+                        ]
+                    selected = None
+                    for item in candidates:
+                        for job in history.pending_for_target(item["target"], limit=16):
+                            if (job.peer_id, job.message_id) not in active:
+                                selected = (item, job)
+                                break
+                        if selected is not None:
+                            break
+                    if selected is not None:
+                        item, job = selected
+                        if item["target"] == consecutive_target:
+                            streak += 1
+                        else:
+                            consecutive_target, streak = item["target"], 1
+                        async def transfer(job=job):
+                            try:
+                                entity = await resolve_channel(self.client, job.target)
+                                message = await self.client.get_messages(entity, ids=job.message_id)
+                                if message is None or message.date is None:
+                                    history.remove_pending(job.peer_id, job.message_id)
+                                    history.clear_failure(job.peer_id, job.message_id)
+                                    return
+                                kind = job.kind or _downloader.classify_message(message)
+                                if kind is None:
+                                    history.remove_pending(job.peer_id, job.message_id)
+                                    history.clear_failure(job.peer_id, job.message_id)
+                                    return
+                                folder = self.settings.download_dir / safe_name(
+                                    getattr(entity, "title", None) or job.title
+                                ) / ("photos" if kind == "photo" else "videos")
+                                stats = DownloadStats()
+                                path = await _download_with_retry(
+                                    self.client, message, folder,
+                                    job.base or f"{message.date.strftime('%Y%m%d')}_{message.id}",
+                                    stats, skip_existing=True, retries=retries,
+                                    chunk_concurrency=chunks, history=history,
+                                    peer_id=job.peer_id,
+                                    on_saved=lambda detail: self._log_download(f"[{job.title}] {detail}"),
+                                    temp_download_dir=self.settings.temp_download_dir,
+                                    on_progress=self._update_download_progress,
+                                )
+                                if stats.failed:
+                                    history.mark_failure(job.peer_id, job.message_id)
+                                elif path is None:
+                                    history.remove_pending(job.peer_id, job.message_id)
+                                    history.clear_failure(job.peer_id, job.message_id)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                print(f"[监控] 下载 {job.title}/{job.message_id} 失败：{exc}")
+                                history.mark_failure(job.peer_id, job.message_id)
+                        active[(job.peer_id, job.message_id)] = asyncio.create_task(transfer())
+                        self._monitor_active_transfers = len(active)
+                        continue
+                await asyncio.sleep(0.25 if active else 1)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            if cancelled:
+                for task in active.values():
+                    task.cancel()
+            if active:
+                await asyncio.gather(*active.values(), return_exceptions=True)
+            self._monitor_active_transfers = 0
+            history.close()
+            self._monitor_worker_task = None
 
     def _build_gallery_tab(self):
         tk, ttk = self.tk, self.ttk
@@ -1234,11 +1452,11 @@ class _App:
     def _monitor_log_progress(self, target: str, result) -> None:
         """Aggregate one scan window's batches in the running GUI session."""
         total = self._monitor_totals.setdefault(
-            target, {"matched": 0, "saved": 0, "skipped": 0, "failed": 0, "batches": 0},
+            target, {"matched": 0, "queued": 0, "skipped": 0, "failed": 0, "batches": 0},
         )
         total["batches"] += 1
-        for key in ("matched", "saved", "skipped", "failed"):
-            total[key] += getattr(result, key)
+        for key in ("matched", "queued", "skipped", "failed"):
+            total[key] += getattr(result, key, 0)
         name = next(
             (item.get("name") or target for item in self._monitored if item["target"] == target),
             target,
@@ -1246,7 +1464,7 @@ class _App:
         status = "还有下一批" if result.more_pending else "本轮扫描已结束"
         self._log(
             f"[监控进度] {name}: {status}；本次运行累计 {total['batches']} 批，"
-            f"匹配={total['matched']} 下载={total['saved']} "
+            f"匹配={total['matched']} 新增排队={total['queued']} "
             f"跳过={total['skipped']} 失败={total['failed']}\n"
         )
         if not result.more_pending:
@@ -1467,8 +1685,21 @@ class _App:
         if self._download_future is not None and not self._download_future.done():
             self._download_future.cancel()
             self._log("[下载] 正在取消当前扫描及未完成文件；已成功的文件不会删除\n")
+        elif (getattr(self, "_monitor_download_future", None) is not None
+              and not self._monitor_download_future.done()):
+            # Cancel active transfers, leave uncommitted media in the durable
+            # queue, and let the monitor tick start a fresh worker afterwards.
+            self._monitor_download_stop.set()
+            self._monitor_download_future.cancel()
+            self._log("[监控] 正在取消当前媒体传输，未完成项目保留在队列\n")
+            if self._monitor_active:
+                self.root.after(1500, self._resume_monitor_downloads)
         else:
             self._log("[下载] 当前没有可取消的下载任务\n")
+
+    def _resume_monitor_downloads(self) -> None:
+        if self._monitor_active and not self._closing:
+            self._monitor_download_stop.clear()
 
     def _finish_close(self) -> None:
         if self._download_future is not None and not self._download_future.done():
@@ -1485,6 +1716,20 @@ class _App:
                     await asyncio.wait_for(asyncio.shield(active), timeout=30)
                 except (asyncio.CancelledError, Exception):
                     pass
+            # A cancelled concurrent.futures.Future can report done() while
+            # its underlying asyncio task still cleans up temporary chunks.
+            monitor_worker = getattr(self, "_monitor_worker_task", None)
+            if monitor_worker is not None and not monitor_worker.done():
+                try:
+                    await asyncio.shield(monitor_worker)
+                except (asyncio.CancelledError, Exception):
+                    pass
+            for future in (self._monitor_scan_future, self._monitor_download_future):
+                if future is not None and not future.done():
+                    try:
+                        await asyncio.wrap_future(future)
+                    except (asyncio.CancelledError, Exception):
+                        pass
             if self.client is not None:
                 await self.client.disconnect()
 
@@ -1501,7 +1746,9 @@ class _App:
     def _on_close(self) -> None:
         if self._closing:
             return
-        busy = self._download_future is not None and not self._download_future.done()
+        manual_busy = self._download_future is not None and not self._download_future.done()
+        monitor_busy = getattr(self, "_monitor_active_transfers", 0) > 0
+        busy = manual_busy or monitor_busy
         if busy:
             decision = self.messagebox.askyesnocancel(
                 "安全退出",
@@ -1518,14 +1765,22 @@ class _App:
             self._stop_auto()
         self._closing = True
         self._stop_download.set()
+        if hasattr(self, "_monitor_scan_stop"):
+            self._monitor_scan_stop.set()
+        if hasattr(self, "_monitor_download_stop"):
+            self._monitor_download_stop.set()
         if busy:
             if not decision:
-                self._download_future.cancel()
+                if manual_busy:
+                    self._download_future.cancel()
+                if monitor_busy and self._monitor_download_future is not None:
+                    self._monitor_download_future.cancel()
             self._log(
                 "[退出] 等待当前已开始的文件完成后关闭\n"
                 if decision else "[退出] 正在取消下载\n"
             )
-            return
+            if manual_busy:
+                return
         self._finish_close()
 
     def run(self) -> None:

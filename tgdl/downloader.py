@@ -32,7 +32,7 @@ from tgdl.chunked import (
     ChunkDownloadStalled, chunkable_document, document_suffix, download_chunked,
 )
 from tgdl.cache_budget import optional_staging_reservation
-from tgdl.history import DownloadHistory
+from tgdl.history import DownloadHistory, PendingMedia
 from tgdl.progress import ProgressCallback, TransferProgress
 from tgdl.temp_cleanup import own_temporary
 
@@ -213,6 +213,123 @@ class DownloadStats:
         self.last_message_id = 0
         self.scan_upper = 0
         self.scan_completed = 0
+        self.queued = 0
+        self.scanned_messages = 0
+
+
+async def scan_monitor_slice(
+    client: TelegramClient, *,
+    target: str,
+    types: set[str],
+    monitor_direction: str = "newest",
+    slice_size: int = 20,
+    match_limit: int = 20,
+    stop_event: threading.Event | None = None,
+    on_channel_resolved: Callable[[str, int], None] | None = None,
+) -> DownloadStats:
+    """Scan only a small Telegram message slice, without downloading files.
+
+    SQLite commits the queued media and the scan cursor together, so a crash
+    cannot skip discovered media. The 20-message slice yields to other
+    monitored channels even when this channel has a 500-media batch quota.
+    """
+    if monitor_direction not in ("newest", "oldest"):
+        raise ValueError("Invalid monitor direction")
+    if slice_size < 1 or match_limit < 1:
+        raise ValueError("Monitor slice and match limits must be positive")
+    entity = await resolve_channel(client, target)
+    title = str(getattr(entity, "title", None) or getattr(entity, "username", None) or entity.id)
+    peer_id = int(entity.id)
+    if on_channel_resolved is not None:
+        on_channel_resolved(title, peer_id)
+    stats = DownloadStats()
+    history = DownloadHistory()
+    try:
+        completed, upper, cursor, saved_direction = history.scan_state(peer_id)
+        media_types = ",".join(sorted(types))
+        previous_types = history.scan_media_types(peer_id)
+        if previous_types not in ("", media_types) or (previous_types == "" and completed):
+            completed, upper, cursor = 0, 0, 0
+        elif upper and saved_direction != monitor_direction:
+            cursor = 0
+
+        starting_cycle = not upper
+        if starting_cycle:
+            # Old failures from the pre-queue monitor also remain retryable.
+            failures = [
+                PendingMedia(peer_id, mid, target, title, "", "")
+                for mid in history.failures(peer_id, limit=20)
+            ]
+            stats.queued += history.enqueue_media(failures)
+            async for latest in client.iter_messages(entity, limit=1):
+                upper = int(latest.id)
+                break
+            if upper <= completed:
+                stats.scan_completed = completed
+                return stats
+            history.save_scan_state(peer_id, completed, upper, 0, monitor_direction, media_types)
+
+        stats.scan_upper = upper
+        stats.scan_completed = completed
+        if monitor_direction == "oldest":
+            iterator = client.iter_messages(
+                entity, reverse=True, min_id=cursor or completed,
+                max_id=upper + 1, limit=slice_size,
+            )
+        else:
+            iterator = client.iter_messages(
+                entity, min_id=completed,
+                max_id=cursor or (upper + 1), limit=slice_size,
+            )
+
+        discovered: list[PendingMedia] = []
+        last_seen = 0
+        quota_reached = False
+        interrupted = False
+        async for message in iterator:
+            if stop_event is not None and stop_event.is_set():
+                interrupted = True
+                break
+            stats.scanned_messages += 1
+            last_seen = int(message.id)
+            if not stats.first_message_id:
+                stats.first_message_id = last_seen
+            stats.last_message_id = last_seen
+            if not isinstance(message, Message) or message.date is None:
+                continue
+            kind = classify_message(message)
+            if kind not in types:
+                continue
+            stats.matched += 1
+            if history.contains(peer_id, message.id):
+                stats.skipped += 1
+            else:
+                discovered.append(PendingMedia(
+                    peer_id, int(message.id), target, title, kind,
+                    f"{message.date.strftime('%Y%m%d')}_{message.id}",
+                ))
+            if stats.matched >= match_limit:
+                quota_reached = True
+                break
+
+        if interrupted:
+            # Leave the old cursor intact; all work in this slice is replayable.
+            stats.more_pending = True
+            return stats
+        completed_window = not quota_reached and stats.scanned_messages < slice_size
+        stats.queued += history.commit_scan_batch(
+            peer_id, discovered,
+            completed=upper if completed_window else completed,
+            upper=0 if completed_window else upper,
+            cursor=0 if completed_window else (last_seen or cursor),
+            direction=monitor_direction, media_types=media_types,
+        )
+        stats.more_pending = not completed_window
+        if completed_window:
+            stats.scan_completed = upper
+        return stats
+    finally:
+        history.close()
 
 
 async def download_channel(

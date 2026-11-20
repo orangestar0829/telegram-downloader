@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from tgdl.paths import prepare_data_dir
@@ -11,6 +12,16 @@ from tgdl.paths import prepare_data_dir
 def default_history_path() -> Path:
     """Use the portable data folder, or the installed user's writable data."""
     return prepare_data_dir() / "tgdl_download_history.sqlite3"
+
+
+@dataclass(frozen=True)
+class PendingMedia:
+    peer_id: int
+    message_id: int
+    target: str
+    title: str
+    kind: str
+    base: str
 
 
 class DownloadHistory:
@@ -59,6 +70,20 @@ class DownloadHistory:
                     PRIMARY KEY(peer_id, message_id)
                 )"""
             )
+            self._connection.execute(
+                """CREATE TABLE IF NOT EXISTS pending_media (
+                    peer_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    target TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    base TEXT NOT NULL,
+                    PRIMARY KEY (peer_id, message_id)
+                )"""
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS pending_media_target ON pending_media (target)"
+            )
 
     def scan_state(self, peer_id: int) -> tuple[int, int, int, str]:
         with self._lock:
@@ -91,10 +116,82 @@ class DownloadHistory:
                 (peer_id, completed, upper, cursor, direction, media_types),
             )
 
+    def _enqueue(self, item: PendingMedia) -> int:
+        cursor = self._connection.execute(
+            """INSERT OR IGNORE INTO pending_media
+               (peer_id, message_id, target, title, kind, base)
+               SELECT ?, ?, ?, ?, ?, ?
+               WHERE NOT EXISTS (
+                   SELECT 1 FROM downloaded_media
+                   WHERE peer_id=? AND message_id=?
+               )""",
+            (item.peer_id, item.message_id, item.target, item.title,
+             item.kind, item.base, item.peer_id, item.message_id),
+        )
+        return cursor.rowcount
+
+    def enqueue_media(self, items: list[PendingMedia]) -> int:
+        with self._lock, self._connection:
+            return sum(self._enqueue(item) for item in items)
+
+    def commit_scan_batch(
+        self, peer_id: int, items: list[PendingMedia], *,
+        completed: int, upper: int, cursor: int, direction: str, media_types: str,
+    ) -> int:
+        """Enqueue media and advance the scan cursor in one SQLite transaction.
+
+        If interrupted before commit the slice is replayed; if committed,
+        pending downloads survive restarts even though the cursor advanced.
+        """
+        with self._lock, self._connection:
+            queued = sum(self._enqueue(item) for item in items)
+            self._connection.execute(
+                """INSERT INTO scan_state
+                   (peer_id, completed_id, upper_id, cursor_id, direction, media_types)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(peer_id) DO UPDATE SET
+                     completed_id=excluded.completed_id,
+                     upper_id=excluded.upper_id,
+                     cursor_id=excluded.cursor_id,
+                     direction=excluded.direction,
+                     media_types=excluded.media_types""",
+                (peer_id, completed, upper, cursor, direction, media_types),
+            )
+            return queued
+
+    def pending_for_target(self, target: str, limit: int = 16) -> list[PendingMedia]:
+        with self._lock:
+            return [PendingMedia(*row) for row in self._connection.execute(
+                """SELECT peer_id, message_id, target, title, kind, base
+                   FROM pending_media WHERE target=? ORDER BY rowid LIMIT ?""",
+                (target, limit),
+            )]
+
+    def pending_count(self, target: str | None = None) -> int:
+        with self._lock:
+            if target is None:
+                row = self._connection.execute("SELECT COUNT(*) FROM pending_media").fetchone()
+            else:
+                row = self._connection.execute(
+                    "SELECT COUNT(*) FROM pending_media WHERE target=?", (target,),
+                ).fetchone()
+            return int(row[0])
+
+    def remove_pending(self, peer_id: int, message_id: int) -> None:
+        with self._lock, self._connection:
+            self._connection.execute(
+                "DELETE FROM pending_media WHERE peer_id=? AND message_id=?",
+                (peer_id, message_id),
+            )
+
     def mark_failure(self, peer_id: int, message_id: int) -> None:
         with self._lock, self._connection:
             self._connection.execute(
                 "INSERT OR IGNORE INTO scan_failures(peer_id, message_id) VALUES (?, ?)",
+                (peer_id, message_id),
+            )
+            self._connection.execute(
+                "DELETE FROM pending_media WHERE peer_id=? AND message_id=?",
                 (peer_id, message_id),
             )
 
@@ -131,6 +228,9 @@ class DownloadHistory:
             )
             self._connection.execute(
                 "DELETE FROM scan_failures WHERE peer_id=? AND message_id=?", (peer_id, message_id),
+            )
+            self._connection.execute(
+                "DELETE FROM pending_media WHERE peer_id=? AND message_id=?", (peer_id, message_id),
             )
 
     def close(self) -> None:

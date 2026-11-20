@@ -11,6 +11,20 @@ def monitor_path() -> Path:
     return prepare_data_dir() / "monitored_channels.json"
 
 
+def next_due_channel(
+    items: list[dict], next_at: dict[str, float], now: float, turn: int,
+) -> dict | None:
+    """Higher numeric priority starts first; slices rotate to avoid starvation."""
+    ready = sorted(
+        (
+            item for item in items
+            if item.get("enabled", True) and next_at.get(item["target"], 0) <= now
+        ),
+        key=lambda item: -int(item.get("priority", 0)),
+    )
+    return ready[turn % len(ready)] if ready else None
+
+
 def load_channels(path: Path | None = None) -> list[dict]:
     path = path or monitor_path()
     if not path.exists():
@@ -23,11 +37,26 @@ def load_channels(path: Path | None = None) -> list[dict]:
         if not isinstance(item, dict):
             continue
         target = str(item.get("target", "")).strip()
-        minutes = int(item.get("minutes", 30))
+        try:
+            minutes = int(item.get("minutes", 30))
+        except (TypeError, ValueError):
+            continue
+        try:
+            priority = int(item.get("priority", 0))
+        except (TypeError, ValueError):
+            priority = 0
+        try:
+            batch_size = int(item.get("batch_size", 100))
+        except (TypeError, ValueError):
+            batch_size = 100
+        if not 1 <= batch_size <= 100_000:
+            batch_size = 100
         if target and 1 <= minutes <= 1440:
             result.append({
                 "target": target,
                 "minutes": minutes,
+                "priority": priority,
+                "batch_size": batch_size,
                 "types": str(item.get("types", "photo,video")),
                 "enabled": bool(item.get("enabled", True)),
                 "direction": item.get("direction", "newest") if item.get("direction") in ("newest", "oldest") else "newest",
