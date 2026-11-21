@@ -1,8 +1,78 @@
 from __future__ import annotations
 
 from telethon import TelegramClient
+from telethon.errors import FloodPremiumWaitError, FloodWaitError
+from telethon import errors
+from telethon.tl.functions.upload import GetFileRequest
 
 from tgdl.config import SESSION_PATH, Settings
+
+
+class DiagnosticTelegramClient(TelegramClient):
+    """Observe actual RPC exceptions before Telethon handles/retries them.
+
+    The send result and error are returned to Telethon unchanged. Borrowed
+    media DC senders are instrumented independently of the primary sender.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tgdl_flood_counts = {"FLOOD_WAIT": [0, 0], "FLOOD_PREMIUM_WAIT": [0, 0]}
+        self._tgdl_rpc_counts: dict[str, int] = {}
+        self._tgdl_observe_sender(self._sender)
+
+    def flood_snapshot(self) -> dict[str, tuple[int, int]]:
+        return {name: tuple(values) for name, values in self._tgdl_flood_counts.items()}
+
+    def rpc_snapshot(self) -> dict[str, int]:
+        return dict(self._tgdl_rpc_counts)
+
+    def _tgdl_observe_sender(self, sender) -> None:
+        if getattr(sender, "_tgdl_observed", False):
+            return
+        send_original = sender.send
+
+        def observing_send(request, ordered=False):
+            result = send_original(request, ordered=ordered)
+            requests = list(request) if isinstance(request, (tuple, list)) else [request]
+            futures = result if isinstance(result, list) else [result]
+            for req, future in zip(requests, futures):
+                if isinstance(req, GetFileRequest):
+                    future.add_done_callback(self._tgdl_record_getfile_result)
+            return result
+
+        sender.send = observing_send
+        sender._tgdl_observed = True
+
+    def _tgdl_record_getfile_result(self, future) -> None:
+        if future.cancelled():
+            return
+        exc = future.exception()
+        if isinstance(exc, (
+            errors.ServerError, errors.RpcCallFailError,
+            errors.RpcMcgetFailError, errors.InterdcCallErrorError,
+            errors.TimedOutError, errors.InterdcCallRichErrorError,
+        )):
+            kind = type(exc).__name__
+            count = self._tgdl_rpc_counts.get(kind, 0) + 1
+            self._tgdl_rpc_counts[kind] = count
+            print(
+                f"[网络诊断] GetFileRequest RPC异常 {kind}，累计{count}次；"
+                "Telethon 将按原策略等待约2s后重试（非实际阻塞计时）"
+            )
+            return
+        if not isinstance(exc, (FloodWaitError, FloodPremiumWaitError)):
+            return
+        kind = "FLOOD_PREMIUM_WAIT" if isinstance(exc, FloodPremiumWaitError) else "FLOOD_WAIT"
+        count, seconds = self._tgdl_flood_counts[kind]
+        self._tgdl_flood_counts[kind] = [count + 1, seconds + max(0, exc.seconds)]
+        print(f"[网络诊断] 服务端原始响应 {kind} {exc.seconds}s (GetFileRequest) | "
+              f"累计{count + 1}次，要求等待累计{seconds + max(0, exc.seconds)}s")
+
+    async def _borrow_exported_sender(self, dc_id):
+        sender = await super()._borrow_exported_sender(dc_id)
+        self._tgdl_observe_sender(sender)
+        return sender
 
 
 def build_client(settings: Settings) -> TelegramClient:
@@ -17,7 +87,7 @@ def build_client(settings: Settings) -> TelegramClient:
             settings.proxy_username,
             settings.proxy_password,
         )
-    return TelegramClient(
+    return DiagnosticTelegramClient(
         str(SESSION_PATH),
         settings.api_id,
         settings.api_hash,
