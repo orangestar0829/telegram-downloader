@@ -2,9 +2,56 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from tgdl.paths import prepare_data_dir
+
+
+class MonitorDispatchSummary:
+    """Coalesce adjacent successful pause/resume events into readable lines.
+
+    Only actual suspended checkpoints should be recorded as pause events;
+    requests that have not yet reached a checkpoint are intentionally silent.
+    The caller periodically drains the buffer and forces a drain on shutdown.
+    """
+
+    def __init__(self, *, quiet_seconds: float = 0.9, max_seconds: float = 2.5):
+        self.quiet_seconds = quiet_seconds
+        self.max_seconds = max_seconds
+        self._events: dict[tuple[str, str], int] = {}
+        self._first_at = 0.0
+        self._last_at = 0.0
+
+    def add(self, kind: str, channel_name: str, *, now: float | None = None) -> None:
+        if kind not in ("paused", "resumed"):
+            raise ValueError("Unknown monitor dispatch event")
+        now = time.monotonic() if now is None else now
+        if not self._events:
+            self._first_at = now
+        self._last_at = now
+        key = (kind, channel_name)
+        self._events[key] = self._events.get(key, 0) + 1
+
+    def drain(self, *, now: float | None = None, force: bool = False) -> list[str]:
+        if not self._events:
+            return []
+        now = time.monotonic() if now is None else now
+        if not force and (now - self._last_at < self.quiet_seconds
+                          and now - self._first_at < self.max_seconds):
+            return []
+        lines = []
+        for (kind, name), count in self._events.items():
+            if kind == "paused":
+                lines.append(
+                    f"[调度] 高优先级任务优先｜已暂停 {name} 的{count}个下载任务"
+                )
+            else:
+                lines.append(
+                    f"[调度] {name}：恢复{count}个下载任务｜从原进度继续"
+                )
+        self._events.clear()
+        return lines
 
 
 def monitor_path() -> Path:

@@ -237,7 +237,7 @@ def test_monitor_worker_uses_live_file_concurrency_without_cancelling(tmp_path, 
     asyncio.run(scenario())
 
 
-def test_high_priority_scan_preempts_low_and_resumes_partial_transfer(tmp_path, monkeypatch):
+def test_high_priority_scan_preempts_low_and_resumes_partial_transfer(tmp_path, monkeypatch, capsys):
     app, db = create_app(tmp_path, monkeypatch)
     app._monitor_live_concurrency = 1
     app._monitor_live_chunks = 1
@@ -288,9 +288,13 @@ def test_high_priority_scan_preempts_low_and_resumes_partial_transfer(tmp_path, 
             await asyncio.wait_for(worker, 4)
 
     asyncio.run(scenario())
+    log = capsys.readouterr().out
+    assert "[调度] 高优先级任务优先｜已暂停 low 的1个下载任务" in log
+    assert "[调度] low：恢复1个下载任务｜从原进度继续" in log
+    assert "请求暂停低优先级" not in log
 
 
-def test_live_monitor_concurrency_validates_and_persists(monkeypatch):
+def test_media_settings_apply_atomically_and_persist(monkeypatch):
     app = object.__new__(gui._App)
     class Var:
         def __init__(self, value):
@@ -299,42 +303,155 @@ def test_live_monitor_concurrency_validates_and_persists(monkeypatch):
             return self.value
 
     app.media_concurrency_var = Var("2")
+    app.media_retries_var = Var("2")
     app.chunk_concurrency_var = Var("1")
-    app.media_speed_kib_var = Var("0")
+    app.media_speed_kib_var = Var("2048")
     app._monitor_active = True
     app._monitor_active_transfers = 2
     app._monitor_live_concurrency = 2
     app._monitor_live_chunks = 1
-    app._monitor_live_speed_kib = 0
+    app._monitor_live_speed_kib = 2048
+    app._monitor_live_retries = 2
+    app._applied_media_settings = (2, 2, 1, 2048)
     messages = []
     persisted = []
+    warnings = []
     app._log = messages.append
+    app.messagebox = SimpleNamespace(showwarning=lambda *args: warnings.append(args))
     monkeypatch.setattr(gui, "read_env_values", lambda: {"media_concurrency": "2", "phone": "saved"})
     monkeypatch.setattr(gui, "update_env", lambda values: persisted.append(dict(values)))
+    # Typing a multi-digit number does not affect running monitoring settings.
+    for intermediate in ("", "3", "30", "309", "3096"):
+        app.media_speed_kib_var.value = intermediate
+        assert app._monitor_live_speed_kib == 2048
+        assert app._media_options() == (2, 2, 1)
+    assert persisted == []
+    app.media_speed_kib_var.value = "3096"
     app.media_concurrency_var.value = "1"
-    app._on_monitor_concurrency_changed()
+    app._apply_media_settings()
     assert app._monitor_live_concurrency == 1
+    assert app._monitor_live_speed_kib == 3096
     assert persisted[-1]["media_concurrency"] == "1"
     assert persisted[-1]["phone"] == "saved"
-    assert "文件并发数实时调整：2 → 1" in messages[-1]
+    assert "[下载设置] 已应用" in messages[-1]
 
     for invalid in ("", "0", "9", "x"):
         app.media_concurrency_var.value = invalid
-        app._on_monitor_concurrency_changed()
+        app._apply_media_settings()
     assert app._monitor_live_concurrency == 1
     assert len(persisted) == 1
+    assert len(warnings) == 4
     app.media_concurrency_var.value = "3"
-    app._on_monitor_concurrency_changed()
+    app._apply_media_settings()
     assert app._monitor_live_concurrency == 3
     assert len(persisted) == 2
 
     app.chunk_concurrency_var.value = "3"
     app.media_speed_kib_var.value = "512"
-    app._on_monitor_concurrency_changed()
+    app.media_retries_var.value = "4"
+    app._apply_media_settings()
     assert app._monitor_live_chunks == 3
+    assert app._monitor_live_retries == 4
     assert app._monitor_live_speed_kib == 512
     assert persisted[-1]["chunk_concurrency"] == "3"
     assert persisted[-1]["media_speed_kib"] == "512"
+    assert persisted[-1]["media_retries"] == "4"
+    assert app._media_options() == (3, 4, 3)
+
+
+def test_media_settings_save_failure_keeps_previous_values(monkeypatch):
+    app = object.__new__(gui._App)
+    class Var:
+        def __init__(self, value): self.value = value
+        def get(self): return self.value
+    app.media_concurrency_var = Var("2")
+    app.media_retries_var = Var("2")
+    app.chunk_concurrency_var = Var("1")
+    app.media_speed_kib_var = Var("512")
+    app._applied_media_settings = (1, 1, 1, 0)
+    app._monitor_live_concurrency = 1
+    app._monitor_live_speed_kib = 0
+    warnings = []
+    app.messagebox = SimpleNamespace(showwarning=lambda *args: warnings.append(args))
+    monkeypatch.setattr(gui, "read_env_values", lambda: {})
+    def fail(_values): raise OSError("disk unavailable")
+    monkeypatch.setattr(gui, "update_env", fail)
+    app._apply_media_settings()
+    assert warnings and "保存失败" in warnings[-1][1]
+    assert app._applied_media_settings == (1, 1, 1, 0)
+    assert app._monitor_live_concurrency == 1
+    assert app._monitor_live_speed_kib == 0
+
+
+def test_high_priority_preempts_two_busy_low_downloads(tmp_path, monkeypatch, capsys):
+    """Match GUI screenshot: two low videos busy when high scan queues media."""
+    app, db = create_app(tmp_path, monkeypatch)
+    app._monitor_live_concurrency = 2
+    app._monitor_live_chunks = 1
+    app._monitored = [
+        {"target": "high", "priority": 99, "name": "priority channel", "enabled": True},
+        {"target": "low", "priority": 0, "name": "stripchat", "enabled": True},
+    ]
+    history = DownloadHistory(db)
+    history.enqueue_media([
+        PendingMedia(456, mid, "low", "stripchat", "video", str(mid))
+        for mid in (4092, 4093)
+    ])
+    history.close()
+
+    async def scenario():
+        low_starts = asyncio.Queue()
+        high_done = asyncio.Event()
+        low_done = asyncio.Event()
+        low_released = asyncio.Event()
+        observed = []
+
+        async def fake_download(client, message, folder, base, stats, *,
+                                history, peer_id, monitor_flow, **kwargs):
+            if peer_id == 456:
+                monitor_flow.pause.register()
+                low_starts.put_nowait(message.id)
+                observed.append(("low_started", message.id))
+                try:
+                    for i in range(60):
+                        await monitor_flow.pause.checkpoint()
+                        if low_released.is_set():
+                            break
+                        await asyncio.sleep(0.04)
+                finally:
+                    monitor_flow.pause.unregister()
+                observed.append(("low_finished", message.id))
+                low_done.set()
+            else:
+                observed.append(("high_started", message.id))
+                high_done.set()
+            history.mark_saved(peer_id, message.id, "video", Path(base))
+            return Path(base)
+
+        monkeypatch.setattr(downloader, "_download_with_retry", fake_download)
+        worker = asyncio.create_task(app._monitor_download_worker(2, 0, 1))
+        try:
+            ids = {await asyncio.wait_for(low_starts.get(), 3) for _ in range(2)}
+            assert ids == {4092, 4093}
+            assert app._monitor_active_transfers == 2
+            newer = DownloadHistory(db)
+            newer.enqueue_media([
+                PendingMedia(123, 6001, "high", "priority channel", "photo", "6001")
+            ])
+            newer.close()
+            await asyncio.wait_for(high_done.wait(), 5)
+            assert not low_done.is_set(), "high priority starts before low videos finish"
+            low_released.set()
+        finally:
+            app._monitor_download_stop.set()
+            low_released.set()
+            await asyncio.wait_for(worker, 5)
+        assert ("high_started", 6001) in observed
+
+    asyncio.run(scenario())
+    log = capsys.readouterr().out
+    assert "[调度] priority channel：已插队开始下载" in log
+    assert "[调度] 高优先级任务优先｜已暂停 stripchat" in log
 
 
 def test_scan_completes_while_video_transfer_is_blocked(tmp_path, monkeypatch):
