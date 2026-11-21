@@ -39,6 +39,7 @@ from tgdl.monitor import (
     MonitorDispatchSummary, choose_monitor_download, load_channels, next_due_channel,
     save_channels,
 )
+
 from tgdl.paths import data_dir
 from tgdl.single_instance import AlreadyRunning, gui_instance_guard
 from tgdl.temp_cleanup import inspect_cleanup
@@ -169,6 +170,7 @@ class _App:
         self.download_queue: "queue.Queue[str]" = queue.Queue()
         self.progress_queue: "queue.Queue[tuple[str, str, int, int, str]]" = queue.Queue()
         self._progress_entries: dict[str, dict] = {}
+        self._monitor_progress_states: dict[str, str] = {}
         self._log_popup = None
         self._log_popup_text = None
         self._download_popup = None
@@ -253,6 +255,7 @@ class _App:
         self._monitor_batch_used: dict[str, int] = {}
         self._monitor_scan_inflight = False
         self._monitor_active_transfers = 0
+        self._monitor_total_transfers = 0
         self._monitor_live_concurrency = self._applied_media_settings[0]
         self._monitor_live_retries = self._applied_media_settings[1]
         self._monitor_live_chunks = self._applied_media_settings[2]
@@ -864,6 +867,7 @@ class _App:
         priority_logged = False
         pause_requested_at: dict[tuple[int, int], float] = {}
         pause_delay_reported: set[tuple[int, int]] = set()
+        paused_since: dict[tuple[int, int], float] = {}
         limiter = SharedSpeedLimiter(getattr(self, "_monitor_live_speed_kib", 0) * 1024)
         cancelled = False
         try:
@@ -877,8 +881,10 @@ class _App:
                     task = active.pop(key)
                     active_jobs.pop(key)
                     pauses.pop(key)
+                    self._monitor_progress_state(key[0], key[1], "结束")
                     pause_requested_at.pop(key, None)
                     pause_delay_reported.discard(key)
+                    paused_since.pop(key, None)
                     target = active_target.pop(key)
                     started_at = active_started.pop(key)
                     if key not in suspended_accounted:
@@ -896,8 +902,10 @@ class _App:
                 # Paused wall time must not count as occupied transfer time.
                 for key, ctl in pauses.items():
                     if ctl.suspended and key not in suspended_accounted:
+                        paused_since[key] = time.monotonic()
                         pause_requested_at.pop(key, None)
                         pause_delay_reported.discard(key)
+                        self._monitor_progress_state(key[0], key[1], "已暂停")
                         target = active_target[key]
                         occupied_seconds[target] = (
                             occupied_seconds.get(target, 0.0)
@@ -930,6 +938,7 @@ class _App:
                 if not any(ctl.suspended or ctl.requested for ctl in pauses.values()):
                     priority_logged = False
                 self._monitor_active_transfers = len(running_keys)
+                self._monitor_total_transfers = len(active)
                 # Preserve the existing manual download behaviour: don't
                 # launch new monitor transfers while a manual job is running.
                 manual_busy = self._download_future is not None and not self._download_future.done()
@@ -949,13 +958,13 @@ class _App:
                     )
                     pending = []
                     for item in candidates:
-                        suspended = next((
+                        suspended_jobs = [
                             active_jobs[key] for key, ctl in pauses.items()
                             if ctl.suspended and active_target[key] == item["target"]
-                        ), None)
-                        if suspended is not None:
-                            pending.append((item, suspended))
-                            continue
+                        ]
+                        pending.extend((item, suspended) for suspended in suspended_jobs)
+                        if suspended_jobs:
+                            continue  # Resume all paused files before new ones at this priority.
                         if not item["enabled"]:
                             continue  # Only finish an already-started disabled channel.
                         for job in history.pending_for_target(item["target"], limit=16):
@@ -1005,22 +1014,52 @@ class _App:
                             current_occupied.get(target, 0.0)
                             + max(0.0, now - active_started[key])
                         )
-                    # Once an earlier low-priority file was paused, higher
-                    # priority queued work goes first; resume it afterward.
-                    if any(ctl.suspended for ctl in pauses.values()) and pending:
+                    selected = None
+                    if pending:
+                        # Strict priority: never resume or start a lower-rank
+                        # job while any higher-rank file is still running or
+                        # queued. At the winning rank, paused jobs get the
+                        # first slot, before new media from the same rank.
                         highest = max(int(item.get("priority", 0)) for item, _ in pending)
-                        pending = [
+                        highest_running = max(
+                            (
+                                int(next(
+                                    (item.get("priority", 0) for item in candidates
+                                     if item["target"] == active_target[key]), 0
+                                ))
+                                for key in running_keys
+                            ),
+                            default=None,
+                        )
+                        if highest_running is not None and highest_running > highest:
+                            await asyncio.sleep(0.25)
+                            continue  # Higher-priority transfer has not finished yet.
+                        matching = [
                             pair for pair in pending
                             if int(pair[0].get("priority", 0)) == highest
                         ]
-                    selected = choose_monitor_download(pending, active_counts, current_occupied)
+                        suspended_first = [
+                            pair for pair in matching
+                            if (pair[1].peer_id, pair[1].message_id) in paused_since
+                        ]
+                        if suspended_first:
+                            selected = min(
+                                suspended_first,
+                                key=lambda pair: paused_since[
+                                    (pair[1].peer_id, pair[1].message_id)
+                                ],
+                            )
+                        else:
+                            selected = choose_monitor_download(matching, active_counts, current_occupied)
                     if selected is not None:
                         item, job = selected
                         key = (job.peer_id, job.message_id)
                         if key in active:
+                            paused_since.pop(key, None)
                             suspended_accounted.discard(key)
                             active_started[key] = time.monotonic()
                             pauses[key].resume()
+                            self._monitor_progress_state(key[0], key[1], "恢复中")
                             dispatch_log.add("resumed", item.get("name") or item["target"])
                             continue
                         pause = MonitorPause()
@@ -1094,7 +1133,10 @@ class _App:
                     task.cancel()
             if active:
                 await asyncio.gather(*active.values(), return_exceptions=True)
+            for key in active:
+                self._monitor_progress_state(key[0], key[1], "结束")
             self._monitor_active_transfers = 0
+            self._monitor_total_transfers = 0
             history.close()
             self._monitor_worker_task = None
 
@@ -1333,12 +1375,33 @@ class _App:
         """Called from background downloads; only enqueue, never touch Tk."""
         self.progress_queue.put((key, label, done, total, status))
 
+    def _monitor_progress_state(self, peer_id: int, message_id: int, status: str) -> None:
+        """Publish a worker pause/resume state to Tk without resetting bytes."""
+        self._update_download_progress(
+            f"__monitor_state__:{peer_id}:{message_id}", "", 0, 0, status
+        )
+
     def _drain_progress(self) -> None:
         now = time.monotonic()
         latest = {}
+        states = getattr(self, "_monitor_progress_states", None)
+        if states is None:
+            states = {}
+            self._monitor_progress_states = states
         try:
             while True:
                 event = self.progress_queue.get_nowait()
+                if event[0].startswith("__monitor_state__:"):
+                    prefix = event[0][len("__monitor_state__:"):] + ":"
+                    if event[4] == "结束":
+                        states.pop(prefix, None)
+                    else:
+                        states[prefix] = event[4]
+                    continue
+                if event[4] == "下载中":
+                    prefix = ":".join(event[0].split(":", 2)[:2]) + ":"
+                    if states.get(prefix) == "恢复中":
+                        states.pop(prefix, None)
                 latest[event[0]] = event
         except queue.Empty:
             pass
@@ -1359,12 +1422,17 @@ class _App:
                 old["expires"] = now + 5
             else:
                 old.pop("expires", None)
+        running, paused = [], []
         for key, entry in list(self._progress_entries.items()):
             if entry.get("expires", float("inf")) <= now:
                 self._progress_entries.pop(key)
                 if self.progress_tree.exists(key):
                     self.progress_tree.delete(key)
                 continue
+            display_status = next(
+                (status for prefix, status in states.items() if key.startswith(prefix)),
+                entry["status"],
+            )
             total = entry["total"]
             done = entry["done"]
             ratio = min(1.0, done / total) if total else 0
@@ -1373,19 +1441,23 @@ class _App:
             portion = f"{done / 1048576:.1f}/{total / 1048576:.1f} MiB  {ratio:.0%}" if total else f"{done / 1048576:.1f} MiB"
             speed = (
                 f"{entry['speed'] / 1048576:.2f} MiB/s"
-                if entry["status"] == "下载中" and now - entry["last_time"] < 3
+                if display_status == "下载中" and now - entry["last_time"] < 3
                 else "—"
             )
-            values = (entry["label"], f"{bar} {portion}", speed, entry["status"])
+            values = (entry["label"], f"{bar} {portion}", speed, display_status)
             if self.progress_tree.exists(key):
                 self.progress_tree.item(key, values=values)
             else:
                 self.progress_tree.insert("", "end", iid=key, values=values)
-        active = [v for v in self._progress_entries.values() if v["status"] not in ("完成", "失败", "限流等待", "已取消")]
+            if display_status == "已暂停":
+                paused.append(entry)
+            elif display_status not in ("完成", "失败", "限流等待", "已取消"):
+                running.append(entry)
         self.progress_summary.set(
-            f"正在处理 {len(active)} 个文件，合计速度 "
-            f"{sum(v['speed'] for v in active if v['status'] == '下载中' and now - v['last_time'] < 3) / 1048576:.2f} MiB/s"
-            if active else "当前没有正在下载的文件"
+            f"正在下载 {len(running)} 个文件"
+            + (f"，已暂停 {len(paused)} 个" if paused else "")
+            + f"，合计速度 {sum(v['speed'] for v in running if v['status'] == '下载中' and now - v['last_time'] < 3) / 1048576:.2f} MiB/s"
+            if running or paused else "当前没有正在下载的文件"
         )
 
     def _drain_log(self) -> None:
@@ -2024,7 +2096,7 @@ class _App:
         if self._closing:
             return
         manual_busy = self._download_future is not None and not self._download_future.done()
-        monitor_busy = getattr(self, "_monitor_active_transfers", 0) > 0
+        monitor_busy = getattr(self, "_monitor_total_transfers", 0) > 0
         busy = manual_busy or monitor_busy
         if busy:
             decision = self.messagebox.askyesnocancel(

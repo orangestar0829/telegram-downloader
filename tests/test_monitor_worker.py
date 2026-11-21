@@ -63,7 +63,7 @@ def create_app(tmp_path, monkeypatch):
     return app, db
 
 
-def test_single_slot_balances_time_instead_of_counting_three_files(tmp_path, monkeypatch):
+def test_single_slot_drains_higher_priority_before_lower_priority(tmp_path, monkeypatch):
     app, db = create_app(tmp_path, monkeypatch)
     history = DownloadHistory(db)
     history.enqueue_media([
@@ -83,7 +83,7 @@ def test_single_slot_balances_time_instead_of_counting_three_files(tmp_path, mon
 
     monkeypatch.setattr(downloader, "_download_with_retry", fake_download)
     asyncio.run(asyncio.wait_for(app._monitor_download_worker(1, 0, 1), timeout=5))
-    assert [peer for peer, _ in scheduled] == [123, 456, 123, 123]
+    assert [peer for peer, _ in scheduled] == [123, 123, 123, 123]
     hist = DownloadHistory(db)
     assert hist.pending_count() == 3
     hist.close()
@@ -143,7 +143,7 @@ def test_monitor_fair_choice_prevents_three_large_videos_from_monopolizing():
     assert order == ["high", "low", "third"]
 
 
-def test_monitor_worker_gives_small_media_its_own_slot(tmp_path, monkeypatch):
+def test_monitor_worker_does_not_start_low_file_while_high_files_active(tmp_path, monkeypatch):
     app, db = create_app(tmp_path, monkeypatch)
     history = DownloadHistory(db)
     history.enqueue_media([
@@ -170,10 +170,17 @@ def test_monitor_worker_gives_small_media_its_own_slot(tmp_path, monkeypatch):
         monkeypatch.setattr(downloader, "_download_with_retry", fake_download)
         worker = asyncio.create_task(app._monitor_download_worker(3, 0, 1))
         try:
+            for _ in range(40):
+                if len([item for item in started if item[0] == 123]) == 3:
+                    break
+                await asyncio.sleep(0.025)
+            assert len([item for item in started if item[0] == 123]) == 3
+            await asyncio.sleep(0.5)
+            assert not photo_finished.is_set()
+            assert (456, 201) not in started
+            big_video_release.set()
             await asyncio.wait_for(photo_finished.wait(), timeout=3)
             assert (456, 201) in started
-            assert len([item for item in started if item[0] == 123]) <= 2
-            assert not big_video_release.is_set()
         finally:
             app._monitor_download_stop.set()
             big_video_release.set()
