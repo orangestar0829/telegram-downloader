@@ -182,6 +182,96 @@ def test_monitor_worker_gives_small_media_its_own_slot(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_monitor_worker_uses_live_file_concurrency_without_cancelling(tmp_path, monkeypatch):
+    app, db = create_app(tmp_path, monkeypatch)
+    app._monitor_live_concurrency = 2
+    history = DownloadHistory(db)
+    history.enqueue_media([
+        PendingMedia(123, mid, "high", "high", "video", str(mid))
+        for mid in range(301, 305)
+    ])
+    history.close()
+
+    async def scenario():
+        started = asyncio.Queue()
+        gates = {mid: asyncio.Event() for mid in range(301, 305)}
+
+        async def fake_download(client, message, folder, base, stats, *, history, peer_id, **kwargs):
+            started.put_nowait(message.id)
+            await gates[message.id].wait()
+            history.mark_saved(peer_id, message.id, "video", Path(base))
+            return Path(base)
+
+        monkeypatch.setattr(downloader, "_download_with_retry", fake_download)
+        worker = asyncio.create_task(app._monitor_download_worker(2, 0, 1))
+        try:
+            first = await asyncio.wait_for(started.get(), timeout=3)
+            second = await asyncio.wait_for(started.get(), timeout=3)
+            assert app._monitor_active_transfers == 2
+            # Limit changes while existing downloads are running.
+            app._monitor_live_concurrency = 1
+            gates[first].set()
+            await asyncio.sleep(0.55)
+            assert started.empty(), "lower limit must not start another file while one is active"
+            assert not gates[second].is_set(), "lowering limit must not cancel the other file"
+
+            gates[second].set()
+            third = await asyncio.wait_for(started.get(), timeout=3)
+            assert app._monitor_active_transfers == 1
+            # Raising from 1 to 2 should fill the newly available slot.
+            app._monitor_live_concurrency = 2
+            fourth = await asyncio.wait_for(started.get(), timeout=3)
+            assert {first, second, third, fourth} == set(range(301, 305))
+            assert app._monitor_active_transfers == 2
+        finally:
+            app._monitor_download_stop.set()
+            for gate in gates.values():
+                gate.set()
+            await asyncio.wait_for(worker, timeout=3)
+        completed = DownloadHistory(db)
+        try:
+            assert completed.pending_count() == 0
+        finally:
+            completed.close()
+
+    asyncio.run(scenario())
+
+
+def test_live_monitor_concurrency_validates_and_persists(monkeypatch):
+    app = object.__new__(gui._App)
+    class Var:
+        def __init__(self, value):
+            self.value = value
+        def get(self):
+            return self.value
+
+    app.media_concurrency_var = Var("2")
+    app._monitor_active = True
+    app._monitor_active_transfers = 2
+    app._monitor_live_concurrency = 2
+    messages = []
+    persisted = []
+    app._log = messages.append
+    monkeypatch.setattr(gui, "read_env_values", lambda: {"media_concurrency": "2", "phone": "saved"})
+    monkeypatch.setattr(gui, "update_env", lambda values: persisted.append(dict(values)))
+    app.media_concurrency_var.value = "1"
+    app._on_monitor_concurrency_changed()
+    assert app._monitor_live_concurrency == 1
+    assert persisted[-1]["media_concurrency"] == "1"
+    assert persisted[-1]["phone"] == "saved"
+    assert "正在下载 2 个文件" in messages[-1]
+
+    for invalid in ("", "0", "9", "x"):
+        app.media_concurrency_var.value = invalid
+        app._on_monitor_concurrency_changed()
+    assert app._monitor_live_concurrency == 1
+    assert len(persisted) == 1
+    app.media_concurrency_var.value = "3"
+    app._on_monitor_concurrency_changed()
+    assert app._monitor_live_concurrency == 3
+    assert len(persisted) == 2
+
+
 def test_scan_completes_while_video_transfer_is_blocked(tmp_path, monkeypatch):
     app, db = create_app(tmp_path, monkeypatch)
     history = DownloadHistory(db)

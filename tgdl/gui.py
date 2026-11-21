@@ -238,6 +238,7 @@ class _App:
         self._monitor_batch_used: dict[str, int] = {}
         self._monitor_scan_inflight = False
         self._monitor_active_transfers = 0
+        self._monitor_live_concurrency: int | None = None
         self._monitor_worker_retry_at = 0.0
         self._monitor_job = None
         self._monitor_active = False
@@ -256,6 +257,9 @@ class _App:
         self.p_limit = tk.StringVar()
 
         self._build_ui()
+        # Tk variables must be read on the GUI thread. Publish only validated
+        # integer limits; the background monitor worker reads this snapshot.
+        self.media_concurrency_var.trace_add("write", self._on_monitor_concurrency_changed)
 
         self._stdout, self._stderr = sys.stdout, sys.stderr
         self._timestamp_formatter = TimestampedLines()
@@ -632,11 +636,43 @@ class _App:
             self._log("[监控] 已停止调度，正在下载的任务不受影响\n")
             self._monitor_refresh()
 
+    def _on_monitor_concurrency_changed(self, *_args) -> None:
+        if self._monitor_active:
+            self._refresh_monitor_concurrency()
+
+    def _refresh_monitor_concurrency(self) -> None:
+        """Publish the live monitor-only file limit from Tk's thread."""
+        try:
+            limit = int(self.media_concurrency_var.get().strip())
+        except (ValueError, TypeError):
+            return  # Ignore transient edits; keep the last valid limit.
+        if not 1 <= limit <= 8:
+            return
+        previous = self._monitor_live_concurrency
+        if previous == limit:
+            return
+        self._monitor_live_concurrency = limit
+        if previous is not None:
+            active = self._monitor_active_transfers
+            self._log(
+                f"[监控下载] 媒体并发数实时调整：{previous} → {limit}；"
+                f"当前正在下载 {active} 个文件，已有下载继续完成，"
+                "新任务按更新后的上限派发\n"
+            )
+            # Settings changed while monitoring should also survive a restart.
+            try:
+                values = read_env_values()
+                values["media_concurrency"] = str(limit)
+                update_env(values)
+            except OSError as exc:
+                self._log(f"[监控下载] 保存并发数设置失败，本次运行仍已生效：{exc}\n")
+
     def _monitor_tick(self):
         self._monitor_job = None
         if not self._monitor_active:
             return
         now = time.time()
+        self._refresh_monitor_concurrency()
         scan_busy = self._monitor_scan_inflight
         if not scan_busy:
             # Rotate a 20-message slice per channel, not a complete 500-media
@@ -766,7 +802,10 @@ class _App:
                 # Preserve the existing manual download behaviour: don't
                 # launch new monitor transfers while a manual job is running.
                 manual_busy = self._download_future is not None and not self._download_future.done()
-                if not manual_busy and len(active) < concurrency:
+                # Only the live monitor limit changes. In-flight files are
+                # never preempted when the user reduces the limit.
+                effective_concurrency = getattr(self, "_monitor_live_concurrency", None) or concurrency
+                if not manual_busy and len(active) < effective_concurrency:
                     candidates = sorted(
                         (item for item in self._monitored if item["enabled"]),
                         key=lambda item: -int(item.get("priority", 0)),
