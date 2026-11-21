@@ -605,6 +605,7 @@ class _App:
             item = self._monitored[index]
             item["enabled"] = not item["enabled"]
             self._monitor_batch_used.pop(item["target"], None)
+            self._monitor_totals.pop(item["target"], None)
             self._monitor_next[item["target"]] = time.time()
             save_channels(self._monitored)
             self._monitor_refresh()
@@ -616,6 +617,7 @@ class _App:
             self._monitor_scan_stop.clear()
             self._monitor_download_stop.clear()
             self._monitor_batch_used.clear()
+            self._monitor_totals.clear()
             self._monitor_next = {item["target"]: time.time() for item in self._monitored}
             self.monitor_button.config(text="停止全部监控")
             self._log("[监控] 多频道监控已启动\n")
@@ -649,6 +651,12 @@ class _App:
                 quota = int(item.get("batch_size", 100))
                 used = self._monitor_batch_used.get(target, 0)
                 remaining = max(1, quota - used)
+                if target not in self._monitor_totals:
+                    display = item.get("name") or target
+                    self._log(
+                        f"[监控扫描] {display}：开始扫描；间隔={item['minutes']}分钟，"
+                        f"本轮媒体上限={quota}（只扫描并入队，不等待文件下载）\n"
+                    )
                 def resolved(title, peer_id):
                     self.root.after(0, lambda: self._monitor_set_name(target, title))
                 async def scan():
@@ -706,6 +714,7 @@ class _App:
         self._monitor_scan_inflight = False
         if not self._monitor_active:
             return
+        self._monitor_totals.pop(target, None)
         self._monitor_next[target] = time.time() + 60
         self._log(f"[监控] 扫描 {target} 失败，60秒后再试：{exc}\n")
 
@@ -717,8 +726,9 @@ class _App:
         if item is None:
             return
         self._monitor_batch_used[target] = self._monitor_batch_used.get(target, 0) + result.matched
-        self._monitor_log_progress(target, result)
-        if not result.more_pending or self._monitor_batch_used[target] >= int(item.get("batch_size", 100)):
+        quota_reached = self._monitor_batch_used[target] >= int(item.get("batch_size", 100))
+        self._monitor_log_progress(target, result, quota_reached=quota_reached)
+        if not result.more_pending or quota_reached:
             self._monitor_batch_used[target] = 0
             self._monitor_next[target] = time.time() + item["minutes"] * 60
         else:
@@ -804,7 +814,7 @@ class _App:
                                     stats, skip_existing=True, retries=retries,
                                     chunk_concurrency=chunks, history=history,
                                     peer_id=job.peer_id,
-                                    on_saved=lambda detail: self._log_download(f"[{job.title}] {detail}"),
+                                    on_saved=lambda detail: self._log_download(f"[监控下载] [{job.title}] {detail}"),
                                     temp_download_dir=self.settings.temp_download_dir,
                                     on_progress=self._update_download_progress,
                                 )
@@ -1459,25 +1469,30 @@ class _App:
 
         future.add_done_callback(finished)
 
-    def _monitor_log_progress(self, target: str, result) -> None:
-        """Aggregate one scan window's batches in the running GUI session."""
+    def _monitor_log_progress(self, target: str, result, *, quota_reached: bool = False) -> None:
+        """Report discovery/queuing only, never claim that media has downloaded."""
         total = self._monitor_totals.setdefault(
-            target, {"matched": 0, "queued": 0, "skipped": 0, "failed": 0, "batches": 0},
+            target, {"matched": 0, "queued": 0, "skipped": 0, "scanned_messages": 0, "batches": 0},
         )
         total["batches"] += 1
-        for key in ("matched", "queued", "skipped", "failed"):
+        for key in ("matched", "queued", "skipped", "scanned_messages"):
             total[key] += getattr(result, key, 0)
-        name = next(
-            (item.get("name") or target for item in self._monitored if item["target"] == target),
-            target,
-        )
-        status = "还有下一批" if result.more_pending else "本轮扫描已结束"
+        channel = next((item for item in self._monitored if item["target"] == target), None)
+        name = (channel.get("name") or target) if channel else target
+        if quota_reached:
+            limit = channel.get("batch_size", 100) if channel else 100
+            status = f"达到本轮媒体上限 {limit}，暂停扫描；下次定时扫描续查"
+        elif result.more_pending:
+            status = "本片扫描结束，稍后继续下一片"
+        else:
+            status = "本轮扫描结束"
         self._log(
-            f"[监控进度] {name}: {status}；本次运行累计 {total['batches']} 批，"
-            f"匹配={total['matched']} 新增排队={total['queued']} "
-            f"跳过={total['skipped']} 失败={total['failed']}\n"
+            f"[监控扫描] {name}：{status}；本轮已扫描 {total['batches']} 片，"
+            f"检查消息={total['scanned_messages']}，匹配媒体={total['matched']}，"
+            f"新加入下载队列={total['queued']}，已有下载记录跳过={total['skipped']}。"
+            "（仅为扫描/入队结果，文件下载独立进行）\n"
         )
-        if not result.more_pending:
+        if quota_reached or not result.more_pending:
             self._monitor_totals.pop(target, None)
 
     def on_toggle_auto(self) -> None:
