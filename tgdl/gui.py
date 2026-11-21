@@ -40,6 +40,7 @@ from tgdl.paths import data_dir
 from tgdl.single_instance import AlreadyRunning, gui_instance_guard
 from tgdl.temp_cleanup import inspect_cleanup
 from tgdl.telethon_diagnostics import install_telethon_diagnostics
+from tgdl.window_state import load_window_geometry, save_window_geometry
 
 from tgdl import downloader as _downloader
 from tgdl import http_fetch as _http_fetch
@@ -172,7 +173,9 @@ class _App:
 
         self.root = tk.Tk()
         self.root.title("Telegram 下载器")
-        self.root.geometry("1080x820")
+        self.root.geometry(load_window_geometry(
+            self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        ))
         self.root.minsize(790, 620)
         self._app_icon = None
         try:
@@ -1946,6 +1949,14 @@ class _App:
             )
             if decision is None:
                 return
+        # Keep a normal window's most recent dimensions and placement. Never
+        # replace saved geometry with a minimized/maximized or invalid rect.
+        if getattr(self, "root", None) is not None and self.root.state() == "normal":
+            save_window_geometry(
+                self.root.geometry(),
+                self.root.winfo_screenwidth(),
+                self.root.winfo_screenheight(),
+            )
         if self._monitor_active:
             self._monitor_start_stop()
         if self._auto_config is not None:
