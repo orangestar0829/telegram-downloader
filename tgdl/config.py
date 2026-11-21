@@ -25,6 +25,7 @@ _ENV_KEYS = {
     "MEDIA_CONCURRENCY": "media_concurrency",
     "MEDIA_RETRIES": "media_retries",
     "CHUNK_CONCURRENCY": "chunk_concurrency",
+    "MEDIA_SPEED_KIB": "media_speed_kib",
 }
 
 
@@ -41,6 +42,7 @@ class Settings:
     media_concurrency: int = 3
     media_retries: int = 2
     chunk_concurrency: int = 1
+    media_speed_kib: int = 0
     temp_download_dir: Path | None = None
 
 
@@ -96,7 +98,7 @@ def read_env_values() -> dict[str, str]:
         "proxy_host": "", "proxy_port": "",
         "proxy_username": "", "proxy_password": "",
         "media_concurrency": "3", "media_retries": "2",
-        "chunk_concurrency": "1",
+        "chunk_concurrency": "1", "media_speed_kib": "0",
     }
     if ENV_PATH.exists():
         for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
@@ -128,6 +130,7 @@ def update_env(values: dict[str, str]) -> Path:
         ("MEDIA_CONCURRENCY", "media_concurrency"),
         ("MEDIA_RETRIES", "media_retries"),
         ("CHUNK_CONCURRENCY", "chunk_concurrency"),
+        ("MEDIA_SPEED_KIB", "media_speed_kib"),
         ("TEMP_DOWNLOAD_DIR", "temp_download_dir"),
     ):
         if name in values:
@@ -196,6 +199,9 @@ def load_settings() -> Settings:
         ),
         chunk_concurrency=_bounded_int(
             os.getenv("CHUNK_CONCURRENCY", "1"), "CHUNK_CONCURRENCY", 1, 8
+        ),
+        media_speed_kib=_bounded_int(
+            os.getenv("MEDIA_SPEED_KIB", "0"), "MEDIA_SPEED_KIB", 0, 1048576
         ),
         temp_download_dir=staging_dir,
     )

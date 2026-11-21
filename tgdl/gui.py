@@ -206,6 +206,7 @@ class _App:
         self.media_concurrency_var = tk.StringVar(value=env["media_concurrency"])
         self.media_retries_var = tk.StringVar(value=env["media_retries"])
         self.chunk_concurrency_var = tk.StringVar(value=env["chunk_concurrency"])
+        self.media_speed_kib_var = tk.StringVar(value=env.get("media_speed_kib", "0"))
         self.status_var = tk.StringVar(value="未登录")
         self.manual_var = tk.StringVar()
 
@@ -239,6 +240,8 @@ class _App:
         self._monitor_scan_inflight = False
         self._monitor_active_transfers = 0
         self._monitor_live_concurrency: int | None = None
+        self._monitor_live_chunks: int | None = None
+        self._monitor_live_speed_kib: int = 0
         self._monitor_worker_retry_at = 0.0
         self._monitor_job = None
         self._monitor_active = False
@@ -260,6 +263,8 @@ class _App:
         # Tk variables must be read on the GUI thread. Publish only validated
         # integer limits; the background monitor worker reads this snapshot.
         self.media_concurrency_var.trace_add("write", self._on_monitor_concurrency_changed)
+        self.chunk_concurrency_var.trace_add("write", self._on_monitor_concurrency_changed)
+        self.media_speed_kib_var.trace_add("write", self._on_monitor_concurrency_changed)
 
         self._stdout, self._stderr = sys.stdout, sys.stderr
         self._timestamp_formatter = TimestampedLines()
@@ -615,6 +620,16 @@ class _App:
             self._monitor_refresh()
 
     def _monitor_start_stop(self):
+        if not self._monitor_active:
+            try:
+                rate = int(self.media_speed_kib_var.get().strip())
+                if not 0 <= rate <= 1048576:
+                    raise ValueError
+            except (TypeError, ValueError):
+                self.messagebox.showwarning(
+                    "监控限速", "监控总限速必须是 0-1048576 的整数 KiB/s（0 表示不限速）"
+                )
+                return
         self._monitor_active = not self._monitor_active
         if self._monitor_active:
             self._stop_auto() if self._auto_config is not None else None
@@ -641,31 +656,36 @@ class _App:
             self._refresh_monitor_concurrency()
 
     def _refresh_monitor_concurrency(self) -> None:
-        """Publish the live monitor-only file limit from Tk's thread."""
-        try:
-            limit = int(self.media_concurrency_var.get().strip())
-        except (ValueError, TypeError):
-            return  # Ignore transient edits; keep the last valid limit.
-        if not 1 <= limit <= 8:
-            return
-        previous = self._monitor_live_concurrency
-        if previous == limit:
-            return
-        self._monitor_live_concurrency = limit
-        if previous is not None:
-            active = self._monitor_active_transfers
-            self._log(
-                f"[监控下载] 媒体并发数实时调整：{previous} → {limit}；"
-                f"当前正在下载 {active} 个文件，已有下载继续完成，"
-                "新任务按更新后的上限派发\n"
-            )
-            # Settings changed while monitoring should also survive a restart.
+        """Only read Tk variables on the main thread; workers use snapshots."""
+        changed: dict[str, str] = {}
+        for variable, attribute, env_key, minimum, maximum, label in (
+            (self.media_concurrency_var, "_monitor_live_concurrency", "media_concurrency", 1, 8, "文件并发数"),
+            (self.chunk_concurrency_var, "_monitor_live_chunks", "chunk_concurrency", 1, 8, "单文件分块并发"),
+            (self.media_speed_kib_var, "_monitor_live_speed_kib", "media_speed_kib", 0, 1048576, "总限速 KiB/s"),
+        ):
+            try:
+                value = int(variable.get().strip())
+            except (ValueError, TypeError):
+                continue
+            if not minimum <= value <= maximum:
+                continue
+            previous = getattr(self, attribute, None)
+            if previous == value:
+                continue
+            setattr(self, attribute, value)
+            if previous is not None:
+                self._log(
+                    f"[监控下载] {label}实时调整：{previous} → {value}；"
+                    "正在下载的文件按新配置逐步生效\n"
+                )
+                changed[env_key] = str(value)
+        if changed:
             try:
                 values = read_env_values()
-                values["media_concurrency"] = str(limit)
+                values.update(changed)
                 update_env(values)
             except OSError as exc:
-                self._log(f"[监控下载] 保存并发数设置失败，本次运行仍已生效：{exc}\n")
+                self._log(f"[监控下载] 保存参数失败，本次运行仍已生效：{exc}\n")
 
     def _monitor_tick(self):
         self._monitor_job = None
@@ -773,64 +793,159 @@ class _App:
     async def _monitor_download_worker(self, concurrency: int, retries: int, chunks: int):
         """Consume durable media jobs independently from the channel scanner."""
         from tgdl.downloader import DownloadStats, _download_with_retry, safe_name
+        from tgdl.monitor_flow import MonitorFlow, MonitorPause, SharedSpeedLimiter
         self._monitor_worker_task = asyncio.current_task()
         history = DownloadHistory()
         active = {}
+        active_jobs = {}
+        pauses = {}
         active_target: dict[tuple[int, int], str] = {}
         active_started: dict[tuple[int, int], float] = {}
         occupied_seconds: dict[str, float] = {}
+        suspended_accounted: set[tuple[int, int]] = set()
+        limiter = SharedSpeedLimiter(getattr(self, "_monitor_live_speed_kib", 0) * 1024)
         cancelled = False
         try:
             await self._ensure_client()
             while not self._monitor_download_stop.is_set():
-                self._monitor_active_transfers = len(active)
+                limiter.bytes_per_second = getattr(self, "_monitor_live_speed_kib", 0) * 1024
                 finished = [key for key, task in active.items() if task.done()]
                 for key in finished:
                     task = active.pop(key)
+                    active_jobs.pop(key)
+                    pauses.pop(key)
                     target = active_target.pop(key)
                     started_at = active_started.pop(key)
-                    occupied_seconds[target] = (
-                        occupied_seconds.get(target, 0.0)
-                        + max(0.0, time.monotonic() - started_at)
-                    )
+                    if key not in suspended_accounted:
+                        occupied_seconds[target] = (
+                            occupied_seconds.get(target, 0.0)
+                            + max(0.0, time.monotonic() - started_at)
+                        )
+                    suspended_accounted.discard(key)
                     try:
                         await task
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
                         print(f"[监控] 下载任务 {key} 异常：{exc}")
+                # Paused wall time must not count as occupied transfer time.
+                for key, ctl in pauses.items():
+                    if ctl.suspended and key not in suspended_accounted:
+                        target = active_target[key]
+                        occupied_seconds[target] = (
+                            occupied_seconds.get(target, 0.0)
+                            + max(0.0, time.monotonic() - active_started[key])
+                        )
+                        suspended_accounted.add(key)
+                running_keys = [key for key, ctl in pauses.items() if not ctl.suspended]
+                self._monitor_active_transfers = len(running_keys)
                 # Preserve the existing manual download behaviour: don't
                 # launch new monitor transfers while a manual job is running.
                 manual_busy = self._download_future is not None and not self._download_future.done()
                 # Only the live monitor limit changes. In-flight files are
                 # never preempted when the user reduces the limit.
                 effective_concurrency = getattr(self, "_monitor_live_concurrency", None) or concurrency
-                if not manual_busy and len(active) < effective_concurrency:
+                if not manual_busy:
                     candidates = sorted(
-                        (item for item in self._monitored if item["enabled"]),
+                        (
+                            item for item in self._monitored
+                            if item["enabled"] or any(
+                                ctl.suspended and active_target[key] == item["target"]
+                                for key, ctl in pauses.items()
+                            )
+                        ),
                         key=lambda item: -int(item.get("priority", 0)),
                     )
                     pending = []
                     for item in candidates:
+                        suspended = next((
+                            active_jobs[key] for key, ctl in pauses.items()
+                            if ctl.suspended and active_target[key] == item["target"]
+                        ), None)
+                        if suspended is not None:
+                            pending.append((item, suspended))
+                            continue
+                        if not item["enabled"]:
+                            continue  # Only finish an already-started disabled channel.
                         for job in history.pending_for_target(item["target"], limit=16):
                             if (job.peer_id, job.message_id) not in active:
                                 pending.append((item, job))
                                 break
+                    # A newly scanned high-priority channel can cooperatively
+                    # pause a lower-priority active transfer at a chunk boundary.
+                    if pending and len(running_keys) >= effective_concurrency:
+                        high_priority = max(int(item.get("priority", 0)) for item, _ in pending)
+                        priority_by_target = {
+                            item["target"]: int(item.get("priority", 0))
+                            for item in candidates
+                        }
+                        transitioning = any(
+                            ctl.requested and not ctl.suspended
+                            for ctl in pauses.values()
+                        )
+                        victims = [
+                            key for key in running_keys
+                            if not pauses[key].requested
+                            and priority_by_target.get(active_target[key], 0) < high_priority
+                        ]
+                        if victims and not transitioning:
+                            victim = min(
+                                victims,
+                                key=lambda key: (
+                                    priority_by_target.get(active_target[key], 0),
+                                    active_started[key],
+                                ),
+                            )
+                            pauses[victim].pause()
+                            print(
+                                f"[监控调度] 高优先级频道有待下载媒体；"
+                                f"请求暂停低优先级 {active_target[victim]} / 消息 {victim[1]}，"
+                                "在安全分块边界释放槽位"
+                            )
+                            await asyncio.sleep(0.1)
+                            continue
+                    if len(running_keys) >= effective_concurrency:
+                        await asyncio.sleep(0.25)
+                        continue
                     active_counts: dict[str, int] = {}
                     current_occupied = dict(occupied_seconds)
                     now = time.monotonic()
                     for key, target in active_target.items():
+                        if pauses[key].suspended:
+                            continue
                         active_counts[target] = active_counts.get(target, 0) + 1
                         current_occupied[target] = (
                             current_occupied.get(target, 0.0)
                             + max(0.0, now - active_started[key])
                         )
-                    selected = choose_monitor_download(
-                        pending, active_counts, current_occupied
-                    )
+                    # Once an earlier low-priority file was paused, higher
+                    # priority queued work goes first; resume it afterward.
+                    if any(ctl.suspended for ctl in pauses.values()) and pending:
+                        highest = max(int(item.get("priority", 0)) for item, _ in pending)
+                        pending = [
+                            pair for pair in pending
+                            if int(pair[0].get("priority", 0)) == highest
+                        ]
+                    selected = choose_monitor_download(pending, active_counts, current_occupied)
                     if selected is not None:
                         item, job = selected
-                        async def transfer(job=job):
+                        key = (job.peer_id, job.message_id)
+                        if key in active:
+                            suspended_accounted.discard(key)
+                            active_started[key] = time.monotonic()
+                            pauses[key].resume()
+                            print(
+                                f"[监控调度] 恢复 {item['target']} / 消息 {job.message_id}，"
+                                "继续已有临时文件，不重新下载"
+                            )
+                            continue
+                        pause = MonitorPause()
+                        flow = MonitorFlow(
+                            pause=pause,
+                            limiter=limiter,
+                            chunks=lambda: getattr(self, "_monitor_live_chunks", None) or chunks,
+                        )
+                        async def transfer(job=job, flow=flow):
                             try:
                                 entity = await resolve_channel(self.client, job.target)
                                 message = await self.client.get_messages(entity, ids=job.message_id)
@@ -856,6 +971,7 @@ class _App:
                                     on_saved=lambda detail: self._log_download(f"[监控下载] [{job.title}] {detail}"),
                                     temp_download_dir=self.settings.temp_download_dir,
                                     on_progress=self._update_download_progress,
+                                    monitor_flow=flow,
                                 )
                                 if stats.failed:
                                     history.mark_failure(job.peer_id, job.message_id)
@@ -867,17 +983,20 @@ class _App:
                             except Exception as exc:
                                 print(f"[监控] 下载 {job.title}/{job.message_id} 失败：{exc}")
                                 history.mark_failure(job.peer_id, job.message_id)
-                        key = (job.peer_id, job.message_id)
                         active[key] = asyncio.create_task(transfer())
+                        active_jobs[key] = job
+                        pauses[key] = pause
                         active_target[key] = item["target"]
                         active_started[key] = time.monotonic()
-                        self._monitor_active_transfers = len(active)
+                        self._monitor_active_transfers = len(running_keys) + 1
                         continue
                 await asyncio.sleep(0.25 if active else 1)
         except asyncio.CancelledError:
             cancelled = True
             raise
         finally:
+            for ctl in pauses.values():
+                ctl.resume()
             if cancelled:
                 for task in active.values():
                     task.cancel()
@@ -1078,6 +1197,10 @@ class _App:
         ttk.Label(frame, text="单文件分块并发 (1-8)").grid(row=3, column=0, sticky="w", **pad)
         ttk.Entry(frame, textvariable=self.chunk_concurrency_var, width=8).grid(
             row=3, column=1, sticky="w", **pad
+        )
+        ttk.Label(frame, text="监控总限速 (KiB/s，0=不限)").grid(row=6, column=0, sticky="w", **pad)
+        ttk.Entry(frame, textvariable=self.media_speed_kib_var, width=10).grid(
+            row=6, column=1, sticky="w", **pad
         )
         frame.columnconfigure(2, weight=1)
         return frame

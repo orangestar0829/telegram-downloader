@@ -31,6 +31,7 @@ from tqdm import tqdm
 from tgdl.chunked import (
     ChunkDownloadStalled, chunkable_document, document_suffix, download_chunked,
 )
+from tgdl.monitor_flow import MonitorFlow, monitor_download_document
 from tgdl.cache_budget import optional_staging_reservation
 from tgdl.history import DownloadHistory, PendingMedia
 from tgdl.progress import ProgressCallback, TransferProgress
@@ -566,6 +567,7 @@ async def _download_one(
     on_saved: Callable[[str], None] | None = None,
     temp_download_dir: Path | None = None,
     on_progress: ProgressCallback | None = None,
+    monitor_flow: MonitorFlow | None = None,
 ) -> Path | None:
     if skip_existing:
         if history is not None and peer_id is not None and history.contains(peer_id, message.id):
@@ -587,7 +589,9 @@ async def _download_one(
     chunk_timings: dict[str, float] = {}
     publish_seconds = 0.0
     target = download_target(message)
-    document = chunkable_document(target, chunk_concurrency)
+    document = chunkable_document(
+        target, max(2, chunk_concurrency) if monitor_flow is not None else chunk_concurrency
+    )
     use_chunks = document is not None and callable(getattr(client, "iter_download", None))
     transfer = TransferProgress(
         f"{peer_id or 0}:{message.id}:{base}",
@@ -620,7 +624,50 @@ async def _download_one(
                         bar.refresh()
                         transfer.emit("下载中", done=current, total=total)
 
-                    if use_chunks:
+                    last_monitored_bytes = 0
+                    async def monitored_progress(current: int, total: int) -> None:
+                        nonlocal last_monitored_bytes
+                        if monitor_flow is not None:
+                            await monitor_flow.pause.checkpoint()
+                            await monitor_flow.limiter.consume(
+                                max(0, current - last_monitored_bytes),
+                                pause=monitor_flow.pause,
+                            )
+                        last_monitored_bytes = current
+                        progress(current, total)
+
+                    async def monitored_direct_download(file: str) -> Path | str | None:
+                        if monitor_flow is not None:
+                            monitor_flow.pause.register()
+                        try:
+                            if monitor_flow is not None:
+                                await monitor_flow.pause.checkpoint()
+                            return await client.download_media(
+                                target, file=file,
+                                progress_callback=monitored_progress if monitor_flow is not None else progress,
+                            )
+                        finally:
+                            if monitor_flow is not None:
+                                monitor_flow.pause.unregister()
+
+                    if use_chunks and monitor_flow is not None:
+                        chunk_output = Path(temporary) / ("data" + document_suffix(document))
+                        try:
+                            saved = await monitor_download_document(
+                                client, document, chunk_output, monitor_flow,
+                                on_bytes=lambda n: (bar.update(n), transfer.advance(n)),
+                            )
+                            mode = "监控动态分块"
+                        except ChunkDownloadStalled as exc:
+                            # Preserve the existing fallback if Telegram never
+                            # completes a window despite bounded retries.
+                            print(f"[监控分块] {base} 请求停顿：{exc}；回退普通下载")
+                            chunk_output.unlink(missing_ok=True)
+                            saved = await monitored_direct_download(
+                                str(Path(temporary) / ("normal" + document_suffix(document)))
+                            )
+                            mode = "监控普通回退"
+                    elif use_chunks:
                         chunk_output = Path(temporary) / ("data" + document_suffix(document))
                         try:
                             saved = await download_chunked(
@@ -639,16 +686,13 @@ async def _download_one(
                             # Delete it BEFORE normal fallback, so SSD staging
                             # never needs space for two full copies of one media.
                             chunk_output.unlink(missing_ok=True)
-                            saved = await client.download_media(
-                                target, file=str(Path(temporary) / ("normal" + document_suffix(document))),
-                                progress_callback=progress,
+                            saved = await monitored_direct_download(
+                                str(Path(temporary) / ("normal" + document_suffix(document)))
                             )
                         else:
                             mode = f"分块{chunk_concurrency}路"
                     else:
-                        saved = await client.download_media(
-                            target, file=str(temporary), progress_callback=progress,
-                        )
+                        saved = await monitored_direct_download(str(temporary))
                 media_elapsed = max(time.monotonic() - media_started, 0.001)
                 if not saved:
                     stats.failed += 1
@@ -750,6 +794,7 @@ async def _download_with_retry(
     on_saved: Callable[[str], None] | None = None,
     temp_download_dir: Path | None = None,
     on_progress: ProgressCallback | None = None,
+    monitor_flow: MonitorFlow | None = None,
 ) -> Path | None:
     for attempt in range(retries + 1):
         try:
@@ -761,6 +806,7 @@ async def _download_with_retry(
                 on_saved=on_saved,
                 temp_download_dir=temp_download_dir,
                 on_progress=on_progress,
+                monitor_flow=monitor_flow,
             )
         except asyncio.CancelledError:
             if on_progress is not None:

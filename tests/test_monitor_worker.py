@@ -237,6 +237,59 @@ def test_monitor_worker_uses_live_file_concurrency_without_cancelling(tmp_path, 
     asyncio.run(scenario())
 
 
+def test_high_priority_scan_preempts_low_and_resumes_partial_transfer(tmp_path, monkeypatch):
+    app, db = create_app(tmp_path, monkeypatch)
+    app._monitor_live_concurrency = 1
+    app._monitor_live_chunks = 1
+    history = DownloadHistory(db)
+    history.enqueue_media([PendingMedia(456, 501, "low", "low", "video", "501")])
+    history.close()
+
+    async def scenario():
+        low_started = asyncio.Event()
+        high_finished = asyncio.Event()
+        low_finished = asyncio.Event()
+        observations = []
+
+        async def fake_download(client, message, folder, base, stats, *, history, peer_id, monitor_flow, **kwargs):
+            if peer_id == 456:
+                monitor_flow.pause.register()
+                try:
+                    observations.append("low_started")
+                    low_started.set()
+                    for step in range(12):
+                        await monitor_flow.pause.checkpoint()
+                        observations.append(f"low_part_{step}")
+                        await asyncio.sleep(0.05)
+                finally:
+                    monitor_flow.pause.unregister()
+                history.mark_saved(peer_id, message.id, "video", Path(base))
+                low_finished.set()
+            else:
+                observations.append("high_started")
+                history.mark_saved(peer_id, message.id, "photo", Path(base))
+                high_finished.set()
+            return Path(base)
+
+        monkeypatch.setattr(downloader, "_download_with_retry", fake_download)
+        worker = asyncio.create_task(app._monitor_download_worker(1, 0, 1))
+        try:
+            await asyncio.wait_for(low_started.wait(), 3)
+            extra = DownloadHistory(db)
+            extra.enqueue_media([PendingMedia(123, 601, "high", "high", "photo", "601")])
+            extra.close()
+            await asyncio.wait_for(high_finished.wait(), 4)
+            assert not low_finished.is_set(), "high should finish before paused lower-priority media"
+            assert "low_part_0" in observations
+            await asyncio.wait_for(low_finished.wait(), 4)
+            assert observations.index("high_started") < observations.index("low_part_11")
+        finally:
+            app._monitor_download_stop.set()
+            await asyncio.wait_for(worker, 4)
+
+    asyncio.run(scenario())
+
+
 def test_live_monitor_concurrency_validates_and_persists(monkeypatch):
     app = object.__new__(gui._App)
     class Var:
@@ -246,9 +299,13 @@ def test_live_monitor_concurrency_validates_and_persists(monkeypatch):
             return self.value
 
     app.media_concurrency_var = Var("2")
+    app.chunk_concurrency_var = Var("1")
+    app.media_speed_kib_var = Var("0")
     app._monitor_active = True
     app._monitor_active_transfers = 2
     app._monitor_live_concurrency = 2
+    app._monitor_live_chunks = 1
+    app._monitor_live_speed_kib = 0
     messages = []
     persisted = []
     app._log = messages.append
@@ -259,7 +316,7 @@ def test_live_monitor_concurrency_validates_and_persists(monkeypatch):
     assert app._monitor_live_concurrency == 1
     assert persisted[-1]["media_concurrency"] == "1"
     assert persisted[-1]["phone"] == "saved"
-    assert "正在下载 2 个文件" in messages[-1]
+    assert "文件并发数实时调整：2 → 1" in messages[-1]
 
     for invalid in ("", "0", "9", "x"):
         app.media_concurrency_var.value = invalid
@@ -270,6 +327,14 @@ def test_live_monitor_concurrency_validates_and_persists(monkeypatch):
     app._on_monitor_concurrency_changed()
     assert app._monitor_live_concurrency == 3
     assert len(persisted) == 2
+
+    app.chunk_concurrency_var.value = "3"
+    app.media_speed_kib_var.value = "512"
+    app._on_monitor_concurrency_changed()
+    assert app._monitor_live_chunks == 3
+    assert app._monitor_live_speed_kib == 512
+    assert persisted[-1]["chunk_concurrency"] == "3"
+    assert persisted[-1]["media_speed_kib"] == "512"
 
 
 def test_scan_completes_while_video_transfer_is_blocked(tmp_path, monkeypatch):
