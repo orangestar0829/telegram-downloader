@@ -25,6 +25,38 @@ def next_due_channel(
     return ready[turn % len(ready)] if ready else None
 
 
+def choose_monitor_download(
+    candidates: list[tuple[dict, object]],
+    active_counts: dict[str, int],
+    occupied_seconds: dict[str, float],
+) -> tuple[dict, object] | None:
+    """Fairly assign the next *monitor* download slot.
+
+    First prefer a channel with queued work and no active transfer, then
+    consider borrowed capacity. Within the same active-slot count, balance
+    completed/in-progress slot occupancy time instead of file counts.
+    Numeric priority breaks ties and supplies a bounded 1..4 weight; no
+    channel can starve simply because its priority is lower.
+    """
+    if not candidates:
+        return None
+    priorities = sorted({int(item.get("priority", 0)) for item, _ in candidates})
+    weights = {priority: 1 + min(rank, 3) for rank, priority in enumerate(priorities)}
+
+    def key(pair: tuple[dict, object]):
+        item, _job = pair
+        target = item["target"]
+        priority = int(item.get("priority", 0))
+        slots = active_counts.get(target, 0)
+        return (
+            slots,
+            occupied_seconds.get(target, 0.0) / weights[priority],
+            -priority,
+        )
+
+    return min(candidates, key=key)
+
+
 def load_channels(path: Path | None = None) -> list[dict]:
     path = path or monitor_path()
     if not path.exists():

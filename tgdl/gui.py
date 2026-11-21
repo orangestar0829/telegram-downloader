@@ -35,7 +35,7 @@ from tgdl.config import (
 from tgdl.downloader import download_channel, resolve_channel, scan_monitor_slice
 from tgdl.history import DownloadHistory
 from tgdl.log_format import TimestampedLines
-from tgdl.monitor import load_channels, next_due_channel, save_channels
+from tgdl.monitor import choose_monitor_download, load_channels, next_due_channel, save_channels
 from tgdl.paths import data_dir
 from tgdl.single_instance import AlreadyRunning, gui_instance_guard
 from tgdl.temp_cleanup import inspect_cleanup
@@ -730,8 +730,9 @@ class _App:
         self._monitor_worker_task = asyncio.current_task()
         history = DownloadHistory()
         active = {}
-        consecutive_target = None
-        streak = 0
+        active_target: dict[tuple[int, int], str] = {}
+        active_started: dict[tuple[int, int], float] = {}
+        occupied_seconds: dict[str, float] = {}
         cancelled = False
         try:
             await self._ensure_client()
@@ -740,6 +741,12 @@ class _App:
                 finished = [key for key, task in active.items() if task.done()]
                 for key in finished:
                     task = active.pop(key)
+                    target = active_target.pop(key)
+                    started_at = active_started.pop(key)
+                    occupied_seconds[target] = (
+                        occupied_seconds.get(target, 0.0)
+                        + max(0.0, time.monotonic() - started_at)
+                    )
                     try:
                         await task
                     except asyncio.CancelledError:
@@ -754,26 +761,26 @@ class _App:
                         (item for item in self._monitored if item["enabled"]),
                         key=lambda item: -int(item.get("priority", 0)),
                     )
-                    # After three selections from one channel give another
-                    # pending channel a turn, regardless of priority.
-                    if streak >= 3 and len(candidates) > 1:
-                        candidates = [x for x in candidates if x["target"] != consecutive_target] + [
-                            x for x in candidates if x["target"] == consecutive_target
-                        ]
-                    selected = None
+                    pending = []
                     for item in candidates:
                         for job in history.pending_for_target(item["target"], limit=16):
                             if (job.peer_id, job.message_id) not in active:
-                                selected = (item, job)
+                                pending.append((item, job))
                                 break
-                        if selected is not None:
-                            break
+                    active_counts: dict[str, int] = {}
+                    current_occupied = dict(occupied_seconds)
+                    now = time.monotonic()
+                    for key, target in active_target.items():
+                        active_counts[target] = active_counts.get(target, 0) + 1
+                        current_occupied[target] = (
+                            current_occupied.get(target, 0.0)
+                            + max(0.0, now - active_started[key])
+                        )
+                    selected = choose_monitor_download(
+                        pending, active_counts, current_occupied
+                    )
                     if selected is not None:
                         item, job = selected
-                        if item["target"] == consecutive_target:
-                            streak += 1
-                        else:
-                            consecutive_target, streak = item["target"], 1
                         async def transfer(job=job):
                             try:
                                 entity = await resolve_channel(self.client, job.target)
@@ -811,7 +818,10 @@ class _App:
                             except Exception as exc:
                                 print(f"[监控] 下载 {job.title}/{job.message_id} 失败：{exc}")
                                 history.mark_failure(job.peer_id, job.message_id)
-                        active[(job.peer_id, job.message_id)] = asyncio.create_task(transfer())
+                        key = (job.peer_id, job.message_id)
+                        active[key] = asyncio.create_task(transfer())
+                        active_target[key] = item["target"]
+                        active_started[key] = time.monotonic()
                         self._monitor_active_transfers = len(active)
                         continue
                 await asyncio.sleep(0.25 if active else 1)
