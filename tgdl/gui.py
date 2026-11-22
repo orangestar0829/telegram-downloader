@@ -515,6 +515,21 @@ class _App:
         self._refresh_log_accounts()
         self.root.after_idle(self._set_initial_log_split, main_panel, log_panel)
 
+        def keep_logs_visible(_event):
+            # When the window shrinks, surrender space from the scrollable
+            # chat list before the progress header hides the entire log.
+            self.root.after_idle(self._reserve_log_space, progress_frame, toolbar)
+
+        self.main_split.bind("<Configure>", keep_logs_visible, add="+")
+
+    def _reserve_log_space(self, progress_frame, toolbar) -> None:
+        if not self.main_split.winfo_exists():
+            return
+        reserve = progress_frame.winfo_reqheight() + toolbar.winfo_reqheight() + 96
+        maximum = max(1, self.main_split.winfo_height() - reserve)
+        if self.main_split.sashpos(0) > maximum:
+            self.main_split.sashpos(0, maximum)
+
     @staticmethod
     def _initial_split_position(
         height: int, main_height: int | None = None, log_height: int | None = None,
