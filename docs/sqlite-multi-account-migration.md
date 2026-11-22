@@ -44,6 +44,14 @@ CREATE TABLE IF NOT EXISTS account_attempt_backoff (
 Additionally, `downloaded_media` receives one nullable column `account_id TEXT`.
 Old rows remain `NULL`; they are **not** deleted or recreated.
 
+`download_claims` also gains a nullable token column automatically. Each
+new claim gets a fresh token, even when the same account reclaims a job.
+A pre-upgrade lease has no token: it retains its original expiry and a new
+worker cannot renew or complete it. Its pending job becomes eligible after
+expiry if no success was recorded. The upgrade does not clear pending jobs
+or rewrite historical successes. Do not run an older executable against the
+same live database: it does not check lease tokens.
+
 Telegram basic groups use account-local message IDs. Only the original account
 monitors them, now under negative peer keys; channel and supergroup keys keep
 their prior positive values. Untyped legacy history keys are not rewritten,

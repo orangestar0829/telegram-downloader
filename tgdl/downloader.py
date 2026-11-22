@@ -367,6 +367,10 @@ class DownloadStats:
         self.scanned_messages = 0
 
 
+class DownloadLeaseLost(RuntimeError):
+    """A monitor transfer no longer owns the attempt that started it."""
+
+
 class UnsupportedSharedMonitorPeer(ValueError):
     """The shared ledger requires a message counter common to all accounts."""
 
@@ -740,7 +744,34 @@ async def _download_one(
     temp_download_dir: Path | None = None,
     on_progress: ProgressCallback | None = None,
     monitor_flow: MonitorFlow | None = None,
+    account_id: str | None = None,
+    claim_token: str | None = None,
+    on_claim_committed: Callable[[], None] | None = None,
 ) -> Path | None:
+    has_claim = account_id is not None or claim_token is not None
+    if has_claim and (history is None or peer_id is None or not account_id or not claim_token):
+        raise ValueError("Monitor downloads require history, peer, account and claim token")
+
+    def require_claim() -> None:
+        if has_claim:
+            assert history is not None and peer_id is not None and account_id and claim_token
+            if not history.owns_claim(account_id, peer_id, message.id, token=claim_token):
+                raise DownloadLeaseLost(f"Monitor lease no longer owns message {message.id}")
+
+    def record_claimed(
+        publish: Callable[[], tuple[Path, bool] | None],
+    ) -> tuple[Path, bool] | None:
+        assert history is not None and peer_id is not None and account_id and claim_token
+        result = history.publish_claimed_media(
+            peer_id, message.id, account_id, claim_token, dest_dir.name, publish,
+        )
+        if result is not None and on_claim_committed is not None:
+            # The renewer must know this worker consumed its own claim before
+            # async cache-reservation cleanup gives another task a turn.
+            on_claim_committed()
+        return result
+
+    require_claim()
     if skip_existing and history is not None and peer_id is not None:
         if history.contains(peer_id, message.id):
             stats.skipped += 1
@@ -750,10 +781,31 @@ async def _download_one(
     if skip_existing and expected_size is not None and expected_suffix is not None:
         existing = _existing_media(dest_dir, base, expected_suffix, expected_size)
         if existing is not None:
-            if history is not None and peer_id is not None:
-                history.mark_saved(peer_id, message.id, dest_dir.name, existing)
-            stats.skipped += 1
-            return None
+            if has_claim:
+                checked_existing = False
+
+                def recheck_existing() -> tuple[Path, bool] | None:
+                    nonlocal checked_existing
+                    checked_existing = True
+                    # The candidate may change between discovery and acquiring
+                    # the DB write lock. Never record it if no longer valid.
+                    if _regular_media_size(existing) != expected_size:
+                        return None
+                    return existing, False
+
+                reused = record_claimed(recheck_existing)
+                if reused is not None:
+                    stats.skipped += 1
+                    return None
+                if not checked_existing:
+                    raise DownloadLeaseLost(f"Monitor lease could not record message {message.id}")
+                # Candidate changed; download the media instead without
+                # changing or releasing the lease.
+            else:
+                if history is not None and peer_id is not None:
+                    history.mark_saved(peer_id, message.id, dest_dir.name, existing)
+                stats.skipped += 1
+                return None
     dest_dir.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
     flood_snapshot = getattr(client, "flood_snapshot", None)
@@ -870,6 +922,7 @@ async def _download_one(
                             file /= "normal" + expected_suffix
                         saved = await monitored_direct_download(str(file))
                 media_elapsed = max(time.monotonic() - media_started, 0.001)
+                require_claim()
                 if not saved:
                     stats.failed += 1
                     transfer.emit("失败", force=True)
@@ -886,15 +939,31 @@ async def _download_one(
                 suffix = saved_path.suffix or ".bin"
                 verified_size = (expected_size if skip_existing and expected_suffix
                                  and suffix.lower() == expected_suffix.lower() else None)
+                def publish_ready(source: Path) -> tuple[Path, bool]:
+                    def publish() -> tuple[Path, bool]:
+                        return _publish_media(
+                            source, dest_dir, base, suffix, verified_size=verified_size,
+                        )
+                    if not has_claim:
+                        return publish()
+                    # The final link/rename and ledger write run without awaits
+                    # under the same SQLite lease fence. A stale attempt cannot
+                    # publish even if ownership changed while copying.
+                    result = record_claimed(publish)
+                    if result is None:
+                        raise DownloadLeaseLost(f"Monitor lease could not publish message {message.id}")
+                    return result
+
                 publish_started = time.monotonic()
                 transfer.emit("正在保存", force=True)
-                # Moving within a volume is a rename, not a full media copy.
+                # Publishing within a volume does not copy media bytes.
                 if not same_volume(saved_path, dest_dir):
                     # On cross-volume moves, first copy sequentially to a hidden
                     # incomplete destination, and publish only after full verification.
                     # Never interleave large file copies on a mechanical disk:
                     # one sequential publishing pass at a time.
                     async with _STAGED_PUBLISH_LOCK:
+                        require_claim()
                         with tempfile.TemporaryDirectory(prefix="tgdl-publish-", dir=dest_dir) as publishing:
                             with own_temporary(Path(publishing)):
                                 partial = Path(publishing) / f"data{suffix}"
@@ -907,15 +976,11 @@ async def _download_one(
                                         await asyncio.sleep(0)
                                 if _regular_media_size(partial) != size:
                                     raise IOError("Staged media copy size mismatch")
-                                final_path, published = _publish_media(
-                                    partial, dest_dir, base, suffix, verified_size=verified_size,
-                                )
+                                final_path, published = publish_ready(partial)
                 else:
-                    final_path, published = _publish_media(
-                        saved_path, dest_dir, base, suffix, verified_size=verified_size,
-                    )
+                    final_path, published = publish_ready(saved_path)
                 publish_seconds = time.monotonic() - publish_started
-                if history is not None and peer_id is not None:
+                if not has_claim and history is not None and peer_id is not None:
                     history.mark_saved(peer_id, message.id, dest_dir.name, final_path)
                 if not published:
                     stats.skipped += 1
@@ -983,6 +1048,9 @@ async def _download_with_retry(
     temp_download_dir: Path | None = None,
     on_progress: ProgressCallback | None = None,
     monitor_flow: MonitorFlow | None = None,
+    account_id: str | None = None,
+    claim_token: str | None = None,
+    on_claim_committed: Callable[[], None] | None = None,
 ) -> Path | None:
     for attempt in range(retries + 1):
         try:
@@ -995,8 +1063,11 @@ async def _download_with_retry(
                 temp_download_dir=temp_download_dir,
                 on_progress=on_progress,
                 monitor_flow=monitor_flow,
+                account_id=account_id,
+                claim_token=claim_token,
+                on_claim_committed=on_claim_committed,
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, DownloadLeaseLost):
             if on_progress is not None:
                 on_progress(f"{peer_id or 0}:{message.id}:{base}",
                             f"{dest_dir.parent.name} / {base}", 0, 0, "已取消")

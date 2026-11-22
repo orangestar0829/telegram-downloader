@@ -21,7 +21,7 @@ from tgdl.account_identity import account_identity
 from tgdl.client import build_client, validate_login_phone
 from tgdl.config import load_settings, read_env_values
 from tgdl.downloader import (
-    DownloadStats, _download_with_retry, classify_message, resolve_channel,
+    DownloadLeaseLost, DownloadStats, _download_with_retry, classify_message, resolve_channel,
     history_peer_id, peer_download_folder, require_shared_monitor_peer, scan_monitor_slice,
     UnsupportedSharedMonitorPeer,
 )
@@ -206,9 +206,9 @@ class AccountMonitorRuntime:
     async def _transfer(
         self, history: DownloadHistory, item: dict, job: PendingMedia,
         settings: Any, limiter: SharedSpeedLimiter, retries: int, chunks: int,
+        claim_token: str, *, on_claim_committed: Callable[[], None] | None = None,
     ) -> None:
         peer, mid = job.peer_id, job.message_id
-        success = False
         cooldown = 0.0
         target = item["target"]  # resolve using THIS account, not the scanner's alias
         try:
@@ -246,6 +246,8 @@ class AccountMonitorRuntime:
                 job.base or f"{message.date.strftime('%Y%m%d')}_{mid}",
                 stats, skip_existing=True, retries=retries,
                 chunk_concurrency=chunks, history=history, peer_id=peer,
+                account_id=self.account.id, claim_token=claim_token,
+                on_claim_committed=on_claim_committed,
                 on_saved=lambda detail: self.on_saved(
                     self.account.id, f"[监控下载] [{job.title}] {detail}"
                 ),
@@ -256,16 +258,15 @@ class AccountMonitorRuntime:
                 ),
                 monitor_flow=flow,
             )
-            if path is not None or history.contains(peer, mid):
-                history.attribute_saved(peer, mid, self.account.id)
-                success = True
-            elif stats.failed:
+            if stats.failed:
                 cooldown = 60
                 self.log(f"[下载失败] {target} 消息 {mid}；稍后重试")
-            else:
+            elif path is None and not history.contains(peer, mid):
                 cooldown = 300
         except asyncio.CancelledError:
             raise
+        except DownloadLeaseLost:
+            self.log(f"[下载跳过] 下载租约已失效，放弃保存 {job.title}/{mid}")
         except UnsupportedSharedMonitorPeer as exc:
             self.peer_by_target.pop(target, None)
             self._blocked.add(target)
@@ -285,12 +286,15 @@ class AccountMonitorRuntime:
             else:
                 self.log(f"[下载异常] {target} 消息 {mid}: {exc}")
         finally:
-            if not success:
-                history.release_claim(self.account.id, peer, mid, cooldown=cooldown)
+            history.release_claim(
+                self.account.id, peer, mid, token=claim_token, cooldown=cooldown
+            )
 
     async def _download_loop(self, settings: Any) -> None:
         history = DownloadHistory(self.registry.root / "tgdl_download_history.sqlite3")
-        active: dict[tuple[int, int], tuple[asyncio.Task, str, float]] = {}
+        active: dict[tuple[int, int], tuple[asyncio.Task, str, float, str]] = {}
+        retiring: set[tuple[int, int]] = set()
+        committed: set[str] = set()
         limiter = SharedSpeedLimiter(settings.media_speed_kib * 1024)
         workers, retries, chunks = (
             settings.media_concurrency, settings.media_retries, settings.chunk_concurrency
@@ -301,21 +305,28 @@ class AccountMonitorRuntime:
         try:
             while not self.stop_event.is_set() or active:
                 now = time.monotonic()
-                for key, (task, target, began) in list(active.items()):
+                for key, (task, target, began, token) in list(active.items()):
                     if not task.done():
                         continue
                     del active[key]
+                    retiring.discard(key)
+                    committed.discard(token)
                     occupancy[target] = occupancy.get(target, 0) + max(0, now - began)
                     try:
                         await task
                     except asyncio.CancelledError:
-                        raise
+                        history.release_claim(self.account.id, *key, token=token)
                     except Exception as exc:
                         self.log(f"[下载协程异常] {type(exc).__name__}: {exc}")
                 self.active_count = len(active)
                 if now - last_renew >= 30:
-                    for peer, mid in active:
-                        history.renew_claim(self.account.id, peer, mid)
+                    for key, (task, _target, _began, token) in active.items():
+                        if key in retiring or token in committed:
+                            continue
+                        if not history.renew_claim(self.account.id, *key, token=token):
+                            retiring.add(key)
+                            task.cancel()
+                            self.log(f"[下载跳过] 下载租约已失效，停止任务 {key}")
                     last_renew = now
                 if now - last_refresh >= 5:
                     env = read_env_values(self.registry.env_path(self.account.id))
@@ -350,21 +361,21 @@ class AccountMonitorRuntime:
                                     break
                         counts: dict[str, int] = {}
                         elapsed = dict(occupancy)
-                        for _key, (_task, target, began) in active.items():
+                        for _task, target, began, _token in active.values():
                             counts[target] = counts.get(target, 0) + 1
                             elapsed[target] = elapsed.get(target, 0) + now - began
                         selected = choose_monitor_download(candidates, counts, elapsed)
                         if selected is not None:
                             item, job = selected
-                            if history.try_claim(
-                                self.account.id, job.peer_id, job.message_id
-                            ):
+                            token = history.try_claim(self.account.id, job.peer_id, job.message_id)
+                            if token is not None:
                                 key = (job.peer_id, job.message_id)
                                 task = asyncio.create_task(
                                     self._transfer(history, item, job, settings,
-                                                   limiter, retries, chunks)
+                                                   limiter, retries, chunks, token,
+                                                   on_claim_committed=lambda token=token: committed.add(token))
                                 )
-                                active[key] = (task, item["target"], time.monotonic())
+                                active[key] = (task, item["target"], time.monotonic(), token)
                                 continue
                     except asyncio.CancelledError:
                         raise
@@ -374,16 +385,16 @@ class AccountMonitorRuntime:
         finally:
             # On cancellation or scheduler error, wait for each downloaded
             # file to remove temporary data before releasing its claim.
-            for task, _target, _began in active.values():
-                if not task.done():
+            for key, (task, _target, _began, token) in active.items():
+                if key not in retiring and token not in committed and not task.done():
                     task.cancel()
             if active:
                 await asyncio.gather(
-                    *(task for task, _, _ in active.values()), return_exceptions=True
+                    *(task for task, _, _, _ in active.values()), return_exceptions=True
                 )
             try:
-                for peer, mid in active:
-                    history.release_claim(self.account.id, peer, mid)
+                for key, (_task, _target, _began, token) in active.items():
+                    history.release_claim(self.account.id, *key, token=token)
             finally:
                 self.active_count = 0
                 history.close()

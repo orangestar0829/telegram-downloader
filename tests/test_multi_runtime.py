@@ -70,7 +70,11 @@ def test_two_accounts_take_different_files_across_target_aliases(tmp_path, monke
     async def fake_download(client, message, folder, base, stats, *, history, peer_id, **kwargs):
         seen.append((client.identity, message.id))
         await asyncio.sleep(0.04)
-        history.mark_saved(peer_id, message.id, "video", Path(base))
+        assert history.mark_claim_saved(
+            kwargs["account_id"], peer_id, message.id, "video", Path(base),
+            token=kwargs["claim_token"],
+        )
+        kwargs["on_claim_committed"]()
         return Path(base)
 
     monkeypatch.setattr(multi_runtime, "resolve_channel", resolve)
@@ -156,7 +160,8 @@ def test_secondary_transfer_refuses_a_basic_group_with_old_queue(tmp_path, monke
     history = DownloadHistory(tmp_path / "tgdl_download_history.sqlite3")
     job = PendingMedia(-123, 10, "-123", "Basic group", "photo", "10")
     history.enqueue_media([job])
-    assert history.try_claim(runtime.account.id, job.peer_id, job.message_id)
+    token = history.try_claim(runtime.account.id, job.peer_id, job.message_id)
+    assert token is not None
     messages_requested = []
 
     async def basic_group(_client, _target):
@@ -168,7 +173,7 @@ def test_secondary_transfer_refuses_a_basic_group_with_old_queue(tmp_path, monke
 
     runtime.client.get_messages = get_messages
     monkeypatch.setattr(multi_runtime, "resolve_channel", basic_group)
-    asyncio.run(runtime._transfer(history, {"target": "-123"}, job, None, None, 0, 1))
+    asyncio.run(runtime._transfer(history, {"target": "-123"}, job, None, None, 0, 1, token))
 
     assert not messages_requested
     assert not history.active_claims()

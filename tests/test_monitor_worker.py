@@ -75,7 +75,11 @@ def test_single_slot_drains_higher_priority_before_lower_priority(tmp_path, monk
 
     async def fake_download(client, message, folder, base, stats, *, history, peer_id, **kwargs):
         scheduled.append((peer_id, message.id))
-        history.mark_saved(peer_id, message.id, "photo", Path(base))
+        assert history.mark_claim_saved(
+            kwargs["account_id"], peer_id, message.id, "photo", Path(base),
+            token=kwargs["claim_token"],
+        )
+        kwargs["on_claim_committed"]()
         stats.saved += 1
         if len(scheduled) == 4:
             app._monitor_download_stop.set()
@@ -164,7 +168,11 @@ def test_monitor_worker_does_not_start_low_file_while_high_files_active(tmp_path
                 await big_video_release.wait()
             else:
                 photo_finished.set()
-            history.mark_saved(peer_id, message.id, "photo", Path(base))
+            assert history.mark_claim_saved(
+                kwargs["account_id"], peer_id, message.id, "photo", Path(base),
+                token=kwargs["claim_token"],
+            )
+            kwargs["on_claim_committed"]()
             return Path(base)
 
         monkeypatch.setattr(downloader, "_download_with_retry", fake_download)
@@ -206,7 +214,11 @@ def test_monitor_worker_uses_live_file_concurrency_without_cancelling(tmp_path, 
         async def fake_download(client, message, folder, base, stats, *, history, peer_id, **kwargs):
             started.put_nowait(message.id)
             await gates[message.id].wait()
-            history.mark_saved(peer_id, message.id, "video", Path(base))
+            assert history.mark_claim_saved(
+                kwargs["account_id"], peer_id, message.id, "video", Path(base),
+                token=kwargs["claim_token"],
+            )
+            kwargs["on_claim_committed"]()
             return Path(base)
 
         monkeypatch.setattr(downloader, "_download_with_retry", fake_download)
@@ -272,11 +284,19 @@ def test_high_priority_scan_preempts_low_and_resumes_partial_transfer(tmp_path, 
                         await asyncio.sleep(0.05)
                 finally:
                     monitor_flow.pause.unregister()
-                history.mark_saved(peer_id, message.id, "video", Path(base))
+                assert history.mark_claim_saved(
+                    kwargs["account_id"], peer_id, message.id, "video", Path(base),
+                    token=kwargs["claim_token"],
+                )
+                kwargs["on_claim_committed"]()
                 low_finished.set()
             else:
                 observations.append("high_started")
-                history.mark_saved(peer_id, message.id, "photo", Path(base))
+                assert history.mark_claim_saved(
+                    kwargs["account_id"], peer_id, message.id, "photo", Path(base),
+                    token=kwargs["claim_token"],
+                )
+                kwargs["on_claim_committed"]()
                 high_finished.set()
             return Path(base)
 
@@ -436,7 +456,11 @@ def test_high_priority_preempts_two_busy_low_downloads(tmp_path, monkeypatch, ca
             else:
                 observed.append(("high_started", message.id))
                 high_done.set()
-            history.mark_saved(peer_id, message.id, "video", Path(base))
+            assert history.mark_claim_saved(
+                kwargs["account_id"], peer_id, message.id, "video", Path(base),
+                token=kwargs["claim_token"],
+            )
+            kwargs["on_claim_committed"]()
             return Path(base)
 
         monkeypatch.setattr(downloader, "_download_with_retry", fake_download)
@@ -478,7 +502,11 @@ def test_scan_completes_while_video_transfer_is_blocked(tmp_path, monkeypatch):
         async def slow_download(client, message, folder, base, stats, *, history, peer_id, **kwargs):
             started.set()
             await release.wait()
-            history.mark_saved(peer_id, message.id, "video", Path(base))
+            assert history.mark_claim_saved(
+                kwargs["account_id"], peer_id, message.id, "video", Path(base),
+                token=kwargs["claim_token"],
+            )
+            kwargs["on_claim_committed"]()
             return Path(base)
 
         monkeypatch.setattr(downloader, "_download_with_retry", slow_download)
@@ -521,7 +549,11 @@ def test_graceful_monitor_stop_renews_active_claim_but_claims_no_new_file(tmp_pa
         fetched.append(message.id)
         started.set()
         await finish.wait()
-        history.mark_saved(peer_id, message.id, "photo", Path(base))
+        assert history.mark_claim_saved(
+            kwargs["account_id"], peer_id, message.id, "photo", Path(base),
+            token=kwargs["claim_token"],
+        )
+        kwargs["on_claim_committed"]()
         return Path(base)
 
     renew = DownloadHistory.renew_claim

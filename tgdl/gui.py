@@ -964,12 +964,17 @@ class _App:
 
     async def _monitor_download_worker(self, concurrency: int, retries: int, chunks: int):
         """Consume durable media jobs independently from the channel scanner."""
-        from tgdl.downloader import DownloadStats, _download_with_retry, peer_download_folder
+        from tgdl.downloader import (
+            DownloadLeaseLost, DownloadStats, _download_with_retry, peer_download_folder,
+        )
         from tgdl.monitor_flow import MonitorFlow, MonitorPause, SharedSpeedLimiter
         self._monitor_worker_task = asyncio.current_task()
         history = DownloadHistory()
         active = {}
         active_jobs = {}
+        claims: dict[tuple[int, int], str] = {}
+        retiring: set[tuple[int, int]] = set()
+        committed: set[str] = set()
         staged_jobs = set()
         pauses = {}
         active_target: dict[tuple[int, int], str] = {}
@@ -990,13 +995,12 @@ class _App:
                     print(line)
                 limiter.bytes_per_second = getattr(self, "_monitor_live_speed_kib", 0) * 1024
                 now_lease = time.monotonic()
-                if now_lease - last_lease_refresh >= 30:
-                    for peer, mid in active:
-                        history.renew_claim("default", peer, mid)
-                    last_lease_refresh = now_lease
                 finished = [key for key, task in active.items() if task.done()]
                 for key in finished:
                     task = active.pop(key)
+                    token = claims.pop(key)
+                    retiring.discard(key)
+                    committed.discard(token)
                     active_jobs.pop(key)
                     staged_jobs.discard(key)
                     pauses.pop(key)
@@ -1015,15 +1019,30 @@ class _App:
                     try:
                         await task
                     except asyncio.CancelledError:
-                        raise
+                        # Independent transfer cancellation must not stop the
+                        # scheduler. A coroutine cancelled before its first
+                        # step won't have executed its own finally clause.
+                        history.release_claim("default", *key, token=token)
                     except Exception as exc:
                         print(f"[监控] 下载任务 {key} 异常：{exc}")
+                if now_lease - last_lease_refresh >= 30:
+                    for key, task in active.items():
+                        token = claims[key]
+                        # A completed SQLite commit consumes its token before
+                        # the coroutine finishes releasing any SSD reservation.
+                        if key in retiring or token in committed:
+                            continue
+                        if not history.renew_claim("default", *key, token=token):
+                            retiring.add(key)
+                            task.cancel()
+                            print(f"[监控] 下载租约已失效，停止任务 {key}")
+                    last_lease_refresh = now_lease
                 if self._monitor_download_stop.is_set():
                     # Drain already-started files (including paused ones)
                     # while continuing their lease heartbeat. Do not claim
                     # anything new, even if a transfer frees a slot.
                     for key, ctl in pauses.items():
-                        if ctl.requested:
+                        if key not in retiring and ctl.requested:
                             ctl.resume()
                             self._monitor_progress_state(key[0], key[1], "恢复中")
                     self._monitor_active_transfers = len(active)
@@ -1033,7 +1052,7 @@ class _App:
                     continue
                 # Paused wall time must not count as occupied transfer time.
                 for key, ctl in pauses.items():
-                    if ctl.suspended and key not in suspended_accounted:
+                    if key not in retiring and ctl.suspended and key not in suspended_accounted:
                         paused_since[key] = time.monotonic()
                         pause_requested_at.pop(key, None)
                         pause_delay_reported.discard(key)
@@ -1056,7 +1075,7 @@ class _App:
                 # instead of silently appearing to ignore priority.
                 for key, requested_at in list(pause_requested_at.items()):
                     ctl = pauses.get(key)
-                    if ctl is None or ctl.suspended:
+                    if ctl is None or ctl.suspended or key in retiring:
                         pause_requested_at.pop(key, None)
                         continue
                     if (time.monotonic() - requested_at >= 5.0
@@ -1066,7 +1085,9 @@ class _App:
                             f"[调度] 等待暂停 {active_target[key]} 的下载任务｜"
                             "当前网络请求尚未到安全暂停点，优先任务暂时等待"
                         )
-                running_keys = [key for key, ctl in pauses.items() if not ctl.suspended]
+                running_keys = [
+                    key for key, ctl in pauses.items() if key in retiring or not ctl.suspended
+                ]
                 if not any(ctl.suspended or ctl.requested for ctl in pauses.values()):
                     priority_logged = False
                 self._monitor_active_transfers = len(running_keys)
@@ -1082,7 +1103,8 @@ class _App:
                         (
                             item for item in self._monitored
                             if item["enabled"] or any(
-                                ctl.suspended and active_target[key] == item["target"]
+                                key not in retiring and ctl.suspended
+                                and active_target[key] == item["target"]
                                 for key, ctl in pauses.items()
                             )
                         ),
@@ -1092,7 +1114,8 @@ class _App:
                     for item in candidates:
                         suspended_jobs = [
                             active_jobs[key] for key, ctl in pauses.items()
-                            if ctl.suspended and active_target[key] == item["target"]
+                            if key not in retiring and ctl.suspended
+                            and active_target[key] == item["target"]
                         ]
                         pending.extend((item, suspended) for suspended in suspended_jobs)
                         if suspended_jobs:
@@ -1133,7 +1156,7 @@ class _App:
                         )
                         victims = [
                             key for key in running_keys
-                            if not pauses[key].requested
+                            if key not in retiring and not pauses[key].requested
                             and priority_by_target.get(active_target[key], 0) < high_priority
                         ]
                         if victims and not transitioning:
@@ -1210,7 +1233,8 @@ class _App:
                             self._monitor_progress_state(key[0], key[1], "恢复中")
                             dispatch_log.add("resumed", item.get("name") or item["target"])
                             continue
-                        if not history.try_claim("default", job.peer_id, job.message_id):
+                        token = history.try_claim("default", job.peer_id, job.message_id)
+                        if token is None:
                             await asyncio.sleep(0.03)
                             continue
                         pause = MonitorPause()
@@ -1226,7 +1250,7 @@ class _App:
 
                         async def transfer(job=job, flow=flow, target=item["target"],
                                            media_types=item.get("types", "photo,video"),
-                                           transfer_settings=settings):
+                                           transfer_settings=settings, claim_token=token):
                             cooldown = 0
                             try:
                                 # Always resolve with the account's own channel target.
@@ -1262,20 +1286,21 @@ class _App:
                                     stats, skip_existing=True,
                                     retries=getattr(self, "_monitor_live_retries", retries),
                                     chunk_concurrency=chunks, history=history,
-                                    peer_id=job.peer_id,
+                                    peer_id=job.peer_id, account_id="default", claim_token=claim_token,
+                                    on_claim_committed=lambda: committed.add(claim_token),
                                     on_saved=lambda detail: self._log_download(f"[监控下载] [{job.title}] {detail}"),
                                     temp_download_dir=transfer_settings.temp_download_dir,
                                     on_progress=self._update_download_progress,
                                     monitor_flow=flow,
                                 )
-                                if history.contains(job.peer_id, job.message_id):
-                                    history.attribute_saved(job.peer_id, job.message_id, "default")
-                                elif stats.failed:
+                                if stats.failed:
                                     cooldown = 60
-                                elif path is None:
+                                elif path is None and not history.contains(job.peer_id, job.message_id):
                                     cooldown = 300
                             except asyncio.CancelledError:
                                 raise
+                            except DownloadLeaseLost:
+                                print(f"[监控] 下载租约已失效，放弃保存 {job.title}/{job.message_id}")
                             except Exception as exc:
                                 cooldown = 60
                                 print(f"[监控] 下载 {job.title}/{job.message_id} 失败：{exc}")
@@ -1283,10 +1308,12 @@ class _App:
                                 # Keep the global pending row retryable by another
                                 # eligible account instead of deleting it on failure.
                                 history.release_claim(
-                                    "default", job.peer_id, job.message_id, cooldown=cooldown
+                                    "default", job.peer_id, job.message_id,
+                                    token=claim_token, cooldown=cooldown,
                                 )
                         active[key] = asyncio.create_task(transfer())
                         active_jobs[key] = job
+                        claims[key] = token
                         pauses[key] = pause
                         active_target[key] = item["target"]
                         active_started[key] = time.monotonic()
@@ -1302,8 +1329,8 @@ class _App:
                 print(line)
             # Graceful shutdown drained this set above. If the worker itself
             # was cancelled or failed, cancel any transfer it can no longer renew.
-            for task in active.values():
-                if not task.done():
+            for key, task in active.items():
+                if key not in retiring and claims[key] not in committed and not task.done():
                     task.cancel()
             if active:
                 await asyncio.gather(*active.values(), return_exceptions=True)
@@ -1312,8 +1339,8 @@ class _App:
             self._monitor_active_transfers = 0
             self._monitor_total_transfers = 0
             try:
-                for peer, mid in active:
-                    history.release_claim("default", peer, mid)
+                for key, token in claims.items():
+                    history.release_claim("default", *key, token=token)
             finally:
                 history.close()
                 self._monitor_worker_task = None

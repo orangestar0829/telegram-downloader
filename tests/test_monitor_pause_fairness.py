@@ -131,7 +131,11 @@ def test_paused_low_waits_until_higher_priority_transfer_completes(
                     await release_high.wait()
             finally:
                 pause.unregister()
-            history.mark_saved(peer_id, message.id, "video", Path(base))
+            assert history.mark_claim_saved(
+                _kwargs["account_id"], peer_id, message.id, "video", Path(base),
+                token=_kwargs["claim_token"],
+            )
+            _kwargs["on_claim_committed"]()
             (low_done if peer_id == 456 else high_done).set()
             return Path(base)
 
@@ -267,7 +271,11 @@ def test_resumed_job_precedes_new_job_at_same_priority(tmp_path, monkeypatch):
                     low2_started.set()
             finally:
                 monitor_flow.pause.unregister()
-            history.mark_saved(peer_id, message.id, "video", Path(base))
+            assert history.mark_claim_saved(
+                _kwargs["account_id"], peer_id, message.id, "video", Path(base),
+                token=_kwargs["claim_token"],
+            )
+            _kwargs["on_claim_committed"]()
             return Path(base)
 
         monkeypatch.setattr(downloader, "_download_with_retry", download)

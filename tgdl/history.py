@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 import time
 import threading
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +41,8 @@ class DownloadHistory:
         self._connection = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         with self._lock, self._connection:
             self._connection.execute("PRAGMA busy_timeout = 30000")
+            # Serialize the PRAGMA/ALTER pairs across separate connections.
+            self._connection.execute("BEGIN IMMEDIATE")
             self._connection.execute(
                 """CREATE TABLE IF NOT EXISTS downloaded_media (
                     peer_id INTEGER NOT NULL,
@@ -110,8 +114,16 @@ class DownloadHistory:
                 """CREATE TABLE IF NOT EXISTS download_claims (
                     peer_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
                     account_id TEXT NOT NULL, expires_at REAL NOT NULL,
+                    claim_token TEXT,
                     PRIMARY KEY(peer_id, message_id))"""
             )
+            claim_columns = {
+                row[1] for row in self._connection.execute("PRAGMA table_info(download_claims)")
+            }
+            if "claim_token" not in claim_columns:
+                # Old live leases remain reserved until their original expiry.
+                # The absence of a token makes them unusable by a new worker.
+                self._connection.execute("ALTER TABLE download_claims ADD COLUMN claim_token TEXT")
             self._connection.execute(
                 """CREATE TABLE IF NOT EXISTS account_attempt_backoff (
                     account_id TEXT NOT NULL, peer_id INTEGER NOT NULL,
@@ -300,16 +312,17 @@ class DownloadHistory:
             )]
 
     def try_claim(self, account_id: str, peer_id: int, message_id: int, *,
-                  ttl: float = 600, now: float | None = None) -> bool:
-        """Atomically claim this task, even with concurrent SQLite connections."""
-        if ttl <= 0:
-            raise ValueError("Lease TTL must be positive")
-        now = time.time() if now is None else now
+                  ttl: float = 600, now: float | None = None) -> str | None:
+        """Return a unique token for this acquisition, not merely for this account."""
+        if not 0 < ttl < float("inf"):
+            raise ValueError("Lease TTL must be finite and positive")
+        token = uuid.uuid4().hex
         with self._lock, self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
+            now = time.time() if now is None else now
             result = self._connection.execute(
-                """INSERT INTO download_claims(peer_id,message_id,account_id,expires_at)
-                   SELECT ?,?,?,? WHERE
+                """INSERT INTO download_claims(peer_id,message_id,account_id,expires_at,claim_token)
+                   SELECT ?,?,?,?,? WHERE
                      EXISTS (SELECT 1 FROM pending_media WHERE peer_id=? AND message_id=?
                              AND NOT (peer_id>0 AND target=('-'||peer_id)))
                      AND NOT EXISTS (SELECT 1 FROM downloaded_media
@@ -318,33 +331,41 @@ class DownloadHistory:
                                      WHERE account_id=? AND peer_id=? AND message_id=?
                                        AND retry_after>?)
                    ON CONFLICT(peer_id,message_id) DO UPDATE SET
-                     account_id=excluded.account_id,expires_at=excluded.expires_at
+                     account_id=excluded.account_id,expires_at=excluded.expires_at,
+                     claim_token=excluded.claim_token
                    WHERE download_claims.expires_at<=?""",
-                (peer_id, message_id, account_id, now + ttl,
+                (peer_id, message_id, account_id, now + ttl, token,
                  peer_id, message_id, peer_id, message_id,
                  account_id, peer_id, message_id, now, now),
             )
-            return result.rowcount == 1
+            return token if result.rowcount == 1 else None
 
     def renew_claim(self, account_id: str, peer_id: int, message_id: int, *,
-                    ttl: float = 600, now: float | None = None) -> bool:
-        now = time.time() if now is None else now
+                    token: str, ttl: float = 600, now: float | None = None) -> bool:
+        if not 0 < ttl < float("inf"):
+            raise ValueError("Lease TTL must be finite and positive")
         with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            now = time.time() if now is None else now
             result = self._connection.execute(
                 """UPDATE download_claims SET expires_at=?
-                   WHERE peer_id=? AND message_id=? AND account_id=?""",
-                (now + ttl, peer_id, message_id, account_id),
+                   WHERE peer_id=? AND message_id=? AND account_id=?
+                     AND claim_token=? AND expires_at>?""",
+                (now + ttl, peer_id, message_id, account_id, token, now),
             )
             return result.rowcount == 1
 
     def release_claim(self, account_id: str, peer_id: int, message_id: int, *,
-                      cooldown: float = 0, now: float | None = None) -> None:
-        """Release failed/cancelled work; per-account backoff does not block peers."""
-        now = time.time() if now is None else now
+                      token: str, cooldown: float = 0, now: float | None = None) -> bool:
+        """Only a live attempt can clear its lease and set its account's backoff."""
         with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            now = time.time() if now is None else now
             owned = self._connection.execute(
-                "DELETE FROM download_claims WHERE peer_id=? AND message_id=? AND account_id=?",
-                (peer_id, message_id, account_id),
+                """DELETE FROM download_claims
+                   WHERE peer_id=? AND message_id=? AND account_id=?
+                     AND claim_token=? AND expires_at>?""",
+                (peer_id, message_id, account_id, token, now),
             ).rowcount
             if owned and cooldown > 0:
                 self._connection.execute(
@@ -353,6 +374,31 @@ class DownloadHistory:
                        DO UPDATE SET retry_after=excluded.retry_after""",
                     (account_id, peer_id, message_id, now + cooldown),
                 )
+            return owned == 1
+
+    def _owns_claim_locked(self, account_id: str, peer_id: int, message_id: int,
+                           token: str, now: float) -> bool:
+        return self._connection.execute(
+            """SELECT 1 FROM download_claims
+               WHERE peer_id=? AND message_id=? AND account_id=?
+                 AND claim_token=? AND expires_at>?""",
+            (peer_id, message_id, account_id, token, now),
+        ).fetchone() is not None
+
+    def owns_claim(self, account_id: str, peer_id: int, message_id: int, *,
+                   token: str, now: float | None = None) -> bool:
+        """Best-effort preflight; final publication always rechecks under a write lock."""
+        with self._lock:
+            return self._owns_claim_locked(
+                account_id, peer_id, message_id, token, time.time() if now is None else now,
+            )
+
+    def _has_live_claim_locked(self, peer_id: int, message_id: int, now: float) -> bool:
+        return self._connection.execute(
+            """SELECT 1 FROM download_claims
+               WHERE peer_id=? AND message_id=? AND expires_at>?""",
+            (peer_id, message_id, now),
+        ).fetchone() is not None
 
     def active_claims(self) -> list[tuple[int, int, str, float]]:
         with self._lock:
@@ -360,14 +406,6 @@ class DownloadHistory:
                     for peer, mid, owner, until in self._connection.execute(
                         "SELECT peer_id,message_id,account_id,expires_at FROM download_claims"
                     )]
-
-    def attribute_saved(self, peer_id: int, message_id: int, account_id: str) -> None:
-        with self._lock, self._connection:
-            self._connection.execute(
-                """UPDATE downloaded_media SET account_id=?
-                   WHERE peer_id=? AND message_id=? AND account_id IS NULL""",
-                (account_id, peer_id, message_id),
-            )
 
     def pending_count(self, target: str | None = None) -> int:
         with self._lock:
@@ -379,15 +417,24 @@ class DownloadHistory:
                 ).fetchone()
             return int(row[0])
 
-    def remove_pending(self, peer_id: int, message_id: int) -> None:
+    def remove_pending(self, peer_id: int, message_id: int, *,
+                       now: float | None = None) -> None:
         with self._lock, self._connection:
-            self._connection.execute(
-                "DELETE FROM pending_media WHERE peer_id=? AND message_id=?",
-                (peer_id, message_id),
-            )
+            self._connection.execute("BEGIN IMMEDIATE")
+            now = time.time() if now is None else now
+            if not self._has_live_claim_locked(peer_id, message_id, now):
+                self._connection.execute(
+                    "DELETE FROM pending_media WHERE peer_id=? AND message_id=?",
+                    (peer_id, message_id),
+                )
 
-    def mark_failure(self, peer_id: int, message_id: int) -> None:
+    def mark_failure(self, peer_id: int, message_id: int, *,
+                     now: float | None = None) -> None:
         with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            now = time.time() if now is None else now
+            if self._has_live_claim_locked(peer_id, message_id, now) or self.contains(peer_id, message_id):
+                return
             self._connection.execute(
                 "INSERT OR IGNORE INTO scan_failures(peer_id, message_id) VALUES (?, ?)",
                 (peer_id, message_id),
@@ -397,11 +444,15 @@ class DownloadHistory:
                 (peer_id, message_id),
             )
 
-    def clear_failure(self, peer_id: int, message_id: int) -> None:
+    def clear_failure(self, peer_id: int, message_id: int, *,
+                      now: float | None = None) -> None:
         with self._lock, self._connection:
-            self._connection.execute(
-                "DELETE FROM scan_failures WHERE peer_id=? AND message_id=?", (peer_id, message_id),
-            )
+            self._connection.execute("BEGIN IMMEDIATE")
+            now = time.time() if now is None else now
+            if not self._has_live_claim_locked(peer_id, message_id, now):
+                self._connection.execute(
+                    "DELETE FROM scan_failures WHERE peer_id=? AND message_id=?", (peer_id, message_id),
+                )
 
     def failures(self, peer_id: int, limit: int = 100) -> list[int]:
         with self._lock:
@@ -417,29 +468,73 @@ class DownloadHistory:
                 (peer_id, message_id),
             ).fetchone() is not None
 
-    def mark_saved(
-        self, peer_id: int, message_id: int, kind: str, path: Path
+    def _record_saved_locked(
+        self, peer_id: int, message_id: int, kind: str, path: Path,
+        account_id: str | None,
     ) -> None:
+        self._connection.execute(
+            """INSERT OR IGNORE INTO downloaded_media
+               (peer_id, message_id, kind, original_path, saved_at, account_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (peer_id, message_id, kind, str(path),
+             datetime.now(timezone.utc).isoformat(), account_id),
+        )
+        for table in ("scan_failures", "pending_media", "account_attempt_backoff"):
+            self._connection.execute(
+                f"DELETE FROM {table} WHERE peer_id=? AND message_id=?", (peer_id, message_id),
+            )
+
+    def mark_saved(self, peer_id: int, message_id: int, kind: str, path: Path, *,
+                   now: float | None = None) -> bool:
+        """Record manual success only when there is no live monitor lease."""
         with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            now = time.time() if now is None else now
+            if self._has_live_claim_locked(peer_id, message_id, now):
+                return False
+            self._record_saved_locked(peer_id, message_id, kind, path, None)
             self._connection.execute(
-                """INSERT OR IGNORE INTO downloaded_media
-                   (peer_id, message_id, kind, original_path, saved_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (peer_id, message_id, kind, str(path),
-                 datetime.now(timezone.utc).isoformat()),
+                "DELETE FROM download_claims WHERE peer_id=? AND message_id=? AND expires_at<=?",
+                (peer_id, message_id, now),
             )
+            return True
+
+    def publish_claimed_media(
+        self, peer_id: int, message_id: int, account_id: str, claim_token: str,
+        kind: str, publish: Callable[[], tuple[Path, bool] | None], *,
+        now: float | None = None,
+    ) -> tuple[Path, bool] | None:
+        """Fence final publication and the attributed DB commit to one attempt.
+
+        The callback does only quick, synchronous filesystem publication or
+        validation, after staging/transfer has already finished. If it raises
+        or declines (None), the claim and job are left unchanged. If SQLite
+        subsequently fails, an already-published complete file can be
+        recovered on retry; filesystem publication is not a SQLite operation.
+        """
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            now = time.time() if now is None else now
+            if not self._owns_claim_locked(account_id, peer_id, message_id, claim_token, now):
+                return None
+            result = publish()
+            if result is None:
+                return None
+            path, _created = result
+            self._record_saved_locked(peer_id, message_id, kind, path, account_id)
             self._connection.execute(
-                "DELETE FROM scan_failures WHERE peer_id=? AND message_id=?", (peer_id, message_id),
+                """DELETE FROM download_claims WHERE peer_id=? AND message_id=?
+                   AND account_id=? AND claim_token=?""",
+                (peer_id, message_id, account_id, claim_token),
             )
-            self._connection.execute(
-                "DELETE FROM pending_media WHERE peer_id=? AND message_id=?", (peer_id, message_id),
-            )
-            self._connection.execute(
-                "DELETE FROM download_claims WHERE peer_id=? AND message_id=?", (peer_id, message_id),
-            )
-            self._connection.execute(
-                "DELETE FROM account_attempt_backoff WHERE peer_id=? AND message_id=?", (peer_id, message_id),
-            )
+            return result
+
+    def mark_claim_saved(self, account_id: str, peer_id: int, message_id: int,
+                         kind: str, path: Path, *, token: str, now: float | None = None) -> bool:
+        """Commit specified completed media (no alternate pathname to select)."""
+        return self.publish_claimed_media(
+            peer_id, message_id, account_id, token, kind, lambda: (path, False), now=now,
+        ) is not None
 
     def close(self) -> None:
         with self._lock:

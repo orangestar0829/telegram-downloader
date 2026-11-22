@@ -1,5 +1,10 @@
 """Multi-account database migration, ownership and session separation regressions."""
 import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+
+import pytest
 from pathlib import Path
 
 from tgdl.accounts import AccountRegistry, DEFAULT_ACCOUNT
@@ -90,16 +95,17 @@ def test_claim_lease_prevents_duplicate_media_and_recovers_after_failure(tmp_pat
     item = PendingMedia(123, 50, "@first-alias", "test", "video", "50")
     assert a.enqueue_media([item]) == 1
     assert [x.message_id for x in b.pending_for_peer(123, account_id="B")] == [50]
-    assert a.try_claim("A", 123, 50, ttl=60, now=100)
+    token_a = a.try_claim("A", 123, 50, ttl=60, now=100)
+    assert token_a
     assert not b.try_claim("B", 123, 50, ttl=60, now=110)
     assert b.pending_for_peer(123, account_id="B", now=110) == []
-    assert a.renew_claim("A", 123, 50, ttl=60, now=140)
+    assert a.renew_claim("A", 123, 50, token=token_a, ttl=60, now=140)
     assert not b.try_claim("B", 123, 50, ttl=60, now=150)
-    a.release_claim("A", 123, 50, cooldown=200, now=150)
+    assert a.release_claim("A", 123, 50, token=token_a, cooldown=200, now=150)
     assert not a.try_claim("A", 123, 50, ttl=60, now=160)
-    assert b.try_claim("B", 123, 50, ttl=60, now=160)
-    b.mark_saved(123, 50, "video", Path("completed.mp4"))
-    b.attribute_saved(123, 50, "B")
+    token_b = b.try_claim("B", 123, 50, ttl=60, now=160)
+    assert token_b
+    assert b.mark_claim_saved("B", 123, 50, "video", Path("completed.mp4"), token=token_b, now=161)
     assert a.pending_count() == 0
     assert not a.try_claim("A", 123, 50, ttl=60, now=500)
     assert b.active_claims() == []
@@ -136,3 +142,183 @@ def test_account_monitor_media_type_selection_excludes_other_types(tmp_path):
     )] == [1, 4]
     assert hist.pending_for_peer(123, account_id="B", kinds=set()) == []
     hist.close()
+
+
+@pytest.mark.parametrize("replacement_account", ["A", "B"])
+def test_stale_attempt_cannot_publish_renew_release_or_penalize_replacement(tmp_path, replacement_account):
+    path = tmp_path / "history.sqlite3"
+    old = DownloadHistory(path)
+    new = DownloadHistory(path)
+    old.enqueue_media([PendingMedia(17, 8, "@chat", "chat", "photo", "8")])
+    first = old.try_claim("A", 17, 8, ttl=10, now=100)
+    assert first
+    assert not old.owns_claim("A", 17, 8, token=first, now=110)
+    assert not old.renew_claim("A", 17, 8, token=first, now=110)
+    other = new.try_claim(replacement_account, 17, 8, ttl=10, now=110)
+    assert other and first != other
+    publications = []
+
+    def stale_publish():
+        publications.append("STALE")
+        return Path("stale.jpg"), True
+
+    assert not old.renew_claim("A", 17, 8, token=first, now=111)
+    assert not old.release_claim("A", 17, 8, token=first, cooldown=600, now=111)
+    assert old.publish_claimed_media(17, 8, "A", first, "photo", stale_publish, now=111) is None
+    assert publications == []
+    assert old.pending_count() == 1
+    assert not old.contains(17, 8)
+    assert new.active_claims() == [(17, 8, replacement_account, 120.0)]
+    assert new.owns_claim(replacement_account, 17, 8, token=other, now=111)
+
+    assert new.release_claim(replacement_account, 17, 8, token=other, now=112)
+    fresh = old.try_claim("A", 17, 8, now=113)
+    assert fresh  # stale cooldown did not pollute even an attempt on A
+    assert old.mark_claim_saved("A", 17, 8, "photo", Path("winner.jpg"), token=fresh, now=114)
+    assert new.pending_count() == 0
+    assert new.active_claims() == []
+    assert new._connection.execute(
+        "SELECT original_path,account_id FROM downloaded_media"
+    ).fetchone() == ("winner.jpg", "A")
+    old.close()
+    new.close()
+
+
+def test_manual_paths_never_mutate_a_live_monitor_task(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    manual = DownloadHistory(path)
+    monitor = DownloadHistory(path)
+    manual.mark_failure(17, 8, now=99)
+    item = PendingMedia(17, 8, "@channel", "channel", "photo", "8")
+    manual.enqueue_media([item])
+    prior = monitor.try_claim("other", 17, 8, now=100)
+    assert prior
+    assert monitor.release_claim("other", 17, 8, token=prior, cooldown=30, now=101)
+    live = monitor.try_claim("active", 17, 8, ttl=10, now=102)
+    assert live
+    assert not manual.mark_saved(17, 8, "photo", Path("manual.jpg"), now=103)
+    manual.clear_failure(17, 8, now=103)
+    manual.remove_pending(17, 8, now=103)
+    manual.mark_failure(17, 8, now=104)
+    assert not manual.contains(17, 8)
+    assert manual.pending_count() == 1
+    assert manual.failures(17) == [8]
+    assert manual._connection.execute(
+        "SELECT account_id,retry_after FROM account_attempt_backoff"
+    ).fetchall() == [("other", 131.0)]
+    assert monitor.owns_claim("active", 17, 8, token=live, now=104)
+
+    chosen = Path("actual-name.jpg")
+    assert monitor.publish_claimed_media(
+        17, 8, "active", live, "photo", lambda: (chosen, True), now=105,
+    ) == (chosen, True)
+    assert manual.pending_count() == 0
+    assert not manual.failures(17)
+    assert manual.active_claims() == []
+    assert manual._connection.execute(
+        "SELECT original_path,account_id FROM downloaded_media"
+    ).fetchone() == (str(chosen), "active")
+
+    manual.enqueue_media([PendingMedia(17, 9, "@channel", "channel", "photo", "9")])
+    expiring = monitor.try_claim("active", 17, 9, ttl=5, now=110)
+    assert expiring
+    assert manual.mark_saved(17, 9, "photo", Path("manual.jpg"), now=115)
+    assert not monitor.mark_claim_saved(
+        "active", 17, 9, "photo", Path("late.jpg"), token=expiring, now=115,
+    )
+    assert manual._connection.execute(
+        "SELECT original_path,account_id FROM downloaded_media WHERE message_id=9"
+    ).fetchone() == ("manual.jpg", None)
+    manual.close()
+    monitor.close()
+
+
+def test_publication_failure_leaves_queue_and_lease_intact(tmp_path):
+    history = DownloadHistory(tmp_path / "history.sqlite3")
+    history.enqueue_media([PendingMedia(17, 8, "@channel", "channel", "photo", "8")])
+    live = history.try_claim("A", 17, 8, ttl=10, now=100)
+    assert live
+
+    def denied_publish():
+        raise OSError("cannot publish test file")
+
+    with pytest.raises(OSError, match="cannot publish test file"):
+        history.publish_claimed_media(17, 8, "A", live, "photo", denied_publish, now=102)
+    assert history.publish_claimed_media(17, 8, "A", live, "photo", lambda: None, now=103) is None
+    assert history.owns_claim("A", 17, 8, token=live, now=104)
+    assert history.pending_count() == 1
+    assert not history.contains(17, 8)
+    history.close()
+
+
+def test_fence_uses_time_after_waiting_for_competing_sqlite_writer(tmp_path, monkeypatch):
+    path = tmp_path / "history.sqlite3"
+    locker = DownloadHistory(path)
+    finisher = DownloadHistory(path)
+    locker.enqueue_media([PendingMedia(17, 8, "@channel", "channel", "photo", "8")])
+    token = locker.try_claim("A", 17, 8, ttl=10, now=100)
+    assert token
+    fake_clock = SimpleNamespace(now=108)
+    monkeypatch.setattr("tgdl.history.time", SimpleNamespace(time=lambda: fake_clock.now))
+    began = threading.Event()
+
+    def trace(sql):
+        if sql == "BEGIN IMMEDIATE":
+            began.set()
+
+    finisher._connection.set_trace_callback(trace)
+    published = []
+    locker._connection.execute("BEGIN IMMEDIATE")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            finish = pool.submit(
+                finisher.publish_claimed_media, 17, 8, "A", token, "photo",
+                lambda: (published.append("posted") or Path("late.jpg"), True),
+            )
+            assert began.wait(5)
+            fake_clock.now = 110
+        finally:
+            locker._connection.commit()
+        assert finish.result(timeout=5) is None
+    assert published == []
+    assert locker.try_claim("B", 17, 8)
+    locker.close()
+    finisher.close()
+
+
+def test_legacy_migration_preserves_existing_tokenless_lease_and_serializes_startup(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    connection = sqlite3.connect(path)
+    with connection:
+        connection.executescript("""
+            CREATE TABLE download_claims (
+                peer_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                account_id TEXT NOT NULL, expires_at REAL NOT NULL,
+                PRIMARY KEY(peer_id, message_id)
+            );
+            INSERT INTO download_claims VALUES (17, 8, 'legacy-account', 110);
+            CREATE TABLE downloaded_media (
+                peer_id INTEGER NOT NULL, message_id INTEGER NOT NULL,
+                kind TEXT NOT NULL, original_path TEXT NOT NULL, saved_at TEXT NOT NULL,
+                PRIMARY KEY(peer_id, message_id)
+            );
+            INSERT INTO downloaded_media VALUES (17, 3, 'photo', 'old.jpg', 'time');
+        """)
+    connection.close()
+    start = threading.Barrier(2)
+
+    def load():
+        start.wait(timeout=5)
+        return DownloadHistory(path)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = pool.submit(load), pool.submit(load)
+        one, two = first.result(timeout=10), second.result(timeout=10)
+    assert one.contains(17, 3)
+    one.enqueue_media([PendingMedia(17, 8, "@channel", "channel", "photo", "8")])
+    assert one.active_claims() == [(17, 8, "legacy-account", 110.0)]
+    assert not one.try_claim("new-account", 17, 8, now=109)
+    assert not one.mark_saved(17, 8, "photo", Path("manual.jpg"), now=109)
+    assert two.try_claim("new-account", 17, 8, now=110)
+    one.close()
+    two.close()
