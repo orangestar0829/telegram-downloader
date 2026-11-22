@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import re
+import stat
 import tempfile
 import time
 import threading
 from collections.abc import AsyncIterable
 from collections.abc import Callable
 from datetime import datetime, timezone
+from glob import escape as glob_escape
 from pathlib import Path
 
 from telethon import TelegramClient, utils
@@ -24,6 +27,7 @@ from telethon.tl.types import (
     Chat,
     ChatEmpty,
     ChatForbidden,
+    Document,
     DocumentAttributeFilename,
     Message,
     MessageMediaDocument,
@@ -31,8 +35,14 @@ from telethon.tl.types import (
     MessageMediaWebPage,
     PeerChat,
     PeerUser,
+    Photo,
+    PhotoCachedSize,
+    PhotoSize,
+    PhotoSizeProgressive,
+    PhotoStrippedSize,
     User,
     UserEmpty,
+    VideoSize,
 )
 from tqdm import tqdm
 
@@ -139,6 +149,102 @@ def download_target(message: Message):
         if document is not None:
             return document
     return message
+
+
+def _media_variant(target: object) -> tuple[int | None, str | None]:
+    """Return exact expected bytes and suffix for the payload Telethon will request."""
+    media = getattr(target, "media", target)
+    document = media if isinstance(media, Document) else getattr(media, "document", None)
+    if document is not None:
+        size = getattr(document, "size", None)
+        return (size if isinstance(size, int) and size > 0 else None, document_suffix(document))
+
+    photo = media if isinstance(media, Photo) else getattr(media, "photo", None)
+    if not isinstance(photo, Photo):
+        return None, None
+    # Use the same selector as Telethon's download_media(thumb=None). An
+    # attached VideoSize takes precedence over any JPEG and is served as MP4.
+    try:
+        selected = TelegramClient._get_thumb(photo.sizes + (photo.video_sizes or []), None)
+        if isinstance(selected, VideoSize):
+            return (selected.size if selected.size > 0 else None, ".mp4")
+        if isinstance(selected, PhotoSizeProgressive):
+            size = max(selected.sizes)
+        elif isinstance(selected, PhotoCachedSize):
+            size = len(selected.bytes)
+        elif isinstance(selected, PhotoStrippedSize):
+            size = len(utils.stripped_photo_to_jpg(selected.bytes))
+        elif isinstance(selected, PhotoSize):
+            size = selected.size
+        else:
+            return None, None
+        return (size if size > 0 else None, ".jpg")
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None, None
+
+
+def _regular_media_size(path: Path) -> int | None:
+    """Never read linked/reparse-point files as proof of a completed transfer."""
+    try:
+        entry = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    if not stat.S_ISREG(entry.st_mode):
+        return None
+    if getattr(entry, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        return None
+    return entry.st_size
+
+
+def _existing_media(dest_dir: Path, base: str, suffix: str, size: int) -> Path | None:
+    # Include numbered files previously published when the original name was
+    # occupied, but not other extensions or files only sharing a prefix.
+    exact = dest_dir / f"{base}{suffix}"
+    if _regular_media_size(exact) == size:
+        return exact
+    pattern = re.compile(rf"{re.escape(base)}(?:_[1-9][0-9]{{0,3}})?{re.escape(suffix)}",
+                         re.IGNORECASE)
+    return next((path for path in dest_dir.glob(f"{glob_escape(base)}*")
+                 if pattern.fullmatch(path.name) and _regular_media_size(path) == size), None)
+
+
+_NO_HARDLINK = {getattr(errno, name, errno.ENOSYS)
+                for name in ("EXDEV", "EPERM", "ENOSYS", "ENOTSUP", "EOPNOTSUPP")}
+
+
+def _publish_noclobber(source: Path, destination: Path) -> None:
+    """Publish a complete adjacent file without replacing occupied paths."""
+    try:
+        os.link(source, destination)
+    except FileExistsError:
+        raise
+    except (NotImplementedError, OSError) as exc:
+        if (isinstance(exc, OSError) and exc.errno not in _NO_HARDLINK
+                and getattr(exc, "winerror", None) not in {1, 50, 1314}):
+            raise
+        if os.name != "nt":
+            raise OSError("This destination does not support safe media publication "
+                          "without overwriting existing files") from exc
+        # Windows rename refuses to replace an existing destination.
+        source.rename(destination)
+
+
+def _publish_media(source: Path, dest_dir: Path, base: str, suffix: str, *,
+                   verified_size: int | None) -> tuple[Path, bool]:
+    for number in range(10_000):
+        stem = f"{base}_{number}" if number else base
+        candidate = dest_dir / f"{stem}{suffix}"
+        if verified_size is not None and _regular_media_size(candidate) == verified_size:
+            return candidate, False
+        if os.path.lexists(candidate):
+            continue
+        try:
+            _publish_noclobber(source, candidate)
+        except FileExistsError:
+            # Another process just occupied it; do not overwrite its output.
+            continue
+        return candidate, True
+    raise OSError(f"Cannot find a free media filename in {dest_dir} for {base}")
 
 
 def media_origin(message: Message) -> str:
@@ -635,12 +741,14 @@ async def _download_one(
     on_progress: ProgressCallback | None = None,
     monitor_flow: MonitorFlow | None = None,
 ) -> Path | None:
-    if skip_existing:
-        if history is not None and peer_id is not None and history.contains(peer_id, message.id):
+    if skip_existing and history is not None and peer_id is not None:
+        if history.contains(peer_id, message.id):
             stats.skipped += 1
             return None
-        existing = next((p for p in dest_dir.glob(f"{base}.*")
-                         if p.is_file() and not p.is_symlink()), None)
+    target = download_target(message)
+    expected_size, expected_suffix = _media_variant(target)
+    if skip_existing and expected_size is not None and expected_suffix is not None:
+        existing = _existing_media(dest_dir, base, expected_suffix, expected_size)
         if existing is not None:
             if history is not None and peer_id is not None:
                 history.mark_saved(peer_id, message.id, dest_dir.name, existing)
@@ -655,7 +763,6 @@ async def _download_one(
     mode = "普通下载"
     chunk_timings: dict[str, float] = {}
     publish_seconds = 0.0
-    target = download_target(message)
     document = chunkable_document(
         target, max(2, chunk_concurrency) if monitor_flow is not None else chunk_concurrency
     )
@@ -666,14 +773,13 @@ async def _download_one(
         on_progress,
     )
     transfer.emit("等待缓存" if use_chunks and temp_download_dir is not None else "准备下载",
-                  total=int(document.size) if document is not None else None, force=True)
+                  total=expected_size, force=True)
     temp_parent = dest_dir
     if use_chunks and temp_download_dir is not None:
         candidate = Path(temp_download_dir).expanduser()
         candidate.mkdir(parents=True, exist_ok=True)
         temp_parent = candidate
-    # Telethon writes using the original filename. Per-task directories avoid
-    # collisions and allow failed/cancelled partial files to be cleaned up.
+    # Per-task directories keep failed/cancelled partial files isolated.
     async with optional_staging_reservation(
         temp_parent if use_chunks and temp_download_dir is not None else None,
         int(document.size) if use_chunks else 0,
@@ -759,22 +865,27 @@ async def _download_one(
                         else:
                             mode = f"分块{chunk_concurrency}路"
                     else:
-                        saved = await monitored_direct_download(str(temporary))
+                        file = Path(temporary)
+                        if expected_suffix is not None:
+                            file /= "normal" + expected_suffix
+                        saved = await monitored_direct_download(str(file))
                 media_elapsed = max(time.monotonic() - media_started, 0.001)
                 if not saved:
                     stats.failed += 1
                     transfer.emit("失败", force=True)
                     return None
                 saved_path = Path(saved)
+                size = _regular_media_size(saved_path)
+                # When the variant has no exact size metadata, use the actual
+                # direct transfer's authoritative callback total if available.
+                transfer_size = expected_size if expected_size is not None else transfer.total or None
+                if size is None or size <= 0:
+                    raise IOError("Telegram download did not produce a non-empty regular file")
+                if transfer_size is not None and size != transfer_size:
+                    raise IOError(f"Telegram media size mismatch: {size} != {transfer_size}")
                 suffix = saved_path.suffix or ".bin"
-                final_path = dest_dir / f"{base}{suffix}"
-                if skip_existing and final_path.is_file() and not final_path.is_symlink():
-                    if history is not None and peer_id is not None:
-                        history.mark_saved(peer_id, message.id, dest_dir.name, final_path)
-                    stats.skipped += 1
-                    return None
-                if final_path.exists():
-                    final_path = unique_path(final_path)
+                verified_size = (expected_size if skip_existing and expected_suffix
+                                 and suffix.lower() == expected_suffix.lower() else None)
                 publish_started = time.monotonic()
                 transfer.emit("正在保存", force=True)
                 # Moving within a volume is a rename, not a full media copy.
@@ -794,14 +905,22 @@ async def _download_one(
                                             break
                                         sink.write(data)
                                         await asyncio.sleep(0)
-                                if partial.stat().st_size != saved_path.stat().st_size:
+                                if _regular_media_size(partial) != size:
                                     raise IOError("Staged media copy size mismatch")
-                                partial.replace(final_path)
+                                final_path, published = _publish_media(
+                                    partial, dest_dir, base, suffix, verified_size=verified_size,
+                                )
                 else:
-                    saved_path.replace(final_path)
+                    final_path, published = _publish_media(
+                        saved_path, dest_dir, base, suffix, verified_size=verified_size,
+                    )
                 publish_seconds = time.monotonic() - publish_started
                 if history is not None and peer_id is not None:
                     history.mark_saved(peer_id, message.id, dest_dir.name, final_path)
+                if not published:
+                    stats.skipped += 1
+                    transfer.emit("已跳过", force=True)
+                    return None
     stats.saved += 1
     transfer.emit("完成", force=True)
     elapsed = max(time.monotonic() - started, 0.001)
