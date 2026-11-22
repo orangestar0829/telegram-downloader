@@ -1,4 +1,4 @@
-"""Per-account configuration locations, preserving the original account's paths."""
+"""Per-account configuration locations with backwards-compatible migration."""
 from __future__ import annotations
 
 import json
@@ -20,10 +20,10 @@ class Account:
 
 
 class AccountRegistry:
-    """The legacy root .env/session/monitor files *are* the default account.
+    """All account config/session/monitor files live in accounts/<id>/.
 
-    All accounts keep separate session files under accounts/<id>/. The original
-    account keeps its legacy .env/monitor settings; all share download history.
+    Root-level legacy files remain only as downgrade backups. The shared
+    download-history SQLite database stays at the data root.
     """
 
     def __init__(self, root: Path | None = None) -> None:
@@ -107,7 +107,8 @@ class AccountRegistry:
         return self.root / "accounts" / account_id
 
     def env_path(self, account_id: str) -> Path:
-        return self.account_dir(account_id) / ".env"
+        self.validate(account_id)
+        return self.root / "accounts" / account_id / ".env"
 
     def session_path(self, account_id: str) -> Path:
         self.validate(account_id)

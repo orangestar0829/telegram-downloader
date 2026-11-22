@@ -59,12 +59,13 @@ The GUI's automatic migration already checks this safely.
 ## New files
 
 - `data/accounts.json`: account IDs and display names, not passwords
+- `data/accounts/default/.env`: original account's API/phone/proxy/download settings. Automatically copied from legacy `data/.env` on the first start using a temporary file and atomic replace; the original file is left intact for rollback. Existing new file always takes precedence.
 - `data/accounts/default/tgdl_session.session`: original account's session,
   automatically copied from the legacy `data/tgdl_session.session` by a
   SQLite backup and verified before first use (old file is **not deleted**).
 - `data/accounts/default/monitored_channels.json`: original account's monitor configuration. On first startup the old `data/monitored_channels.json` is copied through a temporary JSON-validated file and atomically published. Existing new configs are never overwritten; the old file remains intact for rollback.
 - `data/accounts/<id>/tgdl_session.session`: each added account's private session.
-- `data/accounts/<id>/.env`: each additional account's private settings.
+- `data/accounts/<id>/.env`: each account's private settings. Settings and credentials are loaded independently, never from another account or global process environment.
 - `data/accounts/<id>/monitored_channels.json`: independent channel monitors.
 - `data/logs/runtime-YYYY-MM-DD.log`: rotating diagnostic logs (seven days).
 
@@ -73,7 +74,7 @@ up the whole `data/` folder first. At startup, if the new default Session
 file already exists it will NOT be overwritten, even if the legacy file is
 newer. A temporary SQLite backup incorporates WAL state; the legacy file
 remains available for rollback. The original account keeps its existing
-`data/.env` and global `data/tgdl_download_history.sqlite3` (the history is not moved). The active original-account monitor configuration is now `data/accounts/default/monitored_channels.json` (root-level copy is legacy backup only).
+global `data/tgdl_download_history.sqlite3` (the history is not moved). The active original account's `.env` and monitor configuration are now both in `data/accounts/default/`; their root-level copies are legacy backups only.
 
 All diagnostic and download-event logs now show the actual Telegram profile
 name after login (e.g. `[账号:Alice (@alice)]`); the stable account ID

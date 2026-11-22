@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 from tgdl.paths import prepare_data_dir
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = prepare_data_dir()
 SESSION_PATH = DATA_DIR / "accounts" / "default" / "tgdl_session"
-ENV_PATH = DATA_DIR / ".env"
+ENV_PATH = DATA_DIR / "accounts" / "default" / ".env"
 
 _ENV_KEYS = {
     "TELEGRAM_API_ID": "api_id",
@@ -71,11 +70,20 @@ def _bundled_defaults() -> tuple[str, str] | None:
     return None
 
 
+def _file_env(path: Path) -> dict[str, str]:
+    """Read a private account .env without altering global process state."""
+    if not path.exists():
+        return {}
+    return {key: value or "" for key, value in dotenv_values(path).items()
+            if key is not None}
+
+
 def resolve_api_credentials(env: dict[str, str] | None = None) -> tuple[str, str] | None:
-    """Return (api_id, api_hash) from env/.env, else bundled defaults, else None."""
+    """Use this account file for credentials, otherwise packaged defaults."""
     if env is None:
-        load_dotenv(ENV_PATH, override=True)
-        source = os.environ
+        # Each account is isolated: never inject .env into global os.environ.
+        # The default account's authoritative config is accounts/default/.env.
+        source = _file_env(ENV_PATH)
     else:
         source = env
     api_id = (source.get("TELEGRAM_API_ID", "") or "").strip()
@@ -159,20 +167,12 @@ def update_env(values: dict[str, str], path: Path | None = None) -> Path:
 
 
 def load_settings(*, env_path: Path | None = None, session_path: Path | None = None) -> Settings:
-    if env_path is None:
-        creds = resolve_api_credentials()  # legacy .env, process env and bundled defaults
-        raw = os.environ.get
-    else:
-        # No process-wide dotenv mutation for another concurrently running account.
-        file_values: dict[str, str] = {}
-        source = Path(env_path)
-        if source.exists():
-            for line in source.read_text(encoding="utf-8").splitlines():
-                key, sep, value = line.partition("=")
-                if sep and not key.strip().startswith("#"):
-                    file_values[key.strip()] = value.strip()
-        creds = resolve_api_credentials(file_values) or resolve_api_credentials()
-        raw = file_values.get
+    settings_path = Path(env_path) if env_path is not None else ENV_PATH
+    file_values = _file_env(settings_path)
+    # Missing account credentials may use the optional bundled API keys, but
+    # never those from another account or a stale legacy root .env.
+    creds = resolve_api_credentials(file_values)
+    raw = file_values.get
     phone = raw("TELEGRAM_PHONE", "").strip() or None
     dd_raw = raw("DOWNLOAD_DIR", "").strip()
     download_dir = Path(dd_raw).expanduser() if dd_raw else default_download_dir()
@@ -223,7 +223,7 @@ def load_settings(*, env_path: Path | None = None, session_path: Path | None = N
             raw("MEDIA_SPEED_KIB", "0"), "MEDIA_SPEED_KIB", 0, 1048576
         ),
         temp_download_dir=staging_dir,
-        session_path=session_path,
+        session_path=session_path if session_path is not None else SESSION_PATH,
     )
 
 

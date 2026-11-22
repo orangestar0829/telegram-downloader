@@ -66,6 +66,30 @@ def migrate_default_session(directory: Path) -> Path:
     return target
 
 
+def migrate_default_env(directory: Path) -> Path:
+    """Copy the legacy .env into accounts/default once, retaining rollback copy.
+
+    The copy is never overwritten on subsequent launches. Use a temporary
+    sibling and atomic replace to prevent partially written live settings.
+    """
+    legacy = directory / ".env"
+    target = directory / "accounts" / "default" / ".env"
+    if target.exists() or not legacy.is_file():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(".env.migrating")
+    try:
+        shutil.copy2(legacy, temporary)
+        # Reject undecodable or unreadable input rather than publishing a
+        # malformed configuration; empty .env files remain valid.
+        temporary.read_text(encoding="utf-8")
+        temporary.replace(target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
 def migrate_default_monitors(directory: Path) -> Path:
     """Copy the original account's monitor JSON into accounts/default once.
 
@@ -109,4 +133,5 @@ def prepare_data_dir() -> Path:
                 break
     migrate_default_session(destination)
     migrate_default_monitors(destination)
+    migrate_default_env(destination)
     return destination

@@ -21,7 +21,8 @@ B 账号如果无法收到登录验证码，可以使用 **扫码登录**：在�
 GUI 的运行日志/下载记录支持账号筛选，避免一直累积日志导致内存上涨。
 全部 Telegram Session 都位于 `data/accounts/<id>/`；原账号自动复制至
 `data/accounts/default/tgdl_session.session`，原文件不删除、可回滚。
-原账号的 `.env` 与全局下载历史保持原位置；原有监控配置自动复制到 `data/accounts/default/monitored_channels.json`，旧根目录配置保留作为回滚备份。
+所有账号的 `.env` 也统一保存在 `data/accounts/<id>/.env`：每个账号独立保存手机号、代理、并发和限速；原账号启动时复制旧 `data/.env`，新的 `.env` 一旦存在就不会再被旧文件覆盖。
+原账号的 `.env` 和监控配置均自动复制到 `data/accounts/default/`，旧根目录文件保留作为回滚备份；全局下载历史仍位于 `data/tgdl_download_history.sqlite3`。
 日志显示实际 Telegram 显示名（有用户名时带 `@username`），内部账号 ID 仅用于记录关联。
 **注意：旧版手动批量下载尚未接入跨账号租约，不要与其他账号的定时监控
 同时操作相同频道。** 这是预览版的已知限制。

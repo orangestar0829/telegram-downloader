@@ -30,10 +30,12 @@ def test_portable_uses_executable_sibling_data_and_imports_legacy(tmp_path, monk
     with sqlite3.connect(data / "accounts" / "default" / "tgdl_session.session") as conn:
         assert conn.execute("SELECT auth_key FROM sessions").fetchone() == ("session",)
     assert (data / ".env").read_text(encoding="utf-8") == "TELEGRAM_API_ID=1\n"
+    assert (data / "accounts" / "default" / ".env").read_text(encoding="utf-8") == "TELEGRAM_API_ID=1\n"
     assert (data / "tgdl_download_history.sqlite3").read_bytes() == b"old-db"
     (data / ".env").write_text("new", encoding="utf-8")
     paths.prepare_data_dir()
     assert (data / ".env").read_text(encoding="utf-8") == "new"
+    assert (data / "accounts" / "default" / ".env").read_text(encoding="utf-8") == "TELEGRAM_API_ID=1\n"
     # Repeated boot never overwrites the newly authorized default account.
     with sqlite3.connect(data / "accounts" / "default" / "tgdl_session.session") as conn:
         conn.execute("UPDATE sessions SET auth_key='new-token'")
@@ -54,5 +56,6 @@ def test_installer_uses_writable_user_data(tmp_path, monkeypatch):
     monkeypatch.setattr(paths, "user_data_dir", lambda: user)
     assert not paths.is_portable()
     assert paths.prepare_data_dir() == user
+    assert (user / "accounts" / "default" / "tgdl_session.session").is_file()
     with sqlite3.connect(user / "accounts" / "default" / "tgdl_session.session") as conn:
         assert conn.execute("SELECT auth_key FROM sessions").fetchone() == ("legacy",)
