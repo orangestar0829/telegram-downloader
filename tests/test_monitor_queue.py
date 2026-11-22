@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from telethon.tl.types import Channel, Chat, ChatPhotoEmpty
 
 from tgdl import downloader
 from tgdl.history import DownloadHistory, PendingMedia
@@ -133,3 +134,70 @@ def test_cancelled_slice_does_not_advance_checkpoint(monitor_env, monkeypatch):
     assert hist.scan_state(123)[2] == 0
     assert result.more_pending
     hist.close()
+
+
+
+def test_basic_group_is_scanned_only_by_original_account(monitor_env, monkeypatch):
+    async def basic_group(_client, _target):
+        return Chat(123, "Basic group", ChatPhotoEmpty(), 2, None, 1)
+
+    monkeypatch.setattr(downloader, "resolve_channel", basic_group)
+    client = FakeTelegram([1, 2, 3])
+    with pytest.raises(downloader.UnsupportedSharedMonitorPeer, match="普通群"):
+        asyncio.run(downloader.scan_monitor_slice(
+            client, target="-123", types={"photo"}, account_id="secondary"
+        ))
+    assert not client.calls
+    history = DownloadHistory(monitor_env)
+    assert history.pending_count() == 0
+    history.close()
+
+    asyncio.run(downloader.scan_monitor_slice(client, target="-123", types={"photo"}))
+    history = DownloadHistory(monitor_env)
+    assert history.pending_count() == 3
+    assert [job.peer_id for job in history.pending_for_target("-123")] == [-123] * 3
+    assert history.scan_state(-123)[0] == 3
+    assert history.scan_state(123)[0] == 0
+    history.close()
+
+
+def test_basic_group_does_not_share_history_keys_with_channel(monitor_env, monkeypatch):
+    async def resolve(_client, target):
+        if target == "-123":
+            return Chat(123, "Basic group", ChatPhotoEmpty(), 2, None, 1)
+        return Channel(123, "Supergroup", ChatPhotoEmpty(), None, megagroup=True)
+
+    monkeypatch.setattr(downloader, "resolve_channel", resolve)
+    client = FakeTelegram([1])
+    async def scenario():
+        await downloader.scan_monitor_slice(client, target="-123", types={"photo"})
+        await downloader.scan_monitor_slice(
+            client, target="-100123", types={"photo"}, account_id="secondary"
+        )
+    asyncio.run(scenario())
+    history = DownloadHistory(monitor_env)
+    history.mark_saved(-123, 1, "photo", Path("old-basic-group.jpg"))
+    assert history.contains(-123, 1)
+    assert not history.contains(123, 1)
+    assert [job.message_id for job in history.pending_for_peer(123, account_id="secondary")] == [1]
+    assert history.try_claim("secondary", 123, 1)
+    history.close()
+
+
+def test_unambiguous_legacy_basic_group_pending_row_cannot_be_claimed(monitor_env):
+    history = DownloadHistory(monitor_env)
+    history.enqueue_media([PendingMedia(123, 1, "-123", "Basic group", "photo", "old")])
+    assert history.pending_count() == 1  # retain old preview data
+    assert not history.pending_for_peer(123, account_id="secondary")
+    assert not history.pending_for_target("-123", account_id="default")
+    assert not history.try_claim("secondary", 123, 1)
+
+    actual_channel_job = PendingMedia(123, 1, "-100123", "Supergroup", "photo", "new")
+    assert history.enqueue_media([actual_channel_job]) == 1
+    assert history.pending_for_peer(123, account_id="secondary") == [actual_channel_job]
+    assert history.try_claim("secondary", 123, 1)
+    saved_legacy = history._connection.execute(
+        "SELECT target,base FROM legacy_basic_pending_media WHERE peer_id=123 AND message_id=1"
+    ).fetchone()
+    assert saved_legacy == ("-123", "old")
+    history.close()

@@ -6,8 +6,8 @@ currently-authorized Telegram mobile app -> Settings -> Devices -> Link Device.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Callable
 
 from telethon.errors import SessionPasswordNeededError
 
@@ -16,7 +16,7 @@ async def login_with_qr(
     client,
     *,
     show_qr: Callable[[str, datetime], None],
-    ask_password: Callable[[], str],
+    ask_password: Callable[[], Awaitable[str]],
     should_stop: Callable[[], bool] = lambda: False,
     max_refreshes: int = 20,
 ) -> None:
@@ -54,7 +54,7 @@ async def login_with_qr(
                 return
             except SessionPasswordNeededError:
                 # QR was approved, but the account has two-step verification.
-                await client.sign_in(password=ask_password())
+                await client.sign_in(password=await ask_password())
                 return
             except asyncio.TimeoutError:
                 if refresh < max_refreshes - 1:

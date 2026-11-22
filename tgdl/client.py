@@ -4,8 +4,10 @@ from telethon import TelegramClient
 from telethon.errors import FloodPremiumWaitError, FloodWaitError
 from telethon import errors
 from telethon.tl.functions.upload import GetFileRequest
+from telethon.utils import parse_phone
 
 from tgdl.config import SESSION_PATH, Settings
+from tgdl.errors import TGDLInputError
 
 
 class DiagnosticTelegramClient(TelegramClient):
@@ -98,11 +100,22 @@ def build_client(settings: Settings) -> TelegramClient:
     )
 
 
+def validate_login_phone(raw: str) -> str:
+    """Validate before Telethon retries an invalid callable phone forever."""
+    digits = parse_phone(raw)
+    if not digits or not digits.isascii() or not digits.isdigit():
+        raise TGDLInputError("手机号格式无效，请使用带国际区号的号码，例如 +8613800138000。")
+    return "+" + digits
+
+
 async def ensure_login(client: TelegramClient, phone: str | None) -> None:
-    await client.start(phone=phone)
+    if phone:
+        await client.start(phone=validate_login_phone(phone))
+    else:
+        await client.start()  # Keep Telethon's interactive default phone prompt.
     me = await client.get_me()
     if me is None:
-        raise SystemExit("Login failed.")
+        raise TGDLInputError("Login failed.")
     name = " ".join(part for part in (me.first_name, me.last_name) if part)
     username = f"@{me.username}" if me.username else ""
     print(f"Logged in as {name} {username} (id={me.id})".strip())

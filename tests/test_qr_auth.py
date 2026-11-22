@@ -9,6 +9,10 @@ from telethon.errors import SessionPasswordNeededError
 from tgdl.qr_auth import login_with_qr, qr_image
 
 
+async def unused_password():
+    raise AssertionError("unexpected password prompt")
+
+
 class FakeQR:
     def __init__(self, modes):
         self.modes = iter(modes)
@@ -61,7 +65,7 @@ def test_qr_approval_does_not_send_phone_code():
     displayed = []
     asyncio.run(login_with_qr(
         fake, show_qr=lambda url, expires: displayed.append(url),
-        ask_password=lambda: "unused",
+        ask_password=unused_password,
     ))
     assert fake.qr_requests == 1
     assert displayed == ["tg://login?token=PRIVATE"]
@@ -73,7 +77,7 @@ def test_qr_expiration_refreshes_in_place():
     displayed = []
     asyncio.run(login_with_qr(
         fake, show_qr=lambda url, expires: displayed.append(url),
-        ask_password=lambda: "unused",
+        ask_password=unused_password,
     ))
     assert fake.qr.recreated == 1
     assert displayed == ["tg://login?token=PRIVATE", "tg://login?token=NEW_PRIVATE"]
@@ -81,8 +85,12 @@ def test_qr_expiration_refreshes_in_place():
 
 def test_qr_2fa_requests_password_only_after_scan():
     fake = FakeClient(["2fa"])
+    async def ask_password():
+        await asyncio.sleep(0)
+        return "password_for_test"
+
     asyncio.run(login_with_qr(
-        fake, show_qr=lambda *_: None, ask_password=lambda: "password_for_test"
+        fake, show_qr=lambda *_: None, ask_password=ask_password
     ))
     assert fake.passwords == ["password_for_test"]
 
@@ -99,7 +107,7 @@ def test_qr_cancel_releases_wait_task():
         with pytest.raises(asyncio.CancelledError):
             await login_with_qr(
                 fake, show_qr=lambda *_: None,
-                ask_password=lambda: "",
+                ask_password=unused_password,
                 should_stop=lambda: state["stop"],
             )
 

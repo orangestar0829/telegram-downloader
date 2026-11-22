@@ -1,4 +1,6 @@
 from datetime import date, timedelta
+import os
+import stat
 
 from tgdl.log_store import DailyLogStore, redact
 
@@ -34,3 +36,39 @@ def test_log_store_removes_only_expired_daily_logs(tmp_path):
 def test_redact_does_not_hide_unrelated_values():
     assert "password=hunter2" not in redact("password=hunter2")
     assert "priority=10" in redact("priority=10")
+
+
+def test_log_store_masks_private_urls_and_multitoken_credentials(tmp_path):
+    store = DailyLogStore(tmp_path)
+    store.write("频道 t.me/+privateinvite\n")
+    store.write("直链 https://example.test/private/path?signature=secret\n")
+    store.write("tg://login?token=qrsecret\n")
+    store.write("SOCKS5_PASSWORD='words with spaces'\n")
+    store.close()
+    log, = tmp_path.glob("runtime-*.log")
+    saved = log.read_text(encoding="utf-8")
+    assert not any(secret in saved for secret in
+                   ("privateinvite", "/private/path", "signature", "qrsecret", "words with spaces"))
+    assert "[REDACTED LINK]" in saved
+    if os.name != "nt":
+        assert stat.S_IMODE(log.stat().st_mode) & 0o077 == 0
+
+
+def test_log_store_failure_stops_writes_and_close_does_not_require_space(tmp_path, monkeypatch):
+    class FullDisk:
+        def write(self, _):
+            raise OSError("disk full")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("tgdl.log_store.open", lambda *a, **kw: FullDisk(), raising=False)
+    store = DailyLogStore(tmp_path)
+    store.write("before failure")
+    assert store.failed.wait(timeout=2)
+    store._thread.join(timeout=2)
+    for _ in range(store.queue.maxsize):
+        store.queue.put_nowait("pending")
+    store.write("after failure")
+    store.close()
+    assert not store._thread.is_alive()

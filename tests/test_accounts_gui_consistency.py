@@ -94,3 +94,31 @@ def test_dialog_switch_reuses_cached_results_without_network_call():
     window._ensure_dialogs()
     window._ensure_dialogs()
     assert displayed == [True, True]
+
+
+def test_manager_login_save_keeps_proxy_saved_from_main_window(tmp_path):
+    from tgdl.accounts import AccountRegistry
+    from tgdl.accounts_gui import _ACCOUNT_FIELDS
+    from tgdl.config import read_env_values, update_env
+
+    registry = AccountRegistry(tmp_path)
+    path = registry.env_path("account-b")
+    update_env({"api_id": "1", "api_hash": "test", "download_dir": str(tmp_path)}, path)
+    original = read_env_values(path)
+    window = AccountWindow.__new__(AccountWindow)
+    window.registry = registry
+    window._selected_id = lambda: "account-b"
+    window._fields = {key: FakeVar(original[key]) for key, _ in _ACCOUNT_FIELDS}
+    window._loaded_fields = {key: var.get() for key, var in window._fields.items()}
+    window.app = SimpleNamespace(_log_account=lambda *_: None)
+
+    # The main window saved a proxy while this window remained open; the
+    # manager's Login button runs _save_settings before creating its client.
+    update_env({**original, "proxy_host": "new-proxy", "proxy_port": "1080"}, path)
+    window._fields["media_concurrency"].set("2")
+    assert window._save_settings()
+    saved = read_env_values(path)
+    assert (saved["proxy_host"], saved["proxy_port"], saved["media_concurrency"]) == (
+        "new-proxy", "1080", "2"
+    )
+    assert window._fields["proxy_host"].get() == "new-proxy"

@@ -6,12 +6,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from tgdl import downloader, gui
 from tgdl.history import DownloadHistory, PendingMedia
 
 
+@pytest.mark.parametrize("use_staging", [False, True])
 def test_paused_low_waits_until_higher_priority_transfer_completes(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, use_staging,
 ):
     db = tmp_path / "history.sqlite"
     monkeypatch.setattr(gui, "DownloadHistory", lambda: DownloadHistory(db))
@@ -29,7 +32,7 @@ def test_paused_low_waits_until_higher_priority_transfer_completes(
 
     app = object.__new__(gui._App)
     app.client = Client()
-    app.settings = SimpleNamespace(download_dir=tmp_path, temp_download_dir=tmp_path)
+    app.settings = SimpleNamespace(download_dir=tmp_path, temp_download_dir=tmp_path if use_staging else None)
     app._download_future = None
     app._monitor_download_stop = threading.Event()
     app._monitor_live_concurrency = 1
@@ -88,6 +91,17 @@ def test_paused_low_waits_until_higher_priority_transfer_completes(
             pending = DownloadHistory(db)
             pending.enqueue_media([PendingMedia(123, 2, "high", "high", "video", "2")])
             pending.close()
+            if use_staging:
+                # A low-priority staged file holds its SSD reservation until
+                # completion; the scheduler must not pause it for this job.
+                await asyncio.sleep(0.6)
+                assert not high_started.is_set()
+                assert (456, 1, "已暂停") not in events
+                release_low.set()
+                await asyncio.wait_for(high_started.wait(), 3)
+                release_high.set()
+                await asyncio.wait_for(high_done.wait(), 3)
+                return
             await asyncio.wait_for(high_started.wait(), 3)
             # Even if idle time has elapsed, a higher-ranked active file
             # prohibits lower-priority resumption until completion.
@@ -123,7 +137,7 @@ def test_resumed_job_precedes_new_job_at_same_priority(tmp_path, monkeypatch):
 
     app = object.__new__(gui._App)
     app.client = Client()
-    app.settings = SimpleNamespace(download_dir=tmp_path, temp_download_dir=tmp_path)
+    app.settings = SimpleNamespace(download_dir=tmp_path, temp_download_dir=None)
     app._download_future = None
     app._monitor_download_stop = threading.Event()
     app._monitor_live_concurrency = 1

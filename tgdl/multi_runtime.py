@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -18,12 +18,14 @@ from telethon.errors import FloodWaitError
 from tgdl.accounts import Account, AccountRegistry
 from tgdl.account_context import current_account_id
 from tgdl.account_identity import account_identity
-from tgdl.client import build_client
+from tgdl.client import build_client, validate_login_phone
 from tgdl.config import load_settings, read_env_values
 from tgdl.downloader import (
     DownloadStats, _download_with_retry, classify_message, resolve_channel,
-    safe_name, scan_monitor_slice,
+    history_peer_id, peer_download_folder, require_shared_monitor_peer, scan_monitor_slice,
+    UnsupportedSharedMonitorPeer,
 )
+from tgdl.errors import ChannelAccessError
 from tgdl.history import DownloadHistory, PendingMedia
 from tgdl.monitor import choose_monitor_download, load_channels, next_due_channel
 from tgdl.monitor_flow import MonitorFlow, MonitorPause, SharedSpeedLimiter
@@ -77,7 +79,7 @@ class AccountMonitorRuntime:
 
     def __init__(
         self, account: Account, registry: AccountRegistry, *,
-        ask: Callable[[str, bool], str],
+        ask: Callable[[str, bool], Awaitable[str]],
         on_log: Callable[[str, str], None],
         on_saved: Callable[[str, str], None],
         on_progress: Callable[[str, str, int, int, str], None],
@@ -101,12 +103,38 @@ class AccountMonitorRuntime:
         self._slice_cursor = 0
         self._blocked: set[str] = set()
         self.client = None
+        self._run_task: asyncio.Task | None = None
+        self._download_task: asyncio.Task | None = None
+        self._interrupt_requested = False
+        self._run_finishing = False
 
     def log(self, text: str) -> None:
         self.on_log(self.account.id, text)
 
-    def stop(self) -> None:
+    def stop(self, *, cancel: bool = False) -> None:
+        """Stop claiming work; optionally cancel transfers rather than draining."""
         self.stop_event.set()
+        task = self._run_task
+        if task is not None:
+            # Never cancel the cross-thread Future used to join this runtime:
+            # it reports cancelled immediately, before asyncio finishes cleanup.
+            task.get_loop().call_soon_threadsafe(self._interrupt_for_stop, cancel)
+
+    def _interrupt_for_stop(self, cancel: bool) -> None:
+        if self._interrupt_requested:
+            return
+        download = self._download_task
+        if download is None:
+            if self._run_finishing:
+                return             # Leave the in-flight disconnect alone.
+            target = self._run_task  # Interrupt login or an outstanding prompt.
+        elif cancel:
+            target = download
+        else:
+            return                  # Drain and renew any started files.
+        if target is not None and not target.done():
+            self._interrupt_requested = True
+            target.cancel()
 
     def _channel_resolved(self, target: str, title: str, peer_id: int) -> None:
         self.peer_by_target[target] = peer_id
@@ -145,6 +173,11 @@ class AccountMonitorRuntime:
                     )
                 except asyncio.CancelledError:
                     raise
+                except UnsupportedSharedMonitorPeer as exc:
+                    self.peer_by_target.pop(target, None)
+                    self._blocked.add(target)
+                    self.log(f"[监控已暂停] {item.get('name') or '该目标'}：{exc}")
+                    continue
                 except Exception as exc:
                     self.log(f"[扫描异常] {target}: {exc}; 60秒后重试")
                     self._next_at[target] = time.time() + 60
@@ -180,6 +213,14 @@ class AccountMonitorRuntime:
         target = item["target"]  # resolve using THIS account, not the scanner's alias
         try:
             entity = await resolve_channel(self.client, target)
+            require_shared_monitor_peer(entity)
+            if history_peer_id(entity) != peer:
+                # A username/invite may have been rebound since the scan.
+                if self.peer_by_target.get(target) == peer:
+                    self.peer_by_target.pop(target, None)
+                    self._next_at[target] = 0
+                self.log("[下载跳过] 监控目标已指向其他频道，重新扫描后再领取")
+                return
             message = await self.client.get_messages(entity, ids=mid)
             if message is None or getattr(message, "date", None) is None:
                 cooldown = 3600
@@ -192,8 +233,9 @@ class AccountMonitorRuntime:
                 cooldown = 3600
                 self.log(f"[下载跳过] {target} 消息 {mid} 不符合本账号监控类型")
                 return
-            folder = settings.download_dir / safe_name(
-                getattr(entity, "title", None) or job.title
+            folder = peer_download_folder(
+                settings.download_dir, getattr(entity, "title", None) or job.title, entity,
+                account_id=self.account.id,
             ) / ("photos" if kind == "photo" else "videos")
             stats = DownloadStats()
             flow = MonitorFlow(
@@ -224,12 +266,16 @@ class AccountMonitorRuntime:
                 cooldown = 300
         except asyncio.CancelledError:
             raise
+        except UnsupportedSharedMonitorPeer as exc:
+            self.peer_by_target.pop(target, None)
+            self._blocked.add(target)
+            self.log(f"[监控已暂停] {item.get('name') or '该目标'}：{exc}")
         except FloodWaitError as exc:
             cooldown = max(60, int(exc.seconds))
             self.log(f"[账号限流] {target} 消息 {mid}；等待{cooldown}秒")
         except Exception as exc:
             cooldown = 60
-            if type(exc).__name__ in (
+            if isinstance(exc, ChannelAccessError) or type(exc).__name__ in (
                 "ChannelPrivateError", "ChatAdminRequiredError",
                 "ChannelInvalidError", "UserBannedInChannelError",
             ):
@@ -325,30 +371,38 @@ class AccountMonitorRuntime:
                     except Exception as exc:
                         self.log(f"[下载调度异常] {type(exc).__name__}: {exc}")
                 await asyncio.sleep(0.25 if active else 0.8)
-        except asyncio.CancelledError:
-            for task, _target, _began in active.values():
-                task.cancel()
-            await asyncio.gather(
-                *(task for task, _, _ in active.values()), return_exceptions=True
-            )
-            raise
         finally:
-            for peer, mid in active:
-                history.release_claim(self.account.id, peer, mid)
-            self.active_count = 0
-            history.close()
+            # On cancellation or scheduler error, wait for each downloaded
+            # file to remove temporary data before releasing its claim.
+            for task, _target, _began in active.values():
+                if not task.done():
+                    task.cancel()
+            if active:
+                await asyncio.gather(
+                    *(task for task, _, _ in active.values()), return_exceptions=True
+                )
+            try:
+                for peer, mid in active:
+                    history.release_claim(self.account.id, peer, mid)
+            finally:
+                self.active_count = 0
+                history.close()
 
     async def run(self) -> None:
         """Login, run one independent scan loop and download loop; stop gracefully."""
         self.status = "正在登录"
-        settings = None
+        self._run_task = asyncio.current_task()
         token = current_account_id.set(self.account.id)
-        scan = download = None
+        scan = None
+        error_status = None
         try:
+            if self.stop_event.is_set():
+                return
             settings = load_settings(
                 env_path=self.registry.env_path(self.account.id),
                 session_path=self.registry.session_path(self.account.id),
             )
+            configured_phone = validate_login_phone(settings.phone) if settings.phone else None
             self.client = build_client(settings)
             if self.login_method == "qr":
                 if self.on_qr is None:
@@ -377,8 +431,11 @@ class AccountMonitorRuntime:
 
                 self.client.send_code_request = observed_send_code
                 try:
+                    async def ask_phone() -> str:
+                        return validate_login_phone(await self.ask("手机号（带国际区号）", False))
+
                     await self.client.start(
-                        phone=lambda: settings.phone or self.ask("手机号（带国际区号）", False),
+                        phone=configured_phone or ask_phone,
                         code_callback=lambda: self.ask(
                             f"Telegram 验证码（{delivery['label']}）", False
                         ),
@@ -389,43 +446,48 @@ class AccountMonitorRuntime:
             me = await self.client.get_me()
             if me is None:
                 raise RuntimeError("Telegram login failed")
-            if settings.phone and getattr(me, "phone", None):
-                from telethon.utils import parse_phone
-                if parse_phone(settings.phone) != parse_phone(me.phone):
+            if configured_phone and getattr(me, "phone", None):
+                if configured_phone != validate_login_phone(me.phone):
                     raise RuntimeError(
                         "此账号 Session 已登录其他号码；请检查 B 账号是否误用了别的 Session 文件"
                     )
             self.status = f"已连接：{account_identity.update(self.account.id, me)}"
             self.log(f"[账号连接] {self.status}")
             scan = asyncio.create_task(self._scan_loop())
-            download = asyncio.create_task(self._download_loop(settings))
+            self._download_task = asyncio.create_task(self._download_loop(settings))
             while not self.stop_event.is_set():
-                for task in (scan, download):
+                for task in (scan, self._download_task):
                     if task.done():
                         await task  # surface a fatal worker failure
                         self.stop_event.set()
                         break
                 await asyncio.sleep(0.25)
         except asyncio.CancelledError:
-            self.stop_event.set()
-            if download is not None and not download.done():
-                download.cancel()
+            # If run itself is externally cancelled, interrupt transfers too.
+            if self._download_task is not None:
+                self._interrupt_for_stop(cancel=True)
         except Exception as exc:
-            self.status = f"异常：{type(exc).__name__}"
-            self.log(f"[账号启动异常] {type(exc).__name__}: {exc}")
+            error_status = f"异常：{type(exc).__name__}"
+            self.log(f"[账号运行异常] {type(exc).__name__}: {exc}")
         finally:
+            self._run_finishing = True
             self.stop_event.set()
-            if scan is not None and not scan.done():
-                scan.cancel()
-                await asyncio.gather(scan, return_exceptions=True)
-            if download is not None:
-                try:
-                    await download  # finish active files before disconnecting
-                except asyncio.CancelledError:
-                    pass
-            if self.client is not None:
-                await self.client.disconnect()
+            # While draining, UI operations must no longer treat this client
+            # as available. Explicit cancel can still interrupt the drain.
+            self.status = error_status or "正在停止"
+            try:
+                if scan is not None:
+                    if not scan.done():
+                        scan.cancel()
+                    await asyncio.gather(scan, return_exceptions=True)
+                if self._download_task is not None:
+                    await asyncio.gather(self._download_task, return_exceptions=True)
+                if self.client is not None:
+                    await self.client.disconnect()
+                    self.log("[账号停止] 已断开连接")
+            finally:
                 self.client = None
-            self.status = "已停止"
-            self.log("[账号停止] 已断开连接")
-            current_account_id.reset(token)
+                self._download_task = None
+                self._run_task = None
+                self.status = error_status or "已停止"
+                current_account_id.reset(token)

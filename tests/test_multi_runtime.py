@@ -4,6 +4,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from telethon.tl.types import Channel, Chat, ChatPhotoEmpty
+
 from tgdl.accounts import Account, AccountRegistry
 from tgdl.config import update_env
 from tgdl.history import DownloadHistory, PendingMedia
@@ -27,7 +29,7 @@ class FakeClient:
 
 
 async def resolve(_client, target):
-    return SimpleNamespace(id=123, title="Shared channel")
+    return Channel(123, "Shared supergroup", ChatPhotoEmpty(), None, megagroup=True)
 
 
 def create_runtime(registry, account_id, target, enabled):
@@ -130,9 +132,9 @@ def test_print_context_marks_secondary_account():
         writer.write("download started\n")
     finally:
         current_account_id.reset(token)
-    assert "[账号:" + account_identity.label("acc-b") + "]" in queue_out.get_nowait()
+    assert "[账号:" + account_identity.label("acc-b") + "]" in queue_out.get_nowait().text
     writer.write("legacy\n")
-    assert "[账号:原账号（未登录）]" in queue_out.get_nowait()
+    assert "[账号:原账号（未登录）]" in queue_out.get_nowait().text
 
 
 def test_account_tag_is_not_repeated_when_print_splits_newline():
@@ -144,4 +146,32 @@ def test_account_tag_is_not_repeated_when_print_splits_newline():
         writer.write("\n")
     finally:
         current_account_id.reset(token)
-    assert "".join(out.get_nowait() for _ in range(2)).count("[账号:" + account_identity.label("acc-b") + "]") == 1
+    assert "".join(out.get_nowait().text for _ in range(2)).count("[账号:" + account_identity.label("acc-b") + "]") == 1
+
+
+
+def test_secondary_transfer_refuses_a_basic_group_with_old_queue(tmp_path, monkeypatch):
+    registry = AccountRegistry(tmp_path)
+    runtime = create_runtime(registry, "acc-b", "-123", True)
+    history = DownloadHistory(tmp_path / "tgdl_download_history.sqlite3")
+    job = PendingMedia(-123, 10, "-123", "Basic group", "photo", "10")
+    history.enqueue_media([job])
+    assert history.try_claim(runtime.account.id, job.peer_id, job.message_id)
+    messages_requested = []
+
+    async def basic_group(_client, _target):
+        return Chat(123, "Basic group", ChatPhotoEmpty(), 2, None, 1)
+
+    async def get_messages(*_args, **_kwargs):
+        messages_requested.append(True)
+        raise AssertionError("should not read a basic-group message from another account")
+
+    runtime.client.get_messages = get_messages
+    monkeypatch.setattr(multi_runtime, "resolve_channel", basic_group)
+    asyncio.run(runtime._transfer(history, {"target": "-123"}, job, None, None, 0, 1))
+
+    assert not messages_requested
+    assert not history.active_claims()
+    assert history.pending_count() == 1  # remains available to the original account
+    assert "-123" in runtime._blocked
+    history.close()

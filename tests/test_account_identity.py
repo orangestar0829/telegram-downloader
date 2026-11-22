@@ -18,9 +18,6 @@ def test_telegram_display_name_uses_profile_not_local_alias():
     assert identity.label("stable-secret-id") == "账号 B"
     assert identity.update("stable-secret-id", profile) == "Alice Wang (@alice_w)"
     assert identity.label("stable-secret-id") == "Alice Wang (@alice_w)"
-    assert identity.belongs("stable-secret-id", "账号 B")
-    assert identity.belongs("stable-secret-id", "Alice Wang (@alice_w)")
-    assert not identity.belongs("another-account", "Alice Wang (@alice_w)")
     assert "111111" not in identity.label("stable-secret-id")
     assert "stable-secret-id" not in identity.label("stable-secret-id")
 
@@ -45,9 +42,9 @@ def test_all_prints_are_marked_even_for_original_account():
         writer.write("Connected\n")
     finally:
         current_account_id.reset(token)
-    assert "[账号:Bob Li (@bob)]" in sink.get_nowait()
+    assert "[账号:Bob Li (@bob)]" in sink.get_nowait().text
     writer.write("Main log\n")
-    assert "[账号:原账号（未登录）]" in sink.get_nowait()
+    assert "[账号:原账号（未登录）]" in sink.get_nowait().text
 
 
 def test_explicit_runtime_and_download_logs_keep_tg_profile_name():
@@ -62,13 +59,7 @@ def test_explicit_runtime_and_download_logs_keep_tg_profile_name():
     app._log_download_account("acc-identity-test", "已保存媒体文件")
     runtime = app.log_queue.get_nowait()
     download = app.download_queue.get_nowait()
-    assert "[账号:Bob Li (@bob)]" in runtime
-    assert "[账号:Bob Li (@bob)]" in download
-    assert "acc-identity-test" not in runtime + download
-
-    # A profile change retains the ability to filter earlier text.
-    account_identity.update(
-        "acc-identity-test",
-        SimpleNamespace(first_name="Robert", last_name="Li", username="bob"),
-    )
-    assert account_identity.belongs("acc-identity-test", app._line_account(runtime))
+    assert "[账号:Bob Li (@bob)]" in runtime.text
+    assert "[账号:Bob Li (@bob)]" in download.text
+    assert "acc-identity-test" not in runtime.text + download.text
+    assert runtime.owner_id == download.owner_id == "acc-identity-test"

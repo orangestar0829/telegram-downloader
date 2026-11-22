@@ -23,7 +23,6 @@ class AccountIdentity:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._labels: dict[str, str] = {"default": "原账号（未登录）"}
-        self._historical: dict[str, set[str]] = {}
 
     def register(self, account_id: str, fallback: str) -> None:
         with self._lock:
@@ -34,20 +33,12 @@ class AccountIdentity:
     def update(self, account_id: str, user: object) -> str:
         display = telegram_display_name(user)
         with self._lock:
-            previous = self._labels.get(account_id)
-            if previous:
-                self._historical.setdefault(account_id, set()).add(previous)
             self._labels[account_id] = display
-            self._historical.setdefault(account_id, set()).add(display)
         return display
 
     def label(self, account_id: str) -> str:
         with self._lock:
             return self._labels.get(account_id, "未登录账号")
-
-    def belongs(self, account_id: str, label: str) -> bool:
-        with self._lock:
-            return label == self._labels.get(account_id) or label in self._historical.get(account_id, ())
 
 
 account_identity = AccountIdentity()

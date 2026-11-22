@@ -215,3 +215,59 @@ def test_window_timeout_retries_from_last_committed_offset(tmp_path, monkeypatch
         assert content[-8:] == b"B" * 8
 
     asyncio.run(scenario())
+
+
+def test_last_ineligible_lane_can_return_work_after_fast_lane_finishes(tmp_path, monkeypatch):
+    block = monitor_flow.REQUEST_BYTES
+    monkeypatch.setattr(monitor_flow, "WINDOW_BYTES", block * 2)
+    slow_offset = monitor_flow.WINDOW_BYTES
+
+    async def scenario():
+        allow_slow = asyncio.Event()
+        slow_started = asyncio.Event()
+        fast_finished = asyncio.Event()
+        lane_count = 2
+        total = 0
+        starts = []
+
+        class Client:
+            def iter_download(self, document, *, offset, limit, **kwargs):
+                starts.append(offset)
+
+                async def blocks():
+                    if offset == 0:
+                        await slow_started.wait()
+                    if offset == slow_offset:
+                        slow_started.set()
+                        await allow_slow.wait()
+                    for i in range(limit):
+                        yield bytes([offset // block + i]) * block
+                return blocks()
+
+        def received(count):
+            nonlocal total
+            total += count
+            if total == slow_offset:
+                fast_finished.set()
+
+        document = SimpleNamespace(size=4 * block)
+        flow = monitor_flow.MonitorFlow(
+            monitor_flow.MonitorPause(), monitor_flow.SharedSpeedLimiter(0), lambda: lane_count,
+        )
+        task = asyncio.create_task(monitor_flow.monitor_download_document(
+            Client(), document, tmp_path / "dynamic.bin", flow, on_bytes=received,
+        ))
+        try:
+            await asyncio.wait_for(fast_finished.wait(), timeout=2)
+            await asyncio.sleep(0.02)  # Allow the fast lane to try exiting its loop.
+            lane_count = 1
+            allow_slow.set()
+            output = await asyncio.wait_for(task, timeout=2)
+            assert starts == [0, slow_offset, slow_offset + block]
+            assert total == document.size
+            assert output.read_bytes() == b"".join(bytes([i]) * block for i in range(4))
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())

@@ -2,7 +2,16 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 from datetime import datetime
+
+
+@dataclass(frozen=True, slots=True)
+class LogChunk:
+    """GUI routing metadata; only text is rendered or written to disk."""
+
+    owner_id: str
+    text: str
 
 
 class TimestampedLines:

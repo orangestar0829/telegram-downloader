@@ -1,7 +1,7 @@
 ; NSIS installer for Telegram Downloader.
 ; Compile (Windows):  makensis /DVERSION=1.3.0 packaging\installer.nsi
 ; Compile (Linux):    makensis -DVERSION=1.3.0 packaging/installer.nsi
-; Requires the PyInstaller output in dist/TelegramDownloader/.
+; Requires the PyInstaller output and a fresh uninstall_manifest.nsh.
 
 !include "MUI2.nsh"
 
@@ -18,6 +18,7 @@
 !ifndef DISTDIR
   !define DISTDIR "..\dist\${APPNAME}"
 !endif
+!include "uninstall_manifest.nsh"
 
 Name "${DISPLAYNAME} ${VERSION}"
 ; Relative to this .nsi (packaging/), so the installer lands in the repo root.
@@ -44,8 +45,8 @@ RequestExecutionLevel admin
 !insertmacro MUI_LANGUAGE "English"
 
 Section "Install"
+  !insertmacro TGDL_InstallFiles
   SetOutPath "$INSTDIR"
-  File /r "${DISTDIR}\*"
 
   CreateDirectory "$SMPROGRAMS\${APPNAME}"
   CreateShortcut "$SMPROGRAMS\${APPNAME}\${DISPLAYNAME}.lnk" "$INSTDIR\${APPNAME}.exe"
@@ -65,7 +66,9 @@ Section "Uninstall"
   Delete "$DESKTOP\${DISPLAYNAME}.lnk"
   Delete "$SMPROGRAMS\${APPNAME}\${DISPLAYNAME}.lnk"
   RMDir "$SMPROGRAMS\${APPNAME}"
-  RMDir /r "$INSTDIR"
+  !insertmacro TGDL_RemoveFiles
+  Delete "$INSTDIR\Uninstall.exe"
+  RMDir "$INSTDIR"
   DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APPNAME}"
   DeleteRegKey HKLM "Software\${APPNAME}"
 SectionEnd

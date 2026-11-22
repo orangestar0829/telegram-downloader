@@ -149,7 +149,7 @@ def test_chunked_completion_includes_io_stage_timings(tmp_path):
 
 
 def test_ssd_staging_then_atomic_publish_to_other_volume(tmp_path, monkeypatch):
-    from tgdl import downloader
+    from tgdl import cache_budget, downloader
     from types import SimpleNamespace
 
     data = b"z" * (16 * 1024 * 1024 + 17)
@@ -160,6 +160,8 @@ def test_ssd_staging_then_atomic_publish_to_other_volume(tmp_path, monkeypatch):
     output = tmp_path / "hdd" / "videos"
     staging = tmp_path / "ssd" / "staging"
     monkeypatch.setattr(downloader, "same_volume", lambda src, dst: False)
+    monkeypatch.setattr(cache_budget.shutil, "disk_usage",
+                        lambda path: SimpleNamespace(free=40 * cache_budget.GIB))
     logs = []
     result = asyncio.run(downloader._download_one(
         client, message, output, "20261119_99",

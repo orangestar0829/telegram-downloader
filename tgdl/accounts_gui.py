@@ -1,6 +1,7 @@
 """Tk account-management window: independent account settings and channel lists."""
 from __future__ import annotations
 
+from tgdl.account_context import current_account_id
 from tgdl.accounts import DEFAULT_ACCOUNT
 from tgdl.account_identity import account_identity
 from tgdl.dialog_filter import filter_dialogs
@@ -37,6 +38,7 @@ class AccountWindow:
         self.status = tk.StringVar()
         self._channel_rows: list[dict] = []
         self._fields = {key: tk.StringVar() for key, _label in _ACCOUNT_FIELDS}
+        self._loaded_fields: dict[str, str] = {}
 
         toolbar = ttk.Frame(self.win)
         toolbar.pack(fill="x", padx=10, pady=8)
@@ -204,8 +206,9 @@ class AccountWindow:
     def _load_selected(self) -> None:
         account_id = self._selected_id()
         env = read_env_values(self.registry.env_path(account_id))
-        for key in self._fields:
-            self._fields[key].set(env.get(key, ""))
+        self._loaded_fields = {key: env.get(key, "") for key in self._fields}
+        for key, value in self._loaded_fields.items():
+            self._fields[key].set(value)
         self._channel_rows = load_channels(self.registry.monitor_path(account_id))
         self.tree.selection_remove(self.tree.selection())
         self._refresh_channel_tree()
@@ -254,9 +257,17 @@ class AccountWindow:
                 "账号管理", "请使用主窗口的设置按钮修改原有账号", parent=self.win
             )
             return False
-        values = read_env_values(self.registry.env_path(account_id))
-        values.update({key: var.get().strip() for key, var in self._fields.items()})
+        path = self.registry.env_path(account_id)
         try:
+            # The main settings dialog can save this account while this window
+            # stays open. Apply only fields actually edited in this form.
+            values = read_env_values(path)
+            edits = {}
+            for key, var in self._fields.items():
+                value = var.get()
+                if value != self._loaded_fields.get(key, ""):
+                    edits[key] = value if key == "proxy_password" else value.strip()
+            values.update(edits)
             host = values["proxy_host"]
             port = values["proxy_port"]
             if port and not host:
@@ -271,14 +282,21 @@ class AccountWindow:
                 value = int(values[name])
                 if not low <= value <= high:
                     raise ValueError(f"{name} 必须在 {low}～{high} 范围内")
-            update_env(values, self.registry.env_path(account_id))
+            if edits:
+                update_env(values, path)
         except (ValueError, OSError) as exc:
             self.app.messagebox.showwarning("账号设置无效", str(exc), parent=self.win)
             return False
-        self.app._log_account(account_id, "[账号设置] 已保存；代理变更重启账号生效\n")
+        self._loaded_fields = {key: values[key] for key in self._fields}
+        for key, value in self._loaded_fields.items():
+            self._fields[key].set(value)
+        if edits:
+            self.app._log_account(account_id, "[账号设置] 已保存；代理变更重启账号生效\n")
         return True
 
     def _start_account(self, qr: bool = False) -> None:
+        if self.app._closing:
+            return
         from tgdl.multi_runtime import AccountMonitorRuntime
         from tgdl.qr_gui import QrLoginWindow
         account_id = self._selected_id()
@@ -326,7 +344,7 @@ class AccountWindow:
         if runtime.stop_event.is_set():
             window.done()
             return
-        self.win.after(500, lambda: self._poll_qr_login(window, runtime))
+        window.win.after(500, lambda: self._poll_qr_login(window, runtime))
 
     def _stop_account(self) -> None:
         account_id = self._selected_id()
@@ -548,7 +566,11 @@ class AccountWindow:
         self.dialog_counter.set("正在加载...")
 
         async def fetch():
-            return await list_media_dialogs(runtime.client)
+            context_token = current_account_id.set(account_id)
+            try:
+                return await list_media_dialogs(runtime.client)
+            finally:
+                current_account_id.reset(context_token)
 
         future = self.app.loop.submit(fetch())
 

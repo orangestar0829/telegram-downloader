@@ -246,6 +246,8 @@ def test_monitor_worker_uses_live_file_concurrency_without_cancelling(tmp_path, 
 
 def test_high_priority_scan_preempts_low_and_resumes_partial_transfer(tmp_path, monkeypatch, capsys):
     app, db = create_app(tmp_path, monkeypatch)
+    # This test exercises preemption without an SSD staging reservation.
+    app.settings.temp_download_dir = None
     app._monitor_live_concurrency = 1
     app._monitor_live_chunks = 1
     history = DownloadHistory(db)
@@ -393,6 +395,8 @@ def test_media_settings_save_failure_keeps_previous_values(monkeypatch):
 def test_high_priority_preempts_two_busy_low_downloads(tmp_path, monkeypatch, capsys):
     """Match GUI screenshot: two low videos busy when high scan queues media."""
     app, db = create_app(tmp_path, monkeypatch)
+    # This test exercises preemption without an SSD staging reservation.
+    app.settings.temp_download_dir = None
     app._monitor_live_concurrency = 2
     app._monitor_live_chunks = 1
     app._monitored = [
@@ -496,3 +500,58 @@ def test_scan_completes_while_video_transfer_is_blocked(tmp_path, monkeypatch):
             await asyncio.wait_for(worker, timeout=3)
 
     asyncio.run(scenario())
+
+
+def test_graceful_monitor_stop_renews_active_claim_but_claims_no_new_file(tmp_path, monkeypatch):
+    from tgdl import history as history_module
+
+    app, db = create_app(tmp_path, monkeypatch)
+    history = DownloadHistory(db)
+    history.enqueue_media([
+        PendingMedia(123, mid, "high", "high", "photo", str(mid))
+        for mid in (1, 2)
+    ])
+    clock = SimpleNamespace(now=0)
+    monkeypatch.setattr(gui, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    monkeypatch.setattr(history_module, "time", SimpleNamespace(time=lambda: 1000 + clock.now))
+    started, renewed, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    fetched = []
+
+    async def fake_download(client, message, folder, base, stats, *, history, peer_id, **kwargs):
+        fetched.append(message.id)
+        started.set()
+        await finish.wait()
+        history.mark_saved(peer_id, message.id, "photo", Path(base))
+        return Path(base)
+
+    renew = DownloadHistory.renew_claim
+
+    def record_renew(self, *args, **kwargs):
+        result = renew(self, *args, **kwargs)
+        renewed.set()
+        return result
+
+    monkeypatch.setattr(downloader, "_download_with_retry", fake_download)
+    monkeypatch.setattr(DownloadHistory, "renew_claim", record_renew)
+
+    async def scenario():
+        worker = asyncio.create_task(app._monitor_download_worker(1, 0, 1))
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            assert history.active_claims()[0][3] == 1600
+            app._monitor_download_stop.set()
+            clock.now = 31
+            await asyncio.wait_for(renewed.wait(), 2)
+            assert not worker.done()
+            assert not history.try_claim("other", 123, 1, now=1601)
+        finally:
+            finish.set()
+            await asyncio.wait_for(worker, 2)
+
+    try:
+        asyncio.run(scenario())
+        assert fetched == [1]
+        assert history.pending_count() == 1
+        assert history.active_claims() == []
+    finally:
+        history.close()

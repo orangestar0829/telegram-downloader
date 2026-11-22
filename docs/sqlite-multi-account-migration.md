@@ -44,6 +44,15 @@ CREATE TABLE IF NOT EXISTS account_attempt_backoff (
 Additionally, `downloaded_media` receives one nullable column `account_id TEXT`.
 Old rows remain `NULL`; they are **not** deleted or recreated.
 
+Telegram basic groups use account-local message IDs. Only the original account
+monitors them, now under negative peer keys; channel and supergroup keys keep
+their prior positive values. Untyped legacy history keys are not rewritten,
+because the old tables did not store the entity type. The original account
+can rescan old basic-group entries. An old pending row known to be from a
+basic group (its stored target is exactly its marked negative peer ID) is not
+dispatched under a positive key. If a real channel later needs that key, the
+old row is kept in `legacy_basic_pending_media` before the queue slot is reused.
+
 ### Manual migration (optional)
 
 After backing up, run the three CREATE TABLE statements above. Check

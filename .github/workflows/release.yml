@@ -38,7 +38,10 @@ jobs:
           }
 
       - name: Build exe (PyInstaller)
-        run: pyinstaller --noconfirm packaging/tgdl.spec
+        run: |
+          pyinstaller --noconfirm packaging/tgdl.spec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python packaging/build_uninstall_manifest.py dist/TelegramDownloader packaging/uninstall_manifest.nsh
 
       - name: Install NSIS
         run: choco install nsis -y --no-progress

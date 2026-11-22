@@ -44,3 +44,14 @@ def test_migration_refuses_invalid_legacy_session_without_destroying_it(tmp_path
 def test_session_migration_no_legacy_is_noop(tmp_path):
     new = migrate_default_session(tmp_path)
     assert not new.exists()
+
+
+
+def test_default_session_migration_encodes_hash_in_directory(tmp_path):
+    root = tmp_path / "build#4"
+    root.mkdir()
+    old = root / "tgdl_session.session"
+    _make_session(old, "existing-session")
+    new = migrate_default_session(root)
+    assert _auth_key(new) == "existing-session"
+    assert _auth_key(old) == "existing-session"

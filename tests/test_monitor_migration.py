@@ -84,3 +84,20 @@ def test_legacy_file_is_sufficient_for_rollback(tmp_path):
     assert load_channels(new)[0]["target"] == "@changed"
     # Restoring the legacy file to an older installation restores its monitors.
     assert load_channels(old)[0]["priority"] == 9
+
+
+
+def test_invalid_legacy_monitor_json_does_not_abort_startup(tmp_path, monkeypatch):
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    old = tmp_path / "monitored_channels.json"
+    old.write_text("{bad", encoding="utf-8")
+    default = tmp_path / "accounts" / "default" / old.name
+    assert paths.prepare_data_dir() == tmp_path
+    assert paths.monitor_migration_error(tmp_path)
+    assert old.read_text() == "{bad"
+    assert not default.exists()
+
+    old.write_text('[{"target":"@recovered","minutes":5}]', encoding="utf-8")
+    assert paths.prepare_data_dir() == tmp_path
+    assert not paths.monitor_migration_error(tmp_path)
+    assert load_channels(default)[0]["target"] == "@recovered"

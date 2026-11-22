@@ -11,7 +11,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
-from telethon import TelegramClient
+from telethon import TelegramClient, utils
 from telethon.errors import (
     ChannelPrivateError,
     FloodWaitError,
@@ -20,11 +20,19 @@ from telethon.errors import (
 )
 from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
 from telethon.tl.types import (
+    Channel,
+    Chat,
+    ChatEmpty,
+    ChatForbidden,
     DocumentAttributeFilename,
     Message,
     MessageMediaDocument,
     MessageMediaPhoto,
     MessageMediaWebPage,
+    PeerChat,
+    PeerUser,
+    User,
+    UserEmpty,
 )
 from tqdm import tqdm
 
@@ -33,9 +41,10 @@ from tgdl.chunked import (
 )
 from tgdl.monitor_flow import MonitorFlow, monitor_download_document
 from tgdl.cache_budget import optional_staging_reservation
+from tgdl.errors import ChannelAccessError
 from tgdl.history import DownloadHistory, PendingMedia
 from tgdl.progress import ProgressCallback, TransferProgress
-from tgdl.temp_cleanup import own_temporary
+from tgdl.temp_cleanup import PEER_DOWNLOADS_DIR, is_link_or_reparse_point, own_temporary
 
 PHOTO_TYPES = {"photo"}
 VIDEO_TYPES = {"video", "animation"}
@@ -147,6 +156,37 @@ def safe_name(text: str) -> str:
     return cleaned[:80] or "channel"
 
 
+def download_peer_key(entity: object, *, account_id: str = "default") -> str:
+    """Use Telegram's marked ID, and scope non-channel message IDs by account."""
+    try:
+        peer_id = utils.get_peer_id(entity)
+    except TypeError:
+        # A minimal resolved entity supplied by an offline client adapter.
+        peer_id = int(entity.id)
+    if isinstance(entity, (Chat, ChatForbidden, PeerChat, PeerUser, User)):
+        return f"{safe_name(account_id)}_{peer_id}"
+    return str(peer_id)
+
+
+def peer_download_folder(download_dir: Path, title: str, entity: object, *,
+                         account_id: str = "default", create: bool = True) -> Path:
+    """Keep legacy title-only folders separate and reuse a peer folder after renames."""
+    root = Path(download_dir) / PEER_DOWNLOADS_DIR
+    prefix = f"{download_peer_key(entity, account_id=account_id)} - "
+    if is_link_or_reparse_point(root):
+        raise OSError(f"Refusing to use linked peer download namespace: {root}")
+    for existing in sorted(root.glob(f"{prefix}*")):
+        if not is_link_or_reparse_point(existing) and existing.is_dir():
+            return existing
+    label = safe_name(str(title)).rstrip(". ") or "channel"
+    folder = root / f"{prefix}{label}"
+    if is_link_or_reparse_point(folder):
+        raise OSError(f"Refusing to use linked peer download folder: {folder}")
+    if create:
+        folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
 def unique_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -191,12 +231,15 @@ async def resolve_channel(client: TelegramClient, target: str):
         target = target[1:]
 
     try:
-        return await client.get_entity(int(target) if _looks_like_id(target) else target)
+        entity = await client.get_entity(int(target) if _looks_like_id(target) else target)
     except (ChannelPrivateError, UsernameNotOccupiedError, ValueError) as exc:
-        raise SystemExit(
+        raise ChannelAccessError(
             f"Cannot access '{target}'. Join the private channel with this account first, "
             "then pass the numeric id from `python -m tgdl list`."
         ) from exc
+    if isinstance(entity, (User, UserEmpty, PeerUser)):
+        raise ChannelAccessError("Choose a Telegram group or channel, not a user account.")
+    return entity
 
 
 def _looks_like_id(value: str) -> bool:
@@ -216,6 +259,25 @@ class DownloadStats:
         self.scan_completed = 0
         self.queued = 0
         self.scanned_messages = 0
+
+
+class UnsupportedSharedMonitorPeer(ValueError):
+    """The shared ledger requires a message counter common to all accounts."""
+
+
+def history_peer_id(entity) -> int:
+    """Separate Telegram Chat IDs from Channel IDs without rewriting old channels."""
+    raw_id = int(entity.id)
+    return -raw_id if isinstance(entity, (Chat, ChatEmpty, ChatForbidden)) else raw_id
+
+
+def require_shared_monitor_peer(entity):
+    # Only channel entities (broadcast channels and supergroups) have stable
+    # message IDs across accounts. Basic groups have account-local message IDs.
+    if not isinstance(entity, Channel):
+        raise UnsupportedSharedMonitorPeer(
+            "额外账号仅支持监控频道或超级群；普通群请用原账号监控"
+        )
 
 
 async def scan_monitor_slice(
@@ -240,8 +302,10 @@ async def scan_monitor_slice(
     if slice_size < 1 or match_limit < 1:
         raise ValueError("Monitor slice and match limits must be positive")
     entity = await resolve_channel(client, target)
+    if account_id != "default":
+        require_shared_monitor_peer(entity)
     title = str(getattr(entity, "title", None) or getattr(entity, "username", None) or entity.id)
-    peer_id = int(entity.id)
+    peer_id = history_peer_id(entity)
     if on_channel_resolved is not None:
         on_channel_resolved(title, peer_id)
     stats = DownloadStats()
@@ -360,14 +424,14 @@ async def download_channel(
     entity = await resolve_channel(client, target)
     title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
     if on_channel_resolved is not None:
-        on_channel_resolved(str(title), int(entity.id))
+        on_channel_resolved(str(title), history_peer_id(entity))
     def saved_with_source(detail: str) -> None:
         labeled = f"[{title}] {detail}"
         if on_saved is not None:
             on_saved(labeled)
         else:
             print(labeled)
-    folder = download_dir / safe_name(str(title))
+    folder = peer_download_folder(download_dir, title, entity, create=not dry_run)
     photos_dir = folder / "photos"
     videos_dir = folder / "videos"
     if not dry_run:
@@ -387,7 +451,7 @@ async def download_channel(
     if monitored and monitor_batch_size < 1:
         raise ValueError("monitor_batch_size must be positive")
     history = DownloadHistory() if not dry_run else None
-    peer_id = int(entity.id)
+    peer_id = history_peer_id(entity)
     scan_upper = 0
     scan_completed = 0
     scan_cursor = 0
@@ -575,9 +639,10 @@ async def _download_one(
         if history is not None and peer_id is not None and history.contains(peer_id, message.id):
             stats.skipped += 1
             return None
-        existing = next(dest_dir.glob(f"{base}.*"), None) if dest_dir.exists() else None
+        existing = next((p for p in dest_dir.glob(f"{base}.*")
+                         if p.is_file() and not p.is_symlink()), None)
         if existing is not None:
-            if history is not None and peer_id is not None and existing.is_file():
+            if history is not None and peer_id is not None:
                 history.mark_saved(peer_id, message.id, dest_dir.name, existing)
             stats.skipped += 1
             return None
@@ -703,7 +768,9 @@ async def _download_one(
                 saved_path = Path(saved)
                 suffix = saved_path.suffix or ".bin"
                 final_path = dest_dir / f"{base}{suffix}"
-                if skip_existing and final_path.exists():
+                if skip_existing and final_path.is_file() and not final_path.is_symlink():
+                    if history is not None and peer_id is not None:
+                        history.mark_saved(peer_id, message.id, dest_dir.name, final_path)
                     stats.skipped += 1
                     return None
                 if final_path.exists():

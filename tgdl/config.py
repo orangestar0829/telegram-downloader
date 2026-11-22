@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import dotenv_values
+from tgdl.errors import TGDLInputError
 from tgdl.paths import prepare_data_dir
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -184,7 +185,7 @@ def load_settings(*, env_path: Path | None = None, session_path: Path | None = N
         staging_dir = DATA_DIR / staging_dir
 
     if creds is None:
-        raise SystemExit(
+        raise TGDLInputError(
             "Missing TELEGRAM_API_ID / TELEGRAM_API_HASH.\n"
             "1. Open https://my.telegram.org -> API development tools\n"
             "2. Enter api_id and api_hash once in the app (they are remembered)."
@@ -193,12 +194,12 @@ def load_settings(*, env_path: Path | None = None, session_path: Path | None = N
     try:
         api_id = int(api_id_raw)
     except ValueError as exc:
-        raise SystemExit("TELEGRAM_API_ID must be a number.") from exc
+        raise TGDLInputError("TELEGRAM_API_ID must be a number.") from exc
 
     host = raw("SOCKS5_HOST", "").strip() or None
     raw_port = raw("SOCKS5_PORT", "").strip()
     if raw_port and host is None:
-        raise SystemExit("SOCKS5_PORT requires SOCKS5_HOST.")
+        raise TGDLInputError("SOCKS5_PORT requires SOCKS5_HOST.")
     proxy_port = _bounded_int(raw_port or "1080", "SOCKS5_PORT", 1, 65535) if host else None
 
     return Settings(
@@ -231,7 +232,7 @@ def _bounded_int(raw: str, name: str, minimum: int, maximum: int) -> int:
     try:
         value = int(raw)
     except (TypeError, ValueError) as exc:
-        raise SystemExit(f"{name} must be a number.") from exc
+        raise TGDLInputError(f"{name} must be a number.") from exc
     if not minimum <= value <= maximum:
-        raise SystemExit(f"{name} must be between {minimum} and {maximum}.")
+        raise TGDLInputError(f"{name} must be between {minimum} and {maximum}.")
     return value

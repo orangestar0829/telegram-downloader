@@ -3,6 +3,8 @@ import base64
 from datetime import datetime, timezone
 from pathlib import Path
 
+from telethon.tl.types import PeerChannel
+
 from tgdl import browser
 
 # a tiny valid 1x1 PNG so Pillow/Tk could decode it if needed
@@ -77,9 +79,11 @@ def test_save_items_writes_selected(tmp_path: Path) -> None:
     items = asyncio.run(browser.list_media(client, "chat", limit=10))
     # select first two
     result = asyncio.run(
-        browser.save_items(client, items[:2], download_dir=tmp_path, title="My Chat")
+        browser.save_items(
+            client, items[:2], download_dir=tmp_path, title="My Chat", entity=PeerChannel(42)
+        )
     )
     assert result.saved == 2
-    folder = tmp_path / "My Chat"
+    folder = tmp_path / "tgdl-by-peer" / "-1000000000042 - My Chat"
     saved = list((folder / "photos").glob("*")) + list((folder / "videos").glob("*"))
     assert len(saved) == 2

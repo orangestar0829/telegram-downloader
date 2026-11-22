@@ -244,17 +244,53 @@ def test_progress_tree_displays_only_selected_account(tmp_path):
     assert f"{b.id}:peer-b:41" in app._progress_entries
 
 
-def test_log_filter_tracks_selected_telegram_account(tmp_path):
+def test_log_filter_isolates_identical_names_even_after_profile_rename(tmp_path, monkeypatch):
+    from queue import Queue
+    import tgdl.gui
+    from tgdl.account_context import current_account_id
+    from tgdl.account_identity import AccountIdentity
+    from tgdl.log_format import TimestampedLines
+
+    identity = AccountIdentity()
+    monkeypatch.setattr(tgdl.gui, "account_identity", identity)
+    monkeypatch.setattr("tgdl.account_view.account_identity", identity)
     app, b = _make_app(tmp_path)
-    account_identity.register(b.id, "本地备注 B")
-    account_identity.update(b.id, SimpleNamespace(
-        first_name="Telegram", last_name="B", username="b_test"))
+    app.log_queue = Queue()
+    app.download_queue = Queue()
+    app._timestamp_formatter = TimestampedLines()
+    app._download_timestamp_formatter = TimestampedLines()
+    app._log_store = SimpleNamespace(write=lambda text: disk_logs.append(text))
+    disk_logs = []
+    app._log_account = _App._log_account.__get__(app)
+    app._log = _App._log.__get__(app)
+    profile = SimpleNamespace(first_name="同名", last_name="", username=None)
+    identity.update("default", profile)
+    identity.update(b.id, profile)
+    app._log_account("default", "A worker")
+    app._log_account(b.id, "B worker")
+    app._log_download_account(b.id, "B transfer")
+    writer = tgdl.gui._QueueWriter(app.log_queue, app._timestamp_formatter,
+                                  persist=app._log_store.write)
+    context_token = current_account_id.set(b.id)
+    try:
+        writer.write("B diagnostics\n")
+    finally:
+        current_account_id.reset(context_token)
+    a_line, b_line, b_print = (app.log_queue.get_nowait() for _ in range(3))
+    b_download = app.download_queue.get_nowait()
+    assert all("[账号:同名]" in line.text for line in (a_line, b_line, b_print, b_download))
+    assert all(b.id not in text for text in disk_logs)
+
     app._switch_main_account(b.id)
-    assert app._log_visible("[2026-11-22] [账号:Telegram B (@b_test)] login OK")
-    assert not app._log_visible("[2026-11-22] [账号:原账号（未登录）] A worker")
+    assert not app._log_visible(a_line)
+    assert all(app._log_visible(line) for line in (b_line, b_print, b_download))
+    identity.update(b.id, SimpleNamespace(first_name="改名", last_name="", username=None))
+    app._refresh_log_accounts()
+    assert app._log_visible(b_line)  # Old readable name, unchanged owner.
+    assert not app._log_visible(a_line)
     app._switch_main_account("default")
-    assert app._log_visible("[2026-11-22] [账号:原账号（未登录）] A worker")
-    assert not app._log_visible("[2026-11-22] [账号:Telegram B (@b_test)] B worker")
+    assert app._log_visible(a_line)
+    assert not any(app._log_visible(line) for line in (b_line, b_print, b_download))
 
 
 def test_list_refresh_targets_selected_secondary_client(tmp_path):
@@ -333,3 +369,48 @@ def test_account_manager_default_dialogs_do_not_show_main_window_b(tmp_path):
     app.on_list = lambda: calls.append("WRONG: refresh B")
     manager._ensure_dialogs(force=True)
     assert calls == ["scheduled default"]
+
+
+def test_main_settings_dialog_merges_edits_after_account_manager_proxy_save(tmp_path):
+    from tgdl.config import read_env_values
+
+    app, b = _make_app(tmp_path)
+    app._view_account_id = b.id
+    app.client = None
+    app.root = object()
+    path = app._account_registry.env_path(b.id)
+    original = read_env_values(path)
+    drafts, buttons = [], {}
+
+    def variable(**kwargs):
+        var = Var(kwargs["value"])
+        drafts.append(var)
+        return var
+
+    def button(_parent, *, text, command):
+        buttons[text] = command
+        return SimpleNamespace(grid=lambda **_kwargs: None)
+
+    def unexpected(*_args):
+        raise AssertionError("unexpected warning")
+
+    app.tk = SimpleNamespace(Toplevel=lambda _parent: SimpleNamespace(
+        title=lambda _text: None, transient=lambda _parent: None, destroy=lambda: None,
+    ), StringVar=variable)
+    widget = lambda *_args, **_kwargs: SimpleNamespace(grid=lambda **_kwargs: None)
+    app.ttk = SimpleNamespace(Label=widget, Entry=widget, Button=button)
+    app.messagebox = SimpleNamespace(showwarning=unexpected, showinfo=lambda *_: None)
+    app._log = lambda *_args: None
+    app._open_settings()
+
+    # Account manager saves a SOCKS5 host while the main dialog is open.
+    update_env({**original, "proxy_host": "manager-proxy", "proxy_port": "9988"}, path)
+    drafts[6].set(str(tmp_path / "new-download-dir"))
+    app.phone_var.set("+19998887777")  # Independent login draft.
+    buttons["保存"]()
+    saved = read_env_values(path)
+    assert (saved["proxy_host"], saved["proxy_port"], saved["download_dir"]) == (
+        "manager-proxy", "9988", str(tmp_path / "new-download-dir")
+    )
+    assert app.proxy_host_var.get() == "manager-proxy"
+    assert app.phone_var.get() == "+19998887777"

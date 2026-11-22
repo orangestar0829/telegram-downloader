@@ -43,10 +43,10 @@ def test_login_reports_actual_channel_and_does_not_request_again(monkeypatch, tm
             return delivery("SentCodeTypeApp")
 
         async def start(self, *, phone, code_callback, password):
-            self.phone = phone()
+            self.phone = await phone() if callable(phone) else phone
             await self.send_code_request(self.phone)
             # The GUI will see the actual channel before asking for the code.
-            assert code_callback() == "12345"
+            assert await code_callback() == "12345"
 
         async def get_me(self):
             return SimpleNamespace(id=12345, first_name="B", phone="12223334444")
@@ -60,10 +60,14 @@ def test_login_reports_actual_channel_and_does_not_request_again(monkeypatch, tm
     monkeypatch.setattr(multi_runtime, "load_settings",
                         lambda **_: SimpleNamespace(phone="+12223334444"))
     monkeypatch.setattr(multi_runtime, "build_client", lambda settings: fake_client)
+    async def answer(prompt, secret):
+        prompts.append((prompt, secret))
+        return "12345"
+
     account = Account("acc-b", "B")
     runtime = multi_runtime.AccountMonitorRuntime(
         account, registry,
-        ask=lambda prompt, secret: prompts.append((prompt, secret)) or "12345",
+        ask=answer,
         on_log=lambda _id, line: logs.append(line),
         on_saved=lambda *_: None,
         on_progress=lambda *_: None,

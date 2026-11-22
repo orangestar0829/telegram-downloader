@@ -32,7 +32,7 @@ from tgdl.log_store import DailyLogStore
 from tgdl.browser import list_media, save_items
 from tgdl.channels import list_media_dialogs
 from tgdl.dialog_filter import filter_dialogs
-from tgdl.client import build_client
+from tgdl.client import build_client, validate_login_phone
 from tgdl.config import (
     Settings,
     credentials_available,
@@ -43,13 +43,13 @@ from tgdl.config import (
 )
 from tgdl.downloader import download_channel, resolve_channel, scan_monitor_slice
 from tgdl.history import DownloadHistory
-from tgdl.log_format import TimestampedLines
+from tgdl.log_format import LogChunk, TimestampedLines
 from tgdl.monitor import (
     MonitorDispatchSummary, choose_monitor_download, load_channels, next_due_channel,
     save_channels,
 )
 
-from tgdl.paths import data_dir
+from tgdl.paths import data_dir, monitor_migration_error
 from tgdl.single_instance import AlreadyRunning, gui_instance_guard
 from tgdl.temp_cleanup import inspect_cleanup
 from tgdl.telethon_diagnostics import install_telethon_diagnostics
@@ -127,7 +127,7 @@ class AsyncLoop:
 
 
 class _QueueWriter:
-    def __init__(self, sink: "queue.Queue[str]", formatter: TimestampedLines | None = None,
+    def __init__(self, sink: "queue.Queue[LogChunk]", formatter: TimestampedLines | None = None,
                  persist: Callable[[str], None] | None = None) -> None:
         self._sink = sink
         self._formatter = formatter or TimestampedLines()
@@ -139,7 +139,7 @@ class _QueueWriter:
             formatted = self._formatter.format(
                 text, prefix=f"[账号:{account_identity.label(owner)}] "
             )
-            self._sink.put(formatted)
+            self._sink.put(LogChunk(owner, formatted))
             if self._persist is not None:
                 self._persist(formatted)
         return len(text)
@@ -182,6 +182,10 @@ class _App:
 
         self.loop = AsyncLoop()
         self.client = None
+        self._client_lock = asyncio.Lock()
+        self._client_starting_task = None
+        self._client_starting_cleanup = False
+        self._prompt_lock = asyncio.Lock()
         self.settings: Settings | None = None
         self._account_registry = AccountRegistry(data_dir())
         for registered in self._account_registry.accounts():
@@ -197,8 +201,8 @@ class _App:
         self._log_store = DailyLogStore(data_dir() / "logs")
         self._run_log_records = deque(maxlen=5000)
         self._download_log_records = deque(maxlen=5000)
-        self.log_queue: "queue.Queue[str]" = queue.Queue()
-        self.download_queue: "queue.Queue[str]" = queue.Queue()
+        self.log_queue: "queue.Queue[LogChunk]" = queue.Queue()
+        self.download_queue: "queue.Queue[LogChunk]" = queue.Queue()
         self.progress_queue: "queue.Queue[tuple[str, str, int, int, str]]" = queue.Queue()
         self._progress_entries: dict[str, dict] = {}
         self._monitor_progress_states: dict[str, str] = {}
@@ -237,9 +241,9 @@ class _App:
             self._cleanup_path(env["temp_download_dir"]),
             self._cleanup_path(env["download_dir"]),
         )
-        self.log_queue.put(f"[账号:{account_identity.label('default')}] {startup_cache.summary()}\n")
+        self._log_startup(startup_cache.summary() + "\n")
         for error in startup_cache.failed:
-            self.log_queue.put(f"[账号:{account_identity.label('default')}] [缓存清理] {error}\n")
+            self._log_startup(f"[缓存清理] {error}\n")
         self.proxy_host_var = tk.StringVar(value=env["proxy_host"])
         self.proxy_port_var = tk.StringVar(value=env["proxy_port"])
         self.proxy_username_var = tk.StringVar(value=env["proxy_username"])
@@ -275,9 +279,13 @@ class _App:
         self._monitor_cursor = 0
         try:
             self._monitored = load_channels()
+            if migration_error := monitor_migration_error(data_dir()):
+                self._log_startup(
+                    f"[监控] 旧监控配置未迁移，原文件未删除，可修复后重启：{migration_error}\n"
+                )
         except (ValueError, OSError) as exc:
             self._monitored = []
-            self.log_queue.put(f"[监控] 配置读取失败：{exc}\n")
+            self._log_startup(f"[监控] 配置读取失败：{exc}\n")
         self._monitor_next: dict[str, float] = {}
         self._monitor_totals: dict[str, dict[str, int]] = {}
         self._monitor_scan_future = None
@@ -705,7 +713,7 @@ class _App:
     def _monitor_types_label(raw: str) -> str:
         try:
             selected = parse_types(str(raw))
-        except SystemExit:
+        except ValueError:
             return "未知类型"
         return "、".join(
             label for kind, label in (
@@ -716,7 +724,7 @@ class _App:
     def _monitor_set_types(self, raw: str) -> None:
         try:
             selected = parse_types(str(raw))
-        except SystemExit:
+        except ValueError:
             selected = set()
         self.monitor_type_photo.set("photo" in selected)
         self.monitor_type_video.set("video" in selected)
@@ -769,6 +777,8 @@ class _App:
             self._monitor_refresh()
 
     def _monitor_start_stop(self):
+        if self._closing and not self._monitor_active:
+            return
         if self._selected_view_account() != "default" and not self._closing:
             self._open_accounts()
             return
@@ -954,12 +964,13 @@ class _App:
 
     async def _monitor_download_worker(self, concurrency: int, retries: int, chunks: int):
         """Consume durable media jobs independently from the channel scanner."""
-        from tgdl.downloader import DownloadStats, _download_with_retry, safe_name
+        from tgdl.downloader import DownloadStats, _download_with_retry, peer_download_folder
         from tgdl.monitor_flow import MonitorFlow, MonitorPause, SharedSpeedLimiter
         self._monitor_worker_task = asyncio.current_task()
         history = DownloadHistory()
         active = {}
         active_jobs = {}
+        staged_jobs = set()
         pauses = {}
         active_target: dict[tuple[int, int], str] = {}
         active_started: dict[tuple[int, int], float] = {}
@@ -971,11 +982,10 @@ class _App:
         pause_delay_reported: set[tuple[int, int]] = set()
         paused_since: dict[tuple[int, int], float] = {}
         limiter = SharedSpeedLimiter(getattr(self, "_monitor_live_speed_kib", 0) * 1024)
-        cancelled = False
         try:
             await self._ensure_client()
             last_lease_refresh = time.monotonic()
-            while not self._monitor_download_stop.is_set():
+            while not self._monitor_download_stop.is_set() or active:
                 for line in dispatch_log.drain():
                     print(line)
                 limiter.bytes_per_second = getattr(self, "_monitor_live_speed_kib", 0) * 1024
@@ -988,6 +998,7 @@ class _App:
                 for key in finished:
                     task = active.pop(key)
                     active_jobs.pop(key)
+                    staged_jobs.discard(key)
                     pauses.pop(key)
                     self._monitor_progress_state(key[0], key[1], "结束")
                     pause_requested_at.pop(key, None)
@@ -1007,6 +1018,19 @@ class _App:
                         raise
                     except Exception as exc:
                         print(f"[监控] 下载任务 {key} 异常：{exc}")
+                if self._monitor_download_stop.is_set():
+                    # Drain already-started files (including paused ones)
+                    # while continuing their lease heartbeat. Do not claim
+                    # anything new, even if a transfer frees a slot.
+                    for key, ctl in pauses.items():
+                        if ctl.requested:
+                            ctl.resume()
+                            self._monitor_progress_state(key[0], key[1], "恢复中")
+                    self._monitor_active_transfers = len(active)
+                    self._monitor_total_transfers = len(active)
+                    if active:
+                        await asyncio.sleep(0.25)
+                    continue
                 # Paused wall time must not count as occupied transfer time.
                 for key, ctl in pauses.items():
                     if ctl.suspended and key not in suspended_accounted:
@@ -1093,9 +1117,11 @@ class _App:
                             if (job.peer_id, job.message_id) not in active:
                                 pending.append((item, job))
                                 break
-                    # A newly scanned high-priority channel can cooperatively
-                    # pause a lower-priority active transfer at a chunk boundary.
-                    if pending and len(running_keys) >= effective_concurrency:
+                    # Staged transfers may hold the SSD reservation for the
+                    # entire file. Pausing one while starting another could
+                    # make the new transfer wait for that paused reservation.
+                    # With staging, switch priorities only at the next free slot.
+                    if pending and not staged_jobs and len(running_keys) >= effective_concurrency:
                         high_priority = max(int(item.get("priority", 0)) for item, _ in pending)
                         priority_by_target = {
                             item["target"]: int(item.get("priority", 0))
@@ -1194,12 +1220,26 @@ class _App:
                             limiter=limiter,
                             chunks=lambda: getattr(self, "_monitor_live_chunks", None) or chunks,
                         )
+                        settings = self.settings
+                        if settings.temp_download_dir is not None:
+                            staged_jobs.add(key)
+
                         async def transfer(job=job, flow=flow, target=item["target"],
-                                           media_types=item.get("types", "photo,video")):
+                                           media_types=item.get("types", "photo,video"),
+                                           transfer_settings=settings):
                             cooldown = 0
                             try:
                                 # Always resolve with the account's own channel target.
                                 entity = await resolve_channel(self.client, target)
+                                resolved_peer = _downloader.history_peer_id(entity)
+                                if resolved_peer != job.peer_id:
+                                    cooldown = 3600
+                                    title = getattr(entity, "title", None) or job.title
+                                    self.root.after(0, lambda: self._monitor_set_name(
+                                        target, title, resolved_peer
+                                    ))
+                                    print("[监控] 监控目标与队列记录不符，跳过旧任务并重新识别频道")
+                                    return
                                 message = await self.client.get_messages(entity, ids=job.message_id)
                                 if message is None or message.date is None:
                                     cooldown = 3600
@@ -1211,8 +1251,9 @@ class _App:
                                 }:
                                     cooldown = 3600
                                     return
-                                folder = self.settings.download_dir / safe_name(
-                                    getattr(entity, "title", None) or job.title
+                                folder = peer_download_folder(
+                                    transfer_settings.download_dir,
+                                    getattr(entity, "title", None) or job.title, entity,
                                 ) / ("photos" if kind == "photo" else "videos")
                                 stats = DownloadStats()
                                 path = await _download_with_retry(
@@ -1223,7 +1264,7 @@ class _App:
                                     chunk_concurrency=chunks, history=history,
                                     peer_id=job.peer_id,
                                     on_saved=lambda detail: self._log_download(f"[监控下载] [{job.title}] {detail}"),
-                                    temp_download_dir=self.settings.temp_download_dir,
+                                    temp_download_dir=transfer_settings.temp_download_dir,
                                     on_progress=self._update_download_progress,
                                     monitor_flow=flow,
                                 )
@@ -1256,16 +1297,13 @@ class _App:
                             priority_logged = True
                         continue
                 await asyncio.sleep(0.25 if active else 1)
-        except asyncio.CancelledError:
-            cancelled = True
-            raise
         finally:
             for line in dispatch_log.drain(force=True):
                 print(line)
-            for ctl in pauses.values():
-                ctl.resume()
-            if cancelled:
-                for task in active.values():
+            # Graceful shutdown drained this set above. If the worker itself
+            # was cancelled or failed, cancel any transfer it can no longer renew.
+            for task in active.values():
+                if not task.done():
                     task.cancel()
             if active:
                 await asyncio.gather(*active.values(), return_exceptions=True)
@@ -1273,10 +1311,12 @@ class _App:
                 self._monitor_progress_state(key[0], key[1], "结束")
             self._monitor_active_transfers = 0
             self._monitor_total_transfers = 0
-            for peer, mid in active:
-                history.release_claim("default", peer, mid)
-            history.close()
-            self._monitor_worker_task = None
+            try:
+                for peer, mid in active:
+                    history.release_claim("default", peer, mid)
+            finally:
+                history.close()
+                self._monitor_worker_task = None
 
     def _build_gallery_tab(self):
         tk, ttk = self.tk, self.ttk
@@ -1405,6 +1445,8 @@ class _App:
             return
 
         self._stop_download.clear()
+        entity = self._gallery_entity
+        title = self._gallery_title
 
         async def coro():
             self._download_task = asyncio.current_task()
@@ -1414,7 +1456,8 @@ class _App:
                     self.client,
                     selected,
                     download_dir=self.settings.download_dir,
-                    title=self._gallery_title or "gallery",
+                    title=title or "gallery",
+                    entity=entity,
                     concurrency=concurrency,
                     retries=retries,
                     chunk_concurrency=chunk_concurrency,
@@ -1515,32 +1558,33 @@ class _App:
         return frame
 
     # ---------- helpers ----------
-    def _log(self, text: str) -> None:
-        owner = current_account_id.get()
-        label = account_identity.label(owner)
-        if not text.startswith("[账号:"):
-            line = self._timestamp_formatter.format(text, prefix=f"[账号:{label}] ")
-        else:
-            line = self._timestamp_formatter.format(text)
-        self.log_queue.put(line)
+    def _log_startup(self, text: str) -> None:
+        owner = "default"
+        self.log_queue.put(LogChunk(owner, f"[账号:{account_identity.label(owner)}] {text}"))
+
+    def _log(self, text: str, *, owner_id: str | None = None) -> None:
+        owner = current_account_id.get() if owner_id is None else owner_id
+        line = self._timestamp_formatter.format(text, prefix=f"[账号:{account_identity.label(owner)}] ")
+        self.log_queue.put(LogChunk(owner, line))
         store = getattr(self, "_log_store", None)
         if store is not None:
             store.write(line)
 
-    def _log_download(self, text: str) -> None:
-        if not text.startswith("[账号:"):
-            text = f"[账号:{account_identity.label(current_account_id.get())}] {text}"
-        line = self._download_timestamp_formatter.format(text + "\n")
-        self.download_queue.put(line)
+    def _log_download(self, text: str, *, owner_id: str | None = None) -> None:
+        owner = current_account_id.get() if owner_id is None else owner_id
+        line = self._download_timestamp_formatter.format(
+            text + "\n", prefix=f"[账号:{account_identity.label(owner)}] "
+        )
+        self.download_queue.put(LogChunk(owner, line))
         store = getattr(self, "_log_store", None)
         if store is not None:
             store.write("[下载记录] " + line)
 
     def _log_account(self, account_id: str, text: str) -> None:
-        self._log(f"[账号:{account_identity.label(account_id)}] {text.rstrip()}" + "\n")
+        self._log(text.rstrip() + "\n", owner_id=account_id)
 
     def _log_download_account(self, account_id: str, text: str) -> None:
-        self._log_download(f"[账号:{account_identity.label(account_id)}] {text}")
+        self._log_download(text, owner_id=account_id)
 
     def _open_accounts(self) -> None:
         from tgdl.accounts_gui import AccountWindow
@@ -1717,7 +1761,11 @@ class _App:
         pending.add(account_id)
 
         async def fetch():
-            return await list_media_dialogs(runtime.client)
+            context_token = current_account_id.set(account_id)
+            try:
+                return await list_media_dialogs(runtime.client)
+            finally:
+                current_account_id.reset(context_token)
 
         future = self.loop.submit(fetch())
         def finished(done):
@@ -1808,26 +1856,17 @@ class _App:
         if var is not None and var.get() not in choices:
             var.set("全部账号")
 
-    @staticmethod
-    def _line_account(line: str) -> str:
-        marker = "[账号:"
-        start = line.find(marker)
-        if start < 0:
-            return "default"
-        end = line.find("]", start + len(marker))
-        return line[start + len(marker):end] if end > start else "default"
-
-    def _log_visible(self, chunk: str) -> bool:
+    def _log_visible(self, chunk: LogChunk) -> bool:
         var = getattr(self, "log_account_filter", None)
         selected = self._log_filter_options.get(var.get()) if var is not None else None
-        return selected is None or account_identity.belongs(selected, self._line_account(chunk))
+        return selected is None or selected == chunk.owner_id
 
     def _refresh_log_views(self) -> None:
         for widget, records, popup in (
             (self.log, getattr(self, "_run_log_records", ()), self._log_popup_text),
             (self.download_log, getattr(self, "_download_log_records", ()), self._download_popup_text),
         ):
-            visible = "".join(line for line in records if self._log_visible(line))
+            visible = "".join(chunk.text for chunk in records if self._log_visible(chunk))
             widget.configure(state="normal")
             widget.delete("1.0", "end")
             widget.insert("end", visible)
@@ -1933,6 +1972,11 @@ class _App:
 
     def _drain_log(self) -> None:
         self._drain_progress()
+        store = getattr(self, "_log_store", None)
+        if (store is not None and store.failed.is_set()
+                and not getattr(self, "_log_write_warning", False)):
+            self._log_write_warning = True
+            self._log("[日志] 无法继续保存运行日志，请检查日志目录权限或磁盘空间。\n")
         try:
             while True:
                 chunk = self.log_queue.get_nowait()
@@ -1940,9 +1984,9 @@ class _App:
                 if records is not None:
                     records.append(chunk)
                 if self._log_visible(chunk):
-                    self._append_to_log(self.log, chunk)
+                    self._append_to_log(self.log, chunk.text)
                     if self._log_popup_text is not None:
-                        self._append_to_log(self._log_popup_text, chunk)
+                        self._append_to_log(self._log_popup_text, chunk.text)
         except queue.Empty:
             pass
         try:
@@ -1952,9 +1996,9 @@ class _App:
                 if records is not None:
                     records.append(chunk)
                 if self._log_visible(chunk):
-                    self._append_to_log(self.download_log, chunk)
+                    self._append_to_log(self.download_log, chunk.text)
                     if self._download_popup_text is not None:
-                        self._append_to_log(self._download_popup_text, chunk)
+                        self._append_to_log(self._download_popup_text, chunk.text)
         except queue.Empty:
             pass
         self.root.after(100, self._drain_log)
@@ -2052,21 +2096,87 @@ class _App:
         manual = self.manual_var.get().strip()
         return manual or None
 
-    def _ask(self, prompt: str, secret: bool = False) -> str:
-        answer: dict[str, str | None] = {}
-        done = threading.Event()
+    def _show_login_prompt(self, prompt: str, secret: bool, submit):
+        # Do not use simpledialog.askstring: its nested Tk event loop is
+        # difficult to dismiss safely when another account or shutdown cancels.
+        win = self.tk.Toplevel(self.root)
+        win.title("Telegram")
+        win.transient(self.root)
+        win.resizable(False, False)
+        body = self.ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        self.ttk.Label(body, text=prompt, wraplength=420).pack(anchor="w", pady=(0, 8))
+        entry = self.ttk.Entry(body, show="*" if secret else "", width=36)
+        entry.pack(fill="x", pady=(0, 8))
+        buttons = self.ttk.Frame(body)
+        buttons.pack(anchor="e")
 
-        def ask_on_ui() -> None:
-            show = "*" if secret else ""
-            answer["value"] = self.simpledialog.askstring("Telegram", prompt, show=show, parent=self.root)
-            done.set()
+        def accept(_event=None):
+            value = entry.get()
+            entry.delete(0, "end")
+            submit(value)
 
-        self.root.after(0, ask_on_ui)
-        done.wait()
-        value = answer.get("value")
-        if value is None:
-            raise RuntimeError("已取消")
-        return value.strip()
+        def cancel(_event=None):
+            entry.delete(0, "end")
+            submit(None)
+
+        self.ttk.Button(buttons, text="取消", command=cancel).pack(side="left", padx=4)
+        self.ttk.Button(buttons, text="确定", command=accept).pack(side="left")
+        win.bind("<Return>", accept)
+        win.bind("<Escape>", cancel)
+        win.protocol("WM_DELETE_WINDOW", cancel)
+
+        def activate():
+            if win.winfo_exists():
+                win.grab_set()
+                entry.focus_set()
+
+        win.after_idle(activate)
+        return win
+
+    async def _ask(self, prompt: str, secret: bool = False) -> str:
+        # The dialog lives on Tk's thread. Only the account waiting for input
+        # suspends, and cancellation dismisses the dialog before the next opens.
+        async with self._prompt_lock:
+            if self._closing:
+                raise asyncio.CancelledError()
+            answer: concurrent.futures.Future[str | None] = concurrent.futures.Future()
+            window = None
+
+            def dismiss() -> None:
+                if window is not None and window.winfo_exists():
+                    window.destroy()
+
+            def finish(value: str | None) -> None:
+                dismiss()
+                try:
+                    answer.set_result(value)
+                except concurrent.futures.InvalidStateError:
+                    pass  # cancelled on the other thread
+
+            def ask_on_ui() -> None:
+                nonlocal window
+                if answer.done() or self._closing:
+                    finish(None)
+                    return
+                try:
+                    window = self._show_login_prompt(prompt, secret, finish)
+                except Exception as exc:
+                    try:
+                        answer.set_exception(exc)
+                    except concurrent.futures.InvalidStateError:
+                        pass
+
+            self.root.after(0, ask_on_ui)
+            try:
+                value = await asyncio.wrap_future(answer)
+            except asyncio.CancelledError:
+                answer.cancel()
+                self.root.after(0, dismiss)
+                raise
+            if value is None:
+                raise RuntimeError("已取消")
+            return value if secret else value.strip()
 
     def _run_task(self, coro, button) -> None:
         if button is not None:
@@ -2102,24 +2212,47 @@ class _App:
     async def _ensure_client(self):
         if self.client is not None:
             return self.client
-        settings = load_settings()
-        self.settings = settings
-        await self.client_start(settings)
-        me = await self.client.get_me()
-        if me is None:
-            raise RuntimeError("登录失败")
-        name = " ".join(p for p in (me.first_name, me.last_name) if p)
-        handle = f"@{me.username}" if me.username else ""
-        account_identity.update("default", me)
-        self.root.after(0, self._refresh_log_accounts)
-        print(f"已登录:{name} {handle}".strip())
-        self._set_status(f"已登录:{name} {handle}".strip())
-        return self.client
+        async with self._client_lock:
+            if self.client is not None:
+                return self.client
+            if self._closing:
+                raise asyncio.CancelledError()
 
-    async def client_start(self, settings) -> None:
-        self.client = build_client(settings)
-        await self.client.start(
-            phone=lambda: settings.phone or self._ask("手机号(带国际区号,如 +8613800138000):"),
+            # Initialization can yield to other workers while the user is
+            # entering a code. Only publish a fully authorized client.
+            self._client_starting_task = asyncio.current_task()
+            try:
+                settings = load_settings()
+                client = build_client(settings)
+                try:
+                    await self.client_start(client, settings)
+                    me = await client.get_me()
+                    if me is None:
+                        raise RuntimeError("登录失败")
+                except (asyncio.CancelledError, Exception):
+                    self._client_starting_cleanup = True
+                    await client.disconnect()
+                    raise
+                self.settings = settings
+                self.client = client
+            finally:
+                self._client_starting_task = None
+                self._client_starting_cleanup = False
+
+            name = " ".join(p for p in (me.first_name, me.last_name) if p)
+            handle = f"@{me.username}" if me.username else ""
+            account_identity.update("default", me)
+            self.root.after(0, self._refresh_log_accounts)
+            print(f"已登录:{name} {handle}".strip())
+            self._set_status(f"已登录:{name} {handle}".strip())
+            return client
+
+    async def client_start(self, client, settings):
+        async def ask_phone() -> str:
+            return validate_login_phone(await self._ask("手机号(带国际区号,如 +8613800138000):"))
+
+        await client.start(
+            phone=validate_login_phone(settings.phone) if settings.phone else ask_phone,
             code_callback=lambda: self._ask("Telegram 发来的验证码:"),
             password=lambda: self._ask("两步验证密码:", secret=True),
         )
@@ -2268,6 +2401,8 @@ class _App:
         self, target, types_raw, limit, concurrency, retries, chunk_concurrency,
         monitor_item=None,
     ) -> None:
+        if self._closing:
+            return
         if self._download_future is not None and not self._download_future.done():
             self._log("[定时] 上一次下载尚未结束，跳过本轮。\n")
             return
@@ -2441,8 +2576,9 @@ class _App:
                 since=None,
                 until=None,
                 keep_previews=not opts["no_previews"],
-                download_direct=not opts["catalog_only"],
-                download_torrents=not opts["catalog_only"] and not opts["no_bt"],
+                catalog_only=opts["catalog_only"],
+                download_torrents=not opts["no_bt"],
+                show_sensitive_details=False,
                 dry_run=opts["dry"],
             )
             await parse_channel(self.client, **kwargs)
@@ -2473,7 +2609,7 @@ class _App:
             else:
                 subprocess.Popen(["xdg-open", str(folder)])
         except Exception as exc:  # noqa: BLE001
-            self._log(f"[错误] 打不开文件夹:{exc}\n")
+            self._log_account(self._selected_view_account(), f"[错误] 打不开文件夹:{exc}\n")
 
     def _open_settings(self) -> None:
         settings_account_id = self._selected_view_account()
@@ -2482,19 +2618,23 @@ class _App:
         win.title("设置：Telegram API / SOCKS5 代理")
         win.transient(self.root)
         pad = {"padx": 8, "pady": 6}
+        path = self._account_registry.env_path(settings_account_id)
+        original = read_env_values(path)
         fields = (
-            ("api_id", self.api_id_var, False),
-            ("api_hash", self.api_hash_var, False),
-            ("SOCKS5 主机（留空则不用代理）", self.proxy_host_var, False),
-            ("SOCKS5 端口（例如 1080）", self.proxy_port_var, False),
-            ("代理用户名（可空）", self.proxy_username_var, False),
-            ("代理密码（可空）", self.proxy_password_var, True),
-            ("下载目录", self.download_dir_var, False),
-            ("分块临时目录（建议 SSD，留空=下载目录）", self.temp_download_dir_var, False),
+            ("api_id", "api_id", self.api_id_var, False),
+            ("api_hash", "api_hash", self.api_hash_var, True),
+            ("proxy_host", "SOCKS5 主机（留空则不用代理）", self.proxy_host_var, False),
+            ("proxy_port", "SOCKS5 端口（例如 1080）", self.proxy_port_var, False),
+            ("proxy_username", "代理用户名（可空）", self.proxy_username_var, False),
+            ("proxy_password", "代理密码（可空）", self.proxy_password_var, True),
+            ("download_dir", "下载目录", self.download_dir_var, False),
+            ("temp_download_dir", "分块临时目录（建议 SSD，留空=下载目录）", self.temp_download_dir_var, False),
         )
-        for row, (name, var, secret) in enumerate(fields):
-            ttk.Label(win, text=name).grid(row=row, column=0, sticky="w", **pad)
-            ttk.Entry(win, textvariable=var, width=43, show="*" if secret else "").grid(
+        draft = {key: tk.StringVar(master=win, value=original[key])
+                 for key, _label, _main_var, _secret in fields}
+        for row, (key, label, _main_var, secret) in enumerate(fields):
+            ttk.Label(win, text=label).grid(row=row, column=0, sticky="w", **pad)
+            ttk.Entry(win, textvariable=draft[key], width=43, show="*" if secret else "").grid(
                 row=row, column=1, sticky="we", **pad
             )
         ttk.Label(
@@ -2502,7 +2642,10 @@ class _App:
             text="SSD 缓存：最大 20 GiB，至少保留 10 GiB 可用空间；满额排队等待，不回退机械盘",
             foreground="#555",
         ).grid(row=len(fields), column=0, columnspan=2, sticky="w", **pad)
-        ttk.Button(win, text="检查并清理残留缓存", command=self._manual_cache_cleanup).grid(
+        ttk.Button(win, text="检查并清理残留缓存", command=lambda: self._manual_cache_cleanup(
+            draft["temp_download_dir"].get(), draft["download_dir"].get(),
+            owner_id=settings_account_id,
+        )).grid(
             row=len(fields) + 1, column=1, sticky="e", **pad
         )
 
@@ -2512,42 +2655,32 @@ class _App:
                     "账号已切换", "设置窗口对应的账号已切换，请关闭窗口后重新打开。"
                 )
                 return
-            host = self.proxy_host_var.get().strip()
-            port = self.proxy_port_var.get().strip()
-            if port and not host:
-                self.messagebox.showwarning("代理设置", "填写端口时必须填写 SOCKS5 主机。")
+            try:
+                values = read_env_values(path)
+                edits = {}
+                for key, var in draft.items():
+                    value = var.get()
+                    if value != original[key]:
+                        edits[key] = value if key == "proxy_password" else value.strip()
+                values.update(edits)
+                host, port = values["proxy_host"], values["proxy_port"]
+                if port and not host:
+                    raise ValueError("填写端口时必须填写 SOCKS5 主机。")
+                if host and not 1 <= int(port or "1080") <= 65535:
+                    raise ValueError("SOCKS5 端口必须在 1-65535 之间。")
+                if edits:
+                    update_env(values, path)
+            except (ValueError, OSError) as exc:
+                self.messagebox.showwarning("账号设置无效", str(exc))
                 return
-            if host:
-                try:
-                    port_number = int(port or "1080")
-                    if not 1 <= port_number <= 65535:
-                        raise ValueError
-                except ValueError:
-                    self.messagebox.showwarning("代理设置", "SOCKS5 端口必须在 1-65535 之间。")
-                    return
-                port = str(port_number)
-            else:
-                port = ""
-            path = self._account_registry.env_path(settings_account_id)
-            values = read_env_values(path)
-            values.update({
-                "api_id": self.api_id_var.get().strip(),
-                "api_hash": self.api_hash_var.get().strip(),
-                "phone": self.phone_var.get().strip(),
-                "download_dir": self.download_dir_var.get().strip() or str(default_download_dir()),
-                "temp_download_dir": self.temp_download_dir_var.get().strip(),
-                "proxy_host": host,
-                "proxy_port": port,
-                "proxy_username": self.proxy_username_var.get().strip(),
-                "proxy_password": self.proxy_password_var.get(),
-            })
-            update_env(values, path)
+            for key, _label, main_var, _secret in fields:
+                main_var.set(values[key])
             win.destroy()
             runtime = self._extra_runtimes.get(self._selected_view_account())
             if self.client is not None or (runtime is not None and runtime.client is not None):
                 self.messagebox.showinfo("设置已保存", "代理设置在重启下载器后生效。")
             else:
-                self._log("设置已保存。\n")
+                self._log_account(settings_account_id, "设置已保存。\n")
 
         ttk.Button(win, text="保存", command=save_and_close).grid(
             row=len(fields), column=1, sticky="e", **pad
@@ -2561,33 +2694,41 @@ class _App:
         path = Path(raw.strip()).expanduser()
         return path if path.is_absolute() else data_dir() / path
 
-    def _manual_cache_cleanup(self):
-        ssd_raw = self.temp_download_dir_var.get().strip()
-        hdd_raw = self.download_dir_var.get().strip()
+    def _manual_cache_cleanup(self, ssd_raw=None, hdd_raw=None, *, owner_id=None):
+        owner = self._selected_view_account() if owner_id is None else owner_id
+        if ssd_raw is None:
+            ssd_raw = self.temp_download_dir_var.get()
+        if hdd_raw is None:
+            hdd_raw = self.download_dir_var.get()
         ssd = self._cleanup_path(ssd_raw)
         hdd = self._cleanup_path(hdd_raw)
         # Work outside Tk's event loop: scanning a large HDD folder can block.
         def worker():
             report = inspect_cleanup(ssd, hdd)
             def finish():
-                self._log(report.summary() + "\n")
+                self._log_account(owner, report.summary() + "\n")
                 if report.legacy:
                     total = len(report.legacy)
+                    for path in report.legacy:
+                        self._log_account(owner, f"[缓存清理] 待确认：{path}\n")
                     confirmed = self.messagebox.askyesno(
                         "旧版临时文件",
                         f"发现 {total} 项没有所有权标记的旧临时文件。"
-                        "\n无法确认是否仍有旧版本进程在写入。"
-                        "\n请先确保旧版本已关闭。\n\n仍要清理这些文件吗？",
+                        "\n请先确认旧版本已关闭，并检查运行日志中列出的路径。"
+                        "\n\n仍要清理这些文件吗？",
+                        detail="\n".join(str(path) for path in report.legacy[:8]),
                     )
                     if confirmed:
-                        threading.Thread(target=legacy_worker, daemon=True).start()
+                        threading.Thread(
+                            target=legacy_worker, args=(set(report.legacy),), daemon=True,
+                        ).start()
                 for error in report.failed:
-                    self._log(f"[缓存清理] {error}\n")
+                    self._log_account(owner, f"[缓存清理] {error}\n")
             self.root.after(0, finish)
 
-        def legacy_worker():
-            result = inspect_cleanup(ssd, hdd, include_legacy=True)
-            self.root.after(0, lambda: self._log(result.summary() + "\n"))
+        def legacy_worker(approved):
+            result = inspect_cleanup(ssd, hdd, approved_legacy=approved)
+            self.root.after(0, lambda: self._log_account(owner, result.summary() + "\n"))
         threading.Thread(target=worker, daemon=True).start()
 
     def _cancel_current_download(self) -> None:
@@ -2617,10 +2758,19 @@ class _App:
     def _finish_close(self) -> None:
         if self._download_future is not None and not self._download_future.done():
             return
-        self._telethon_diag_uninstall()
-        sys.stdout, sys.stderr = self._stdout, self._stderr
+        if getattr(self, "_shutdown_started", False):
+            return
+        self._shutdown_started = True
 
         async def disconnect():
+            starting = getattr(self, "_client_starting_task", None)
+            if starting is not None and not starting.done():
+                # Task.cancelling() was added in Python 3.11. Also track
+                # our own disconnect on older versions, to avoid a second cancel.
+                if (not getattr(self, "_client_starting_cleanup", False)
+                        and not getattr(starting, "cancelling", lambda: 0)()):
+                    starting.cancel()
+                await asyncio.gather(starting, return_exceptions=True)
             # Cancellation can settle the thread-safe Future before the real
             # asyncio download task has removed its temporary chunk files.
             active = self._download_task
@@ -2643,7 +2793,9 @@ class _App:
                         await asyncio.wrap_future(future)
                     except (asyncio.CancelledError, Exception):
                         pass
-            # Stop all secondary account clients before stopping the loop.
+            # Secondary runtimes are interrupted through runtime.stop().
+            # These Futures are never cancelled from Tk, so completion means
+            # the async tasks have cleaned up and their clients disconnected.
             for extra in getattr(self, "_extra_futures", {}).values():
                 if not extra.done():
                     try:
@@ -2660,6 +2812,8 @@ class _App:
             self._destroy_after_disconnect()
 
     def _destroy_after_disconnect(self) -> None:
+        self._telethon_diag_uninstall()
+        sys.stdout, sys.stderr = self._stdout, self._stderr
         store = getattr(self, "_log_store", None)
         if store is not None:
             store.close()
@@ -2675,6 +2829,7 @@ class _App:
             runtime.active_count > 0 for runtime in getattr(self, "_extra_runtimes", {}).values()
         )
         busy = manual_busy or monitor_busy or extra_busy
+        decision = True
         if busy:
             decision = self.messagebox.askyesnocancel(
                 "安全退出",
@@ -2693,14 +2848,14 @@ class _App:
                 self.root.winfo_screenwidth(),
                 self.root.winfo_screenheight(),
             )
+        self._closing = True
         if self._monitor_active:
             self._monitor_start_stop()
         if self._auto_config is not None:
             self._stop_auto()
-        self._closing = True
         self._stop_download.set()
         for runtime in getattr(self, "_extra_runtimes", {}).values():
-            runtime.stop()
+            runtime.stop(cancel=not decision)
         if hasattr(self, "_monitor_scan_stop"):
             self._monitor_scan_stop.set()
         if hasattr(self, "_monitor_download_stop"):
@@ -2711,9 +2866,6 @@ class _App:
                     self._download_future.cancel()
                 if monitor_busy and self._monitor_download_future is not None:
                     self._monitor_download_future.cancel()
-                for extra in getattr(self, "_extra_futures", {}).values():
-                    if not extra.done():
-                        extra.cancel()
             self._log(
                 "[退出] 等待当前已开始的文件完成后关闭\n"
                 if decision else "[退出] 正在取消下载\n"

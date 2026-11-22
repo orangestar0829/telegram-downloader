@@ -94,7 +94,7 @@ def test_reservation_releases_after_exception(tmp_path, monkeypatch):
 
 def test_orphaned_temp_file_counts_against_capacity(tmp_path, monkeypatch):
     budget = cache_budget._CacheBudget(capacity=10, reserve=0)
-    orphan = tmp_path / "tgdl-old-leftover"
+    orphan = tmp_path / "tgdl-abc123_a"
     orphan.mkdir()
     (orphan / "data.mp4").write_bytes(b"x" * 9)
     monkeypatch.setattr(cache_budget.shutil, "disk_usage", lambda _: SimpleNamespace(free=100))
@@ -136,3 +136,18 @@ def test_lease_untracks_only_its_own_directory(tmp_path, monkeypatch):
 
     asyncio.run(run())
     cache_budget._budgets.clear()
+
+def test_regular_media_under_staging_root_does_not_consume_cache(tmp_path, monkeypatch):
+    budget = cache_budget._CacheBudget(capacity=10, reserve=0)
+    for relative in ("tgdl-by-peer/123/videos", "tgdl-news/videos", "tgdl-abcdefgh/videos"):
+        folder = tmp_path / relative
+        folder.mkdir(parents=True)
+        (folder / "video.mp4").write_bytes(b"x" * 17)
+    monkeypatch.setattr(cache_budget.shutil, "disk_usage", lambda _: SimpleNamespace(free=100))
+
+    async def run():
+        await asyncio.wait_for(budget.acquire(tmp_path, 2), timeout=1)
+        assert budget.active_bytes == 2
+        await budget.release(2)
+
+    asyncio.run(run())

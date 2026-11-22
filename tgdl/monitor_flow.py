@@ -159,15 +159,20 @@ async def monitor_download_document(
         handle.truncate(size)
     next_window = 0
     returned_ranges: deque[tuple[int, int]] = deque()
+    in_flight = 0
 
     async def worker(lane: int) -> None:
-        nonlocal next_window
+        nonlocal next_window, in_flight
         while True:
-            if lane >= flow.chunks():
-                if next_window >= size and not returned_ranges:
-                    return
+            if next_window >= size and not returned_ranges and not in_flight:
+                return
+            if (lane >= flow.chunks()
+                    or (next_window >= size and not returned_ranges)):
+                # A slower lane may still return an unfinished range when
+                # the limit drops. Do not let its replacement exit early.
                 await asyncio.sleep(0.1)
                 continue
+            owns_window = False
             flow.pause.register()
             try:
                 await flow.pause.checkpoint()
@@ -178,9 +183,11 @@ async def monitor_download_document(
                 else:
                     start = next_window
                     if start >= size:
-                        return
+                        continue
                     end = min(size, start + WINDOW_BYTES)
                     next_window = end
+                in_flight += 1
+                owns_window = True
                 position = start
                 handed_off = False
                 for attempt in range(CHUNK_RETRIES + 1):
@@ -235,6 +242,8 @@ async def monitor_download_document(
                 if position != end and not handed_off:
                     raise ChunkDownloadStalled(f"Incomplete monitor window {position} != {end}")
             finally:
+                if owns_window:
+                    in_flight -= 1
                 flow.pause.unregister()
 
     tasks = [asyncio.create_task(worker(i)) for i in range(8)]

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from tgdl.channels import format_dialog, list_media_dialogs
 from tgdl.client import build_client, ensure_login
-from tgdl.config import load_settings
+from tgdl.config import Settings, load_settings
 from tgdl.downloader import ALL_TYPES, PHOTO_TYPES, download_channel
+from tgdl.errors import TGDLInputError
 from tgdl.parser import parse_channel
 
 
@@ -101,10 +103,10 @@ def parse_types(raw: str) -> set[str]:
         if not key:
             continue
         if key not in mapping:
-            raise SystemExit(f"Unknown type '{part}'. Use photo, video, animation, or all.")
+            raise TGDLInputError(f"Unknown type '{part}'. Use photo, video, animation, or all.")
         selected |= mapping[key]
     if not selected:
-        raise SystemExit("Choose at least one media type.")
+        raise TGDLInputError("Choose at least one media type.")
     return selected
 
 
@@ -114,25 +116,33 @@ def parse_day(raw: str | None, end_of_day: bool = False) -> datetime | None:
     try:
         day = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except ValueError as exc:
-        raise SystemExit("Dates must be YYYY-MM-DD") from exc
+        raise TGDLInputError("Dates must be YYYY-MM-DD") from exc
     if end_of_day:
         return day.replace(hour=23, minute=59, second=59)
     return day
 
 
+@asynccontextmanager
+async def _authenticated_client(settings: Settings):
+    # Telethon.__aenter__ calls start() before the app can supply a configured
+    # phone. Authenticate exactly once here, including for existing sessions.
+    client = build_client(settings)
+    try:
+        await ensure_login(client, settings.phone)
+        yield client
+    finally:
+        await client.disconnect()
+
+
 async def cmd_login() -> None:
     settings = load_settings()
-    client = build_client(settings)
-    async with client:
-        await ensure_login(client, settings.phone)
+    async with _authenticated_client(settings):
         print("Session saved. Next: python -m tgdl list")
 
 
 async def cmd_list() -> None:
     settings = load_settings()
-    client = build_client(settings)
-    async with client:
-        await ensure_login(client, settings.phone)
+    async with _authenticated_client(settings) as client:
         items = await list_media_dialogs(client)
         if not items:
             print("No channels or groups found.")
@@ -146,9 +156,7 @@ async def cmd_list() -> None:
 
 async def cmd_download(args: argparse.Namespace) -> None:
     settings = load_settings()
-    client = build_client(settings)
-    async with client:
-        await ensure_login(client, settings.phone)
+    async with _authenticated_client(settings) as client:
         await download_channel(
             client,
             target=args.channel,
@@ -168,9 +176,7 @@ async def cmd_download(args: argparse.Namespace) -> None:
 
 async def cmd_parse(args: argparse.Namespace) -> None:
     settings = load_settings()
-    client = build_client(settings)
-    async with client:
-        await ensure_login(client, settings.phone)
+    async with _authenticated_client(settings) as client:
         await parse_channel(
             client,
             target=args.channel,
@@ -179,8 +185,8 @@ async def cmd_parse(args: argparse.Namespace) -> None:
             since=parse_day(args.since),
             until=parse_day(args.until, end_of_day=True),
             keep_previews=not args.no_previews,
-            download_direct=not args.catalog_only,
-            download_torrents=not args.catalog_only and not args.no_bt,
+            catalog_only=args.catalog_only,
+            download_torrents=not args.no_bt,
             dry_run=args.dry_run,
         )
 
@@ -200,7 +206,7 @@ async def cmd_menu() -> None:
     elif choice == "3":
         channel = input("Channel id / @username / invite link: ").strip()
         if not channel:
-            raise SystemExit("Channel is required.")
+            raise TGDLInputError("Channel is required.")
         media_type = input("Types [photo,video]: ").strip() or "photo,video"
         limit_raw = input("Limit empty=all: ").strip()
         args = argparse.Namespace(
@@ -216,7 +222,7 @@ async def cmd_menu() -> None:
     elif choice == "4":
         channel = input("Channel id / @username / invite link: ").strip()
         if not channel:
-            raise SystemExit("Channel is required.")
+            raise TGDLInputError("Channel is required.")
         limit_raw = input("Max messages empty=all: ").strip()
         args = argparse.Namespace(
             channel=channel,
@@ -232,12 +238,19 @@ async def cmd_menu() -> None:
     elif choice in {"0", ""}:
         return
     else:
-        raise SystemExit("Unknown choice.")
+        raise TGDLInputError("Unknown choice.")
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    try:
+        _run_command(parser, args)
+    except TGDLInputError as exc:
+        raise SystemExit(str(exc)) from None
+
+
+def _run_command(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     if args.command == "gui":
         from tgdl.gui import run_gui
 

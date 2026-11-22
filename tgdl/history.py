@@ -83,6 +83,17 @@ class DownloadHistory:
                 )"""
             )
             self._connection.execute(
+                """CREATE TABLE IF NOT EXISTS legacy_basic_pending_media (
+                    peer_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    target TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    base TEXT NOT NULL,
+                    PRIMARY KEY (peer_id, message_id)
+                )"""
+            )
+            self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS pending_media_target ON pending_media (target)"
             )
             self._connection.execute(
@@ -170,7 +181,26 @@ class DownloadHistory:
             (item.peer_id, item.message_id, item.target, item.title,
              item.kind, item.base, item.peer_id, item.message_id),
         )
-        return cursor.rowcount
+        if cursor.rowcount or item.peer_id <= 0 or item.target == f"-{item.peer_id}":
+            return cursor.rowcount
+
+        # An untyped legacy basic-group row can occupy the positive key of
+        # a Channel with the same raw ID. Archive specifically identifiable
+        # rows before replacing them; do not guess about ambiguous old IDs.
+        archived = self._connection.execute(
+            """INSERT OR IGNORE INTO legacy_basic_pending_media
+               SELECT peer_id,message_id,target,title,kind,base FROM pending_media
+               WHERE peer_id=? AND message_id=? AND target=('-'||peer_id)
+               AND NOT EXISTS (SELECT 1 FROM downloaded_media WHERE peer_id=? AND message_id=?)""",
+            (item.peer_id, item.message_id, item.peer_id, item.message_id),
+        )
+        if archived.rowcount:
+            self._connection.execute(
+                """UPDATE pending_media SET target=?,title=?,kind=?,base=?
+                   WHERE peer_id=? AND message_id=?""",
+                (item.target, item.title, item.kind, item.base, item.peer_id, item.message_id),
+            )
+        return archived.rowcount
 
     def enqueue_media(self, items: list[PendingMedia]) -> int:
         with self._lock, self._connection:
@@ -218,6 +248,9 @@ class DownloadHistory:
                        FROM pending_media WHERE target=? ORDER BY rowid LIMIT ?""",
                     (target, limit),
                 )]
+        # An old positive-ID row whose target explicitly uses the marked
+        # basic-chat ID belongs to the old Chat namespace, not a Channel.
+        # Leave it in the DB for rollback, but do not dispatch it.
         now = time.time()
         if kinds is not None and not kinds:
             return []
@@ -226,6 +259,7 @@ class DownloadHistory:
             return [PendingMedia(*row) for row in self._connection.execute(
                 """SELECT p.peer_id,p.message_id,p.target,p.title,p.kind,p.base
                    FROM pending_media p WHERE p.target=?
+                   AND NOT (p.peer_id>0 AND p.target=('-'||p.peer_id))
                    AND (?='' OR p.kind='' OR instr(','||?||',', ','||p.kind||',')>0)
                    AND NOT EXISTS (SELECT 1 FROM downloaded_media d
                        WHERE d.peer_id=p.peer_id AND d.message_id=p.message_id)
@@ -251,6 +285,7 @@ class DownloadHistory:
             return [PendingMedia(*row) for row in self._connection.execute(
                 """SELECT p.peer_id,p.message_id,p.target,p.title,p.kind,p.base
                    FROM pending_media p WHERE p.peer_id=?
+                   AND NOT (p.peer_id>0 AND p.target=('-'||p.peer_id))
                    AND (?='' OR p.kind='' OR instr(','||?||',', ','||p.kind||',')>0)
                    AND NOT EXISTS (SELECT 1 FROM downloaded_media d
                        WHERE d.peer_id=p.peer_id AND d.message_id=p.message_id)
@@ -275,7 +310,8 @@ class DownloadHistory:
             result = self._connection.execute(
                 """INSERT INTO download_claims(peer_id,message_id,account_id,expires_at)
                    SELECT ?,?,?,? WHERE
-                     EXISTS (SELECT 1 FROM pending_media WHERE peer_id=? AND message_id=?)
+                     EXISTS (SELECT 1 FROM pending_media WHERE peer_id=? AND message_id=?
+                             AND NOT (peer_id>0 AND target=('-'||peer_id)))
                      AND NOT EXISTS (SELECT 1 FROM downloaded_media
                                      WHERE peer_id=? AND message_id=?)
                      AND NOT EXISTS (SELECT 1 FROM account_attempt_backoff

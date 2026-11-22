@@ -5,6 +5,7 @@ import pytest
 
 from tgdl import config, paths
 from tgdl.accounts import AccountRegistry
+from tgdl.errors import TGDLInputError
 from tgdl.config import load_settings, read_env_values, update_env
 
 
@@ -80,7 +81,7 @@ def test_b_account_missing_credentials_does_not_read_default(tmp_path, monkeypat
     update_env({"api_id": "", "api_hash": "", "download_dir": "./download"}, b)
     monkeypatch.setattr(config, "ENV_PATH", a)
     monkeypatch.setattr(config, "_bundled_defaults", lambda: None)
-    with pytest.raises(SystemExit, match="Missing TELEGRAM_API_ID"):
+    with pytest.raises(TGDLInputError, match="Missing TELEGRAM_API_ID"):
         load_settings(env_path=b)
 
 

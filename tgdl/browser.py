@@ -20,7 +20,7 @@ from tgdl.downloader import (
     DownloadStats,
     download_many,
     classify_message,
-    safe_name,
+    peer_download_folder,
 )
 
 
@@ -88,16 +88,13 @@ async def list_media(
     return items
 
 
-def _folder_for(download_dir: Path, title: str) -> Path:
-    return Path(download_dir) / safe_name(str(title))
-
-
 async def save_items(
     client,
     items: Iterable[MediaItem],
     *,
     download_dir: Path,
     title: str,
+    entity: object,
     skip_existing: bool = True,
     concurrency: int = 3,
     retries: int = 2,
@@ -106,7 +103,7 @@ async def save_items(
     on_progress: ProgressCallback | None = None,
 ) -> SaveResult:
     """Download the full-quality files for the selected media items."""
-    folder = _folder_for(download_dir, title)
+    folder = peer_download_folder(download_dir, title, entity)
     photos = folder / "photos"
     videos = folder / "videos"
     photos.mkdir(parents=True, exist_ok=True)
