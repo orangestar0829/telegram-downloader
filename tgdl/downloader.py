@@ -56,6 +56,7 @@ from tgdl.monitor_flow import MonitorFlow, monitor_download_document
 from tgdl.cache_budget import optional_staging_reservation
 from tgdl.errors import ChannelAccessError
 from tgdl.history import DownloadHistory, PendingMedia
+from tgdl.paths import data_dir
 from tgdl.progress import ProgressCallback, TransferProgress
 from tgdl.temp_cleanup import PEER_DOWNLOADS_DIR, is_link_or_reparse_point, own_temporary
 
@@ -303,7 +304,31 @@ def _real_folders(root: Path) -> list[Path]:
     return sorted(p for p in root.iterdir() if not is_link_or_reparse_point(p) and p.is_dir())
 
 
-def _select_peer_folder(root: Path, key: str, label: str, owned: set[str]) -> Path:
+def _legacy_folder_owners(folder: Path) -> set[int]:
+    """Read the original destination ledger, not the legacy filename."""
+    history = data_dir() / "tgdl_download_history.sqlite3"
+    if not history.is_file():
+        return set()
+    prefixes = {p.as_posix().rstrip("/") + "/" for p in (folder, folder.absolute())}
+    expression = "replace(original_path, char(92), '/')"
+    with closing(sqlite3.connect(history.absolute().as_uri() + "?mode=ro",
+                                 uri=True, timeout=10)) as db:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='downloaded_media'").fetchone():
+            return set()
+        owners = set()
+        for prefix in prefixes:
+            for owner, original in db.execute(
+                f"SELECT peer_id, original_path FROM downloaded_media "
+                f"WHERE substr({expression}, 1, ?) = ? COLLATE NOCASE",
+                (len(prefix), prefix),
+            ):
+                relative = original.replace(chr(92), "/")[len(prefix):]
+                if relative.partition("/")[0].casefold() in {"photos", "videos"}:
+                    owners.add(int(owner))
+        return owners
+
+
+def _select_peer_folder(root: Path, key: str, label: str, owned: set[str], peer: int) -> Path:
     namespace = root / PEER_DOWNLOADS_DIR
     if is_link_or_reparse_point(namespace):
         raise OSError(f"Refusing to use linked peer download namespace: {namespace}")
@@ -324,10 +349,20 @@ def _select_peer_folder(root: Path, key: str, label: str, owned: set[str]) -> Pa
         candidates = [
             p for p in _real_folders(root)
             if p.name != PEER_DOWNLOADS_DIR and p.name.casefold() not in owned
-            and _legacy_label_key(p.name) in label_keys - ambiguous
+            and _legacy_label_key(p.name) in label_keys
         ]
-        if len(candidates) == 1:
-            return candidates[0]
+        verified = []
+        plausible = []
+        for candidate in candidates:
+            owners = _legacy_folder_owners(candidate)
+            if owners == {peer} and "_" not in key:
+                verified.append(candidate)
+            elif not owners and keyed and _legacy_label_key(candidate.name) not in ambiguous:
+                plausible.append(candidate)
+        if len(verified) == 1:
+            return verified[0]
+        if not verified and len(plausible) == 1:
+            return plausible[0]
     if keyed:
         return keyed[0]
     existing_names = {p.name.casefold() for p in root.iterdir()} if root.is_dir() else set()
@@ -355,11 +390,13 @@ def peer_download_folder(download_dir: Path, title: str, entity: object, *,
     root = Path(download_dir)
     key = download_peer_key(entity, account_id=account_id)
     label = _folder_label(title)
+    peer = getattr(entity, "id", getattr(entity, "channel_id", None))
+    ledger_peer = int(peer) if peer is not None else 0
     index = root / _FOLDER_INDEX
     if is_link_or_reparse_point(root) or is_link_or_reparse_point(index):
         raise OSError(f"Refusing to use linked download directory or index: {root}")
     if not create and not index.is_file():
-        folder = _select_peer_folder(root, key, label, set())
+        folder = _select_peer_folder(root, key, label, set(), ledger_peer)
         _check_download_folder(root, folder)
         return folder
 
@@ -380,7 +417,7 @@ def peer_download_folder(download_dir: Path, title: str, entity: object, *,
         relative = bindings.get(key)
         if relative is None:
             owned = {Path(path).parts[0].casefold() for path in bindings.values() if Path(path).parts}
-            folder = _select_peer_folder(root, key, label, owned)
+            folder = _select_peer_folder(root, key, label, owned, ledger_peer)
         else:
             relative = Path(relative)
             parts = relative.parts

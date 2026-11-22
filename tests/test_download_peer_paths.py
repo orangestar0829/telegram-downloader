@@ -11,12 +11,16 @@ from tgdl.downloader import DownloadStats, _download_one, peer_download_folder
 from tgdl.history import DownloadHistory
 
 
-def test_same_title_and_message_id_are_kept_separate(tmp_path):
+def test_same_title_and_message_id_are_kept_separate(tmp_path, monkeypatch):
+    monkeypatch.setattr("tgdl.downloader.data_dir", lambda: tmp_path)
     legacy = tmp_path / "Shared" / "videos"
     legacy.mkdir(parents=True)
     (legacy / "20260101_1.mp4").write_bytes(b"legacy unverified")
-    first = peer_download_folder(tmp_path, "Shared", PeerChannel(100)) / "videos"
+    history = DownloadHistory(tmp_path / "tgdl_download_history.sqlite3")
+    history.mark_saved(100, 1, "videos", legacy / "20260101_1.mp4")
+    # Resolve the wrong same-title channel first: it must not take A's folder.
     second = peer_download_folder(tmp_path, "Shared", PeerChannel(200)) / "videos"
+    first = peer_download_folder(tmp_path, "Shared", PeerChannel(100)) / "videos"
     assert first == legacy
     assert first != second
     client = SimpleNamespace()
@@ -27,7 +31,6 @@ def test_same_title_and_message_id_are_kept_separate(tmp_path):
         return path
 
     client.download_media = download_media
-    history = DownloadHistory(tmp_path / "history.sqlite3")
     try:
         stats = DownloadStats()
         saved = asyncio.run(_download_one(
@@ -76,6 +79,7 @@ def test_restore_original_upload_directory_for_all_accounts(tmp_path):
 def test_upgrade_can_match_legacy_windows_punctuation(tmp_path):
     old = tmp_path / "stripchat ｜ ST站 ｜ 直播录屏"
     old.mkdir()
+    (tmp_path / "tgdl-by-peer" / "-1000000000100 - stripchat _ ST站 _ 直播录屏").mkdir(parents=True)
     assert peer_download_folder(tmp_path, "stripchat | ST站 | 直播录屏", PeerChannel(100)) == old
 
 
@@ -101,9 +105,17 @@ def test_ambiguous_legacy_folder_does_not_merge_known_peers(tmp_path):
 def test_malicious_linked_media_subfolder_not_used(tmp_path):
     direct = tmp_path / "Shared"
     direct.mkdir()
+    (tmp_path / "tgdl-by-peer" / "-1000000000100 - Shared").mkdir(parents=True)
     try:
         (direct / "videos").symlink_to(tmp_path, target_is_directory=True)
     except OSError:
         pytest.skip("Creating symlinks is not permitted")
     with pytest.raises(OSError, match="linked download folder"):
         peer_download_folder(tmp_path, "Shared", PeerChannel(100))
+
+
+def test_legacy_directory_without_ownership_evidence_is_not_reused(tmp_path, monkeypatch):
+    monkeypatch.setattr("tgdl.downloader.data_dir", lambda: tmp_path)
+    old = tmp_path / "Shared"
+    old.mkdir()
+    assert peer_download_folder(tmp_path, "Shared", PeerChannel(100)) != old
