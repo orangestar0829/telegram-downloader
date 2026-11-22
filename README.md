@@ -179,11 +179,11 @@ run.cmd download --channel -1001234567890 --since 2026-01-01 --until 2026-08-01
 文件保存在：
 
 ```text
-downloads/tgdl-by-peer/频道ID - 频道名/photos/
-downloads/tgdl-by-peer/频道ID - 频道名/videos/
+downloads/频道名/photos/
+downloads/频道名/videos/
 ```
 
-新版按 Telegram 聊天 ID 区分保存目录；同名频道不再共用文件夹，频道改名也继续使用已有目录。旧的仅以名称区分的目录和 SQLite 下载记录保持不变。为避免把其他频道的文件误认成已下载，程序不会按旧目录的文件名推断归属；没有 SQLite 记录的旧媒体可能会重新下载。
+同一下载根目录内，同一 Telegram 频道在不同账号下共用同一个目录。程序优先沿用能唯一匹配的原频道目录，并按频道 ID 保存对应关系；频道改名不换目录，两个同名频道不会共用。若只有之前预览版的 `tgdl-by-peer` 目录，则沿用它。程序不会搬动或删除已下载文件，也不清空原下载记录。
 
 文件名：`日期_消息ID.扩展名`
 
@@ -236,11 +236,11 @@ run.cmd parse --channel -1001234567890 --no-bt
 输出目录：
 
 ```text
-downloads/tgdl-by-peer/频道ID - 频道名/photos/
-downloads/tgdl-by-peer/频道ID - 频道名/videos/
-downloads/tgdl-by-peer/频道ID - 频道名/parsed/direct/
-downloads/tgdl-by-peer/频道ID - 频道名/parsed/torrents/
-downloads/tgdl-by-peer/频道ID - 频道名/parsed/links.md
+downloads/频道名/photos/
+downloads/频道名/videos/
+downloads/频道名/parsed/direct/
+downloads/频道名/parsed/torrents/
+downloads/频道名/parsed/links.md
 ```
 
 资源群 / 链接预览也会扫到：

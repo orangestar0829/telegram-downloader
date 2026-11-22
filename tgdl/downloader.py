@@ -4,10 +4,13 @@ import asyncio
 import errno
 import os
 import re
+import sqlite3
 import stat
 import tempfile
 import time
 import threading
+import unicodedata
+from contextlib import closing
 from collections.abc import AsyncIterable
 from collections.abc import Callable
 from datetime import datetime, timezone
@@ -274,23 +277,127 @@ def download_peer_key(entity: object, *, account_id: str = "default") -> str:
     return str(peer_id)
 
 
+_FOLDER_INDEX = ".tgdl-channel-folders.sqlite3"
+_PEER_FOLDER_NAME = re.compile(r"(.+?) - (.+)")
+_RESERVED_FOLDER = re.compile(r"(?:CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)", re.I)
+
+
+def _folder_label(title: str) -> str:
+    label = safe_name(str(title)).rstrip(". ") or "channel"
+    if (_RESERVED_FOLDER.match(label)
+            or label.casefold() in {PEER_DOWNLOADS_DIR, _FOLDER_INDEX}):
+        return f"_{label}"
+    return label
+
+
+def _legacy_label_key(label: str) -> str:
+    # Older Windows releases sometimes used full-width equivalents for
+    # punctuation. Ignore spacing around parentheses, not arbitrary spaces.
+    label = safe_name(unicodedata.normalize("NFKC", label)).rstrip(". ").casefold()
+    return re.sub(r"\s*([()])\s*", r"\1", label)
+
+
+def _real_folders(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.iterdir() if not is_link_or_reparse_point(p) and p.is_dir())
+
+
+def _select_peer_folder(root: Path, key: str, label: str, owned: set[str]) -> Path:
+    namespace = root / PEER_DOWNLOADS_DIR
+    if is_link_or_reparse_point(namespace):
+        raise OSError(f"Refusing to use linked peer download namespace: {namespace}")
+    peer_folders = _real_folders(namespace)
+    prefix = f"{key} - "
+    keyed = [p for p in peer_folders if p.name.startswith(prefix)]
+    if keyed or "_" not in key:
+        # Prefer the old flat directory when the preview already associated
+        # this title with this ID (including titles the channel used before).
+        # Never auto-claim a title shared by several known peer IDs.
+        labels = {label, *(p.name[len(prefix):] for p in keyed)}
+        label_keys = {_legacy_label_key(name) for name in labels}
+        ambiguous = set()
+        for path in peer_folders:
+            m = _PEER_FOLDER_NAME.fullmatch(path.name)
+            if m and m[1] != key:
+                ambiguous.add(_legacy_label_key(m[2]))
+        candidates = [
+            p for p in _real_folders(root)
+            if p.name != PEER_DOWNLOADS_DIR and p.name.casefold() not in owned
+            and _legacy_label_key(p.name) in label_keys - ambiguous
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+    if keyed:
+        return keyed[0]
+    existing_names = {p.name.casefold() for p in root.iterdir()} if root.is_dir() else set()
+    if label.casefold() not in owned | existing_names:
+        return root / label
+    for i in range(10_000):
+        name = f"{label} - {key}" + (f"_{i}" if i else "")
+        if name.casefold() not in owned | existing_names:
+            return root / name
+    raise OSError(f"Cannot find a free download folder for {key}")
+
+
+def _check_download_folder(root: Path, folder: Path) -> None:
+    if is_link_or_reparse_point(root) or (
+        folder.parent != root and is_link_or_reparse_point(folder.parent)
+    ) or any(is_link_or_reparse_point(path) for path in (
+        folder, folder / "photos", folder / "videos", folder / "parsed",
+    )):
+        raise OSError(f"Refusing to use linked download folder: {folder}")
+
+
 def peer_download_folder(download_dir: Path, title: str, entity: object, *,
                          account_id: str = "default", create: bool = True) -> Path:
-    """Keep legacy title-only folders separate and reuse a peer folder after renames."""
-    root = Path(download_dir) / PEER_DOWNLOADS_DIR
-    prefix = f"{download_peer_key(entity, account_id=account_id)} - "
-    if is_link_or_reparse_point(root):
-        raise OSError(f"Refusing to use linked peer download namespace: {root}")
-    for existing in sorted(root.glob(f"{prefix}*")):
-        if not is_link_or_reparse_point(existing) and existing.is_dir():
-            return existing
-    label = safe_name(str(title)).rstrip(". ") or "channel"
-    folder = root / f"{prefix}{label}"
-    if is_link_or_reparse_point(folder):
-        raise OSError(f"Refusing to use linked peer download folder: {folder}")
+    """Persist one folder per peer under a shared download root."""
+    root = Path(download_dir)
+    key = download_peer_key(entity, account_id=account_id)
+    label = _folder_label(title)
+    index = root / _FOLDER_INDEX
+    if is_link_or_reparse_point(root) or is_link_or_reparse_point(index):
+        raise OSError(f"Refusing to use linked download directory or index: {root}")
+    if not create and not index.is_file():
+        folder = _select_peer_folder(root, key, label, set())
+        _check_download_folder(root, folder)
+        return folder
+
     if create:
-        folder.mkdir(parents=True, exist_ok=True)
-    return folder
+        root.mkdir(parents=True, exist_ok=True)
+    # BEGIN IMMEDIATE serializes the first assignment even across processes.
+    location = str(index) if create else index.absolute().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(location, uri=not create, timeout=10)) as db, db:
+        if create:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("""CREATE TABLE IF NOT EXISTS folders (
+                peer_key TEXT PRIMARY KEY, relative_path TEXT NOT NULL UNIQUE
+            )""")
+        has_table = create or db.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='folders'"
+        ).fetchone()
+        bindings = dict(db.execute("SELECT peer_key, relative_path FROM folders")) if has_table else {}
+        relative = bindings.get(key)
+        if relative is None:
+            owned = {Path(path).parts[0].casefold() for path in bindings.values() if Path(path).parts}
+            folder = _select_peer_folder(root, key, label, owned)
+        else:
+            relative = Path(relative)
+            parts = relative.parts
+            if relative.anchor or not parts or any(
+                p in (".", "..") or ":" in p or "\\" in p for p in parts
+            ) or (
+                len(parts) != 1 and (len(parts) != 2 or parts[0] != PEER_DOWNLOADS_DIR
+                                     or not parts[1].startswith(f"{key} - "))
+            ):
+                raise ValueError(f"Invalid saved download directory for {key}")
+            folder = root / relative
+        _check_download_folder(root, folder)
+        if create:
+            folder.mkdir(parents=True, exist_ok=True)
+            if relative is None:
+                db.execute("INSERT INTO folders VALUES (?, ?)", (key, str(folder.relative_to(root))))
+        return folder
 
 
 def unique_path(path: Path) -> Path:

@@ -52,7 +52,7 @@ def test_catalog_only_never_downloads_linked_posts_previews_or_http(tmp_path, mo
     path = next(tmp_path.rglob("links.jsonl"))
     records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     assert all(not record["downloaded"] for record in records)
-    assert sorted(p.name for p in tmp_path.rglob("*") if p.is_file()) == ["links.jsonl", "links.md"]
+    assert sorted(p.name for p in path.parent.rglob("*") if p.is_file()) == ["links.jsonl", "links.md"]
 
 
 def test_gui_dry_run_does_not_print_captions_or_urls(tmp_path, monkeypatch, capsys):

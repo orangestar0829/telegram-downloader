@@ -84,6 +84,6 @@ def test_save_items_writes_selected(tmp_path: Path) -> None:
         )
     )
     assert result.saved == 2
-    folder = tmp_path / "tgdl-by-peer" / "-1000000000042 - My Chat"
+    folder = tmp_path / "My Chat"
     saved = list((folder / "photos").glob("*")) + list((folder / "videos").glob("*"))
     assert len(saved) == 2
