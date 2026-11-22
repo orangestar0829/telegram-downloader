@@ -29,6 +29,7 @@ from tgdl.log_store import DailyLogStore
 
 from tgdl.browser import list_media, save_items
 from tgdl.channels import list_media_dialogs
+from tgdl.dialog_filter import filter_dialogs
 from tgdl.client import build_client
 from tgdl.config import (
     Settings,
@@ -365,6 +366,20 @@ class _App:
         # Your chats.
         chats = ttk.LabelFrame(main_panel, text="我的群组 / 频道(登录后自动加载)")
         chats.pack(fill="both", expand=True, **pad)
+        self._dialog_rows: list[tuple[str, str, str, str]] = []
+        self.dialog_search_var = tk.StringVar()
+        search_row = ttk.Frame(chats)
+        search_row.pack(side="top", fill="x", padx=6, pady=(4, 0))
+        ttk.Label(search_row, text="筛选群组/频道").pack(side="left", padx=(0, 6))
+        ttk.Entry(search_row, textvariable=self.dialog_search_var, width=38).pack(
+            side="left", fill="x", expand=True
+        )
+        ttk.Button(search_row, text="清空", command=lambda: self.dialog_search_var.set("")).pack(
+            side="left", padx=6
+        )
+        self.dialog_search_count = tk.StringVar(value="")
+        ttk.Label(search_row, textvariable=self.dialog_search_count).pack(side="left")
+        self.dialog_search_var.trace_add("write", lambda *_: self._filter_dialog_tree())
         cols = ("id", "kind", "name")
         self.tree = ttk.Treeview(chats, columns=cols, show="headings", height=5, selectmode="browse")
         self.tree.heading("id", text="ID")
@@ -1831,12 +1846,14 @@ class _App:
 
     async def _load_dialogs(self) -> None:
         items = await list_media_dialogs(self.client)
-        rows = [(str(it.entity_id), it.kind, it.title) for it in items]
+        rows = [
+            (str(it.entity_id), it.kind, it.title, it.username or "")
+            for it in items
+        ]
 
         def apply():
-            self.tree.delete(*self.tree.get_children())
-            for row in rows:
-                self.tree.insert("", "end", values=row)
+            self._dialog_rows = rows
+            self._filter_dialog_tree()
             names = {str(row[0]): str(row[2]) for row in rows if row[2]}
             changed = False
             for item in self._monitored:
@@ -1850,6 +1867,20 @@ class _App:
 
         self.root.after(0, apply)
         print(f"已加载 {len(rows)} 个群组/频道。点选一个,然后『下载所选』。")
+
+    def _filter_dialog_tree(self) -> None:
+        rows = getattr(self, "_dialog_rows", [])
+        keyword = self.dialog_search_var.get()
+        selected = self.tree.selection()
+        chosen = str(self.tree.item(selected[0], "values")[0]) if selected else None
+        visible = filter_dialogs(rows, keyword)
+        self.tree.delete(*self.tree.get_children())
+        for row in visible:
+            iid = str(row[0])
+            self.tree.insert("", "end", iid=iid, values=row[:3])
+            if iid == chosen:
+                self.tree.selection_set(iid)
+        self.dialog_search_count.set(f"{len(visible)} / {len(rows)}")
 
     def _types_string(self) -> str:
         return ",".join(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from tgdl.accounts import DEFAULT_ACCOUNT
+from tgdl.dialog_filter import filter_dialogs
 from tgdl.config import read_env_values, update_env
 from tgdl.monitor import load_channels, save_channels
 
@@ -374,14 +375,32 @@ class AccountWindow:
         win = self.tk.Toplevel(self.win)
         win.title("该账号已加入的 Telegram 频道 / 群组")
         win.geometry("620x460")
+        keyword = self.tk.StringVar()
+        controls = self.ttk.Frame(win)
+        controls.pack(fill="x", padx=8, pady=6)
+        self.ttk.Label(controls, text="按群组/频道名称筛选").pack(side="left")
+        self.ttk.Entry(controls, textvariable=keyword).pack(
+            side="left", fill="x", expand=True, padx=6
+        )
+        self.ttk.Button(controls, text="清空", command=lambda: keyword.set("")).pack(side="left")
         tree = self.ttk.Treeview(win, columns=("id", "name"), show="headings")
         tree.heading("id", text="ID")
         tree.heading("name", text="名称")
         tree.column("id", width=180)
         tree.column("name", width=400)
         tree.pack(fill="both", expand=True)
-        for item in channels:
-            tree.insert("", "end", values=(str(item.entity_id), item.title))
+        def refresh(*_args):
+            previous = tree.selection()
+            chosen = tree.item(previous[0], "values")[0] if previous else None
+            tree.delete(*tree.get_children())
+            for item in filter_dialogs(channels, keyword.get()):
+                iid = str(item.entity_id)
+                tree.insert("", "end", iid=iid, values=(iid, item.title))
+                if iid == chosen:
+                    tree.selection_set(iid)
+
+        keyword.trace_add("write", refresh)
+        refresh()
 
         def select():
             chosen = tree.selection()
