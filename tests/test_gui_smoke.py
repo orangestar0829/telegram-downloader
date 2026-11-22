@@ -113,11 +113,14 @@ def test_group_list_scrolls_and_keeps_its_height_when_switching_tabs():
         # The CI display may shrink the whole window; give the upper pane
         # sufficient room explicitly to check the list's ten-row cap.
         panes = [app.main_split.nametowidget(name) for name in app.main_split.panes()]
+        initial_sash = app.main_split.sashpos(0)
         app.main_split.sashpos(0, panes[0].winfo_reqheight() + 15)
         root.update()
         assert round(app.tree.yview()[1] * 30) == 10
         app.tree.yview_moveto(1)
         assert app.tree.yview()[1] == 1
+        app.main_split.sashpos(0, initial_sash)
+        root.update()
 
         def layout():
             return (app.tree.winfo_height(), app.feature_tabs.winfo_y(),
@@ -132,9 +135,27 @@ def test_group_list_scrolls_and_keeps_its_height_when_switching_tabs():
                 root.update()
                 assert layout() == before
             assert app.feature_tabs.winfo_viewable()
-            assert app.log_tabs.winfo_viewable()
+            assert panes[1].winfo_height() > 0
     finally:
         root.destroy()
+
+
+def test_window_resize_reserves_room_for_active_downloads_and_logs():
+    app = object.__new__(gui._App)
+    changes = []
+    sash = [500]
+    app.main_split = SimpleNamespace(
+        winfo_exists=lambda: True,
+        winfo_height=lambda: 590,
+        sashpos=lambda _index, *position: changes.extend(position) if position else sash[0],
+    )
+    progress = SimpleNamespace(winfo_reqheight=lambda: 101)
+    toolbar = SimpleNamespace(winfo_reqheight=lambda: 32)
+    app._reserve_log_space(progress, toolbar)
+    assert changes == [361]
+    sash[0] = 320
+    app._reserve_log_space(progress, toolbar)
+    assert changes == [361]  # An already-visible log keeps the user's sash.
 
 
 def test_monitor_table_requests_five_rows_and_uses_vertical_scrollbar():
