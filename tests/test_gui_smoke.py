@@ -109,6 +109,12 @@ def test_group_list_scrolls_and_keeps_its_height_when_switching_tabs():
             app.tree.insert("", "end", values=(i, "channel", f"Channel {i}"))
         root.update()
         assert int(app.tree.cget("height")) == 10
+        assert 0 < app.tree.yview()[1] <= 10 / 30
+        # The CI display may shrink the whole window; give the upper pane
+        # sufficient room explicitly to check the list's ten-row cap.
+        panes = [app.main_split.nametowidget(name) for name in app.main_split.panes()]
+        app.main_split.sashpos(0, panes[0].winfo_reqheight() + 15)
+        root.update()
         assert round(app.tree.yview()[1] * 30) == 10
         app.tree.yview_moveto(1)
         assert app.tree.yview()[1] == 1
