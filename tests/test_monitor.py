@@ -2,7 +2,7 @@ from tgdl.monitor import load_channels, next_due_channel, save_channels
 
 
 def test_channel_intervals_persist_independently(tmp_path):
-    path = tmp_path / "data" / "monitored_channels.json"
+    path = tmp_path / "data" / "accounts" / "default" / "monitored_channels.json"
     items = [
         {"target": "-100123", "minutes": 5, "types": "video", "enabled": True},
         {"target": "-100456", "minutes": 60, "types": "photo,video", "enabled": False},
@@ -12,7 +12,7 @@ def test_channel_intervals_persist_independently(tmp_path):
         dict(item, direction="newest", name="", priority=0, batch_size=100)
         for item in items
     ]
-    assert path.parent.name == "data"
+    assert path.parent.name == "default"
 
 
 def test_invalid_interval_ignored(tmp_path):

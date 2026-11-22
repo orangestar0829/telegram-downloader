@@ -55,7 +55,7 @@ class MonitorDispatchSummary:
 
 
 def monitor_path() -> Path:
-    return prepare_data_dir() / "monitored_channels.json"
+    return prepare_data_dir() / "accounts" / "default" / "monitored_channels.json"
 
 
 def next_due_channel(

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
 import sqlite3
 from contextlib import closing
@@ -65,6 +66,31 @@ def migrate_default_session(directory: Path) -> Path:
     return target
 
 
+def migrate_default_monitors(directory: Path) -> Path:
+    """Copy the original account's monitor JSON into accounts/default once.
+
+    Never overwrite an already migrated file; leave the root copy untouched
+    for a downgrade. Validate before publishing a new config so an interrupted
+    or malformed migration cannot replace a working monitor list.
+    """
+    legacy = directory / "monitored_channels.json"
+    target = directory / "accounts" / "default" / "monitored_channels.json"
+    if target.exists() or not legacy.is_file():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".migrating")
+    try:
+        shutil.copy2(legacy, temporary)
+        data = json.loads(temporary.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            raise ValueError("Invalid legacy channel monitor configuration")
+        temporary.replace(target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
 def prepare_data_dir() -> Path:
     """Safely import legacy data once; never overwrite existing user data."""
     destination = data_dir()
@@ -82,4 +108,5 @@ def prepare_data_dir() -> Path:
                 shutil.copy2(candidate, target)
                 break
     migrate_default_session(destination)
+    migrate_default_monitors(destination)
     return destination

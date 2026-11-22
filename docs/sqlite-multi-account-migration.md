@@ -13,6 +13,7 @@ migration when it first opens the download history. You do not need to run SQL.
    backed-up `data/` into it before the first launch.
 4. If rollback is needed, stop the preview, restore the original data folder
    from the backup and start the old version.
+5. The original account's monitor configuration is migrated automatically into `data/accounts/default/monitored_channels.json`. Before first startup, check you have a backup of the legacy root `monitored_channels.json`; the migrated preview retains the original file for rollback.
 
 ## What changes
 
@@ -61,6 +62,7 @@ The GUI's automatic migration already checks this safely.
 - `data/accounts/default/tgdl_session.session`: original account's session,
   automatically copied from the legacy `data/tgdl_session.session` by a
   SQLite backup and verified before first use (old file is **not deleted**).
+- `data/accounts/default/monitored_channels.json`: original account's monitor configuration. On first startup the old `data/monitored_channels.json` is copied through a temporary JSON-validated file and atomically published. Existing new configs are never overwritten; the old file remains intact for rollback.
 - `data/accounts/<id>/tgdl_session.session`: each added account's private session.
 - `data/accounts/<id>/.env`: each additional account's private settings.
 - `data/accounts/<id>/monitored_channels.json`: independent channel monitors.
@@ -71,8 +73,7 @@ up the whole `data/` folder first. At startup, if the new default Session
 file already exists it will NOT be overwritten, even if the legacy file is
 newer. A temporary SQLite backup incorporates WAL state; the legacy file
 remains available for rollback. The original account keeps its existing
-`data/.env`, `data/monitored_channels.json` and global
-`data/tgdl_download_history.sqlite3` (the history is not moved).
+`data/.env` and global `data/tgdl_download_history.sqlite3` (the history is not moved). The active original-account monitor configuration is now `data/accounts/default/monitored_channels.json` (root-level copy is legacy backup only).
 
 All diagnostic and download-event logs now show the actual Telegram profile
 name after login (e.g. `[账号:Alice (@alice)]`); the stable account ID

@@ -114,4 +114,5 @@ class AccountRegistry:
         return self.root / "accounts" / account_id / "tgdl_session"
 
     def monitor_path(self, account_id: str) -> Path:
-        return self.account_dir(account_id) / "monitored_channels.json"
+        self.validate(account_id)
+        return self.root / "accounts" / account_id / "monitored_channels.json"
