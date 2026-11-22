@@ -28,6 +28,48 @@ from tgdl.monitor import choose_monitor_download, load_channels, next_due_channe
 from tgdl.monitor_flow import MonitorFlow, MonitorPause, SharedSpeedLimiter
 
 
+
+# The Telegram server chooses the code delivery method. Do not assume SMS:
+# some types (e.g. Firebase SMS) can only be completed in official mobile apps.
+_LOGIN_CODE_HINTS = {
+    "SentCodeTypeApp": (
+        "Telegram 应用内",
+        "请在 B 账号已登录的 Telegram 客户端查看官方“Telegram”服务消息；不是手机短信。",
+    ),
+    "SentCodeTypeSms": ("手机短信", "查看 B 账号手机号的短信收件箱。"),
+    "SentCodeTypeSmsWord": ("短信单词验证码", "查看 B 账号手机短信。"),
+    "SentCodeTypeSmsPhrase": ("短信短语验证码", "查看 B 账号手机短信。"),
+    "SentCodeTypeCall": ("语音电话", "留意 B 账号绑定号码的来电。"),
+    "SentCodeTypeMissedCall": ("未接来电", "请查看 B 账号绑定号码的未接来电。"),
+    "SentCodeTypeFlashCall": ("闪电来电", "请查看 B 账号绑定号码的来电。"),
+    "SentCodeTypeEmailCode": ("登录邮箱", "请检查 B 账号已设置的 Telegram 登录邮箱（含垃圾邮件）。"),
+    "SentCodeTypeSetUpEmailRequired": (
+        "需先设置登录邮箱",
+        "Telegram 要求设置或验证登录邮箱；本预览版不支持此设置流程，请先用官方客户端完成。",
+    ),
+    "SentCodeTypeFragmentSms": (
+        "Fragment",
+        "Telegram 选择了 Fragment 验证方式；需使用自己的 Fragment 账号获取验证码。",
+    ),
+    "SentCodeTypeFirebaseSms": (
+        "官方手机 App 专用短信验证",
+        "该类型需要官方手机 App 的 Firebase 认证，Telethon 无法接收此类短信；请先用官方手机 App 登录。",
+    ),
+    "SentCodePaymentRequired": (
+        "需要官方客户端处理的付费验证",
+        "该验证方式需在官方 Telegram 客户端完成。",
+    ),
+}
+
+
+def describe_login_code_delivery(sent_code: object) -> tuple[str, str]:
+    """Return safe user-facing delivery info without logging phone/code/hash."""
+    type_name = type(getattr(sent_code, "type", sent_code)).__name__
+    return _LOGIN_CODE_HINTS.get(
+        type_name, ("未知投递方式", f"Telegram 返回 {type_name}；请先检查 B 账号其他已登录客户端。")
+    )
+
+
 class AccountMonitorRuntime:
     """One service per secondary account; no Tk work on the asyncio thread."""
 
@@ -302,14 +344,41 @@ class AccountMonitorRuntime:
                 session_path=self.registry.session_path(self.account.id),
             )
             self.client = build_client(settings)
-            await self.client.start(
-                phone=lambda: settings.phone or self.ask("手机号（带国际区号）", False),
-                code_callback=lambda: self.ask("Telegram 验证码", False),
-                password=lambda: self.ask("Telegram 两步验证密码", True),
-            )
+            # Telethon.start() requests a login code internally, but normally
+            # hides the Telegram server's delivery type from the GUI. Observe
+            # the *same* request without sending any additional code or
+            # changing Telethon's built-in 2FA / retry behavior.
+            original_send_code = self.client.send_code_request
+            delivery = {"label": "请查看 B 账号 Telegram App、短信或邮箱"}
+
+            async def observed_send_code(*args, **kwargs):
+                sent = await original_send_code(*args, **kwargs)
+                label, guidance = describe_login_code_delivery(sent)
+                delivery["label"] = label
+                self.status = f"等待验证码（{label}）"
+                self.log(f"[登录验证码] Telegram 响应：{label}。{guidance}")
+                return sent
+
+            self.client.send_code_request = observed_send_code
+            try:
+                await self.client.start(
+                    phone=lambda: settings.phone or self.ask("手机号（带国际区号）", False),
+                    code_callback=lambda: self.ask(
+                        f"Telegram 验证码（{delivery['label']}）", False
+                    ),
+                    password=lambda: self.ask("Telegram 两步验证密码", True),
+                )
+            finally:
+                self.client.send_code_request = original_send_code
             me = await self.client.get_me()
             if me is None:
                 raise RuntimeError("Telegram login failed")
+            if settings.phone and getattr(me, "phone", None):
+                from telethon.utils import parse_phone
+                if parse_phone(settings.phone) != parse_phone(me.phone):
+                    raise RuntimeError(
+                        "此账号 Session 已登录其他号码；请检查 B 账号是否误用了别的 Session 文件"
+                    )
             self.status = f"已连接：{getattr(me, 'first_name', '') or me.id}"
             self.log(f"[账号连接] {self.status}")
             scan = asyncio.create_task(self._scan_loop())
