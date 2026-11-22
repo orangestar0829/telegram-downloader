@@ -51,6 +51,7 @@ def create_runtime(registry, account_id, target, enabled):
         on_progress=lambda *_args: None,
     )
     runtime.client = FakeClient(account_id)
+    assert runtime.start_monitoring()
     runtime.peer_by_target[target] = 123
     return runtime
 
@@ -180,3 +181,94 @@ def test_secondary_transfer_refuses_a_basic_group_with_old_queue(tmp_path, monke
     assert history.pending_count() == 1  # remains available to the original account
     assert "-123" in runtime._blocked
     history.close()
+
+
+def test_connected_secondary_monitor_stops_drains_and_cancels_without_logout(tmp_path, monkeypatch):
+    from tgdl.config import Settings
+
+    registry = AccountRegistry(tmp_path)
+    runtime = create_runtime(registry, "acc-b", "@shared", True)
+    runtime.stop_monitoring()  # The state of a newly authenticated account.
+    connected_client = runtime.client
+    source = tmp_path / "old-destination"
+    destination = tmp_path / "new-destination"
+    history = DownloadHistory(tmp_path / "tgdl_download_history.sqlite3")
+    history.enqueue_media([PendingMedia(123, mid, "@shared", "Shared", "video", str(mid))
+                           for mid in (1, 2)])
+    monkeypatch.setattr(multi_runtime, "resolve_channel", resolve)
+    monkeypatch.setattr(multi_runtime, "classify_message", lambda _message: "video")
+    settings = Settings(api_id=1, api_hash="test", phone=None, download_dir=source,
+                        media_concurrency=1, media_retries=0, chunk_concurrency=1)
+
+    async def scenario():
+        first_started = asyncio.Event()
+        first_can_finish = asyncio.Event()
+        second_started = asyncio.Event()
+        second_cancelled = asyncio.Event()
+
+        async def fake_download(client, message, folder, _base, _stats, *, history, peer_id, **kwargs):
+            assert client is connected_client
+            if message.id == 1:
+                assert folder.is_relative_to(source)
+                first_started.set()
+                await first_can_finish.wait()
+                saved = folder / "file.mp4"
+                assert history.mark_claim_saved(
+                    kwargs["account_id"], peer_id, message.id, "video", saved,
+                    token=kwargs["claim_token"],
+                )
+                kwargs["on_claim_committed"]()
+                return saved
+            assert folder.is_relative_to(destination)
+            second_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                second_cancelled.set()
+
+        monkeypatch.setattr(multi_runtime, "_download_with_retry", fake_download)
+        worker = asyncio.create_task(runtime._download_loop(settings))
+
+        async def drained():
+            while runtime.active_count:
+                await asyncio.sleep(0.01)
+
+        try:
+            await asyncio.sleep(0)
+            assert not history.active_claims()
+            assert not first_started.is_set()
+            assert runtime.start_monitoring()
+            runtime.peer_by_target["@shared"] = 123
+            await asyncio.wait_for(first_started.wait(), timeout=2)
+
+            runtime.stop_monitoring()
+            assert runtime.monitoring_draining
+            assert not runtime.stop_event.is_set()
+            assert not runtime.start_monitoring()
+            first_can_finish.set()
+            await asyncio.wait_for(drained(), timeout=2)
+            assert history.contains(123, 1)
+            assert history.pending_count() == 1
+            assert not second_started.is_set()
+            assert runtime.client is connected_client
+
+            runtime.set_download_paths(destination, tmp_path / "new-staging")
+            assert runtime.start_monitoring()
+            runtime.peer_by_target["@shared"] = 123
+            await asyncio.wait_for(second_started.wait(), timeout=2)
+            runtime.cancel_transfers()
+            await asyncio.wait_for(second_cancelled.wait(), timeout=2)
+            await asyncio.wait_for(drained(), timeout=2)
+            assert not runtime.monitoring
+            assert not runtime.stop_event.is_set()
+            assert runtime.client is connected_client
+            assert history.pending_count() == 1
+            assert not history.active_claims()
+        finally:
+            runtime.stop(cancel=True)
+            await asyncio.wait_for(worker, timeout=2)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        history.close()

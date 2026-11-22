@@ -23,6 +23,7 @@ class AccountIdentity:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._labels: dict[str, str] = {"default": "原账号（未登录）"}
+        self._authenticated: set[str] = set()
 
     def register(self, account_id: str, fallback: str) -> None:
         with self._lock:
@@ -30,10 +31,18 @@ class AccountIdentity:
                 safe = re.sub(r"[\r\n\[\]]", " ", str(fallback)).strip()[:100]
                 self._labels[account_id] = safe or "未登录账号"
 
+    def rename_fallback(self, account_id: str, name: str) -> None:
+        """Use a new local remark only before the Telegram identity is known."""
+        with self._lock:
+            if account_id not in self._authenticated:
+                safe = re.sub(r"[\r\n\[\]]", " ", str(name)).strip()[:100]
+                self._labels[account_id] = safe or "未登录账号"
+
     def update(self, account_id: str, user: object) -> str:
         display = telegram_display_name(user)
         with self._lock:
             self._labels[account_id] = display
+            self._authenticated.add(account_id)
         return display
 
     def label(self, account_id: str) -> str:

@@ -93,8 +93,6 @@ def _make_app(tmp_path):
     app._default_dialog_rows = [("-10011", "channel", "A 频道", "achannel")]
     app._dialog_rows = app._default_dialog_rows
     app._default_status_text = "已连接：测试 A"
-    app._default_auto_status_text = "定时下载：未启动"
-    app.auto_status_var = Var("定时下载：未启动")
     app._closing = False
     app._gallery_entity = object()
     app._gallery_title = "A old gallery"
@@ -114,7 +112,6 @@ def _make_app(tmp_path):
     app.load_gallery_btn = Widget()
     app.save_sel_btn = Widget()
     app.parse_btn = Widget()
-    app.auto_btn = Widget()
     app.monitor_button = Widget()
     app.login_btn = Widget()
     app._populate_gallery = lambda items: setattr(app, "gallery_cells", items)
@@ -162,7 +159,6 @@ def test_switch_uses_b_config_channel_list_and_monitor_without_modifying_a(tmp_p
     app, b = _make_app(tmp_path)
     app._switch_main_account(b.id)
     assert app._selected_view_account() == b.id
-    assert app.phone_var.get() == "+222"
     assert app.proxy_host_var.get() == "proxy-b"
     assert app.media_concurrency_var.get() == "4"
     assert app._dialog_rows[0][2] == "B 频道"
@@ -172,7 +168,7 @@ def test_switch_uses_b_config_channel_list_and_monitor_without_modifying_a(tmp_p
     assert app.monitor_tree.rows["0"][7] == "启用"
     assert app.download_btn.options["state"] == "disabled"
     assert app.parse_btn.options["state"] == "disabled"
-    assert app.login_btn.options["text"] == "管理账号登录"
+    assert app.monitor_button.options["text"] == "启动当前账号监控"
     assert app._log_filter_options[app.log_account_filter.get()] == b.id
 
     # Edits in main UI are persisted *only* to account B's monitor file.
@@ -186,14 +182,20 @@ def test_switch_uses_b_config_channel_list_and_monitor_without_modifying_a(tmp_p
 
     # B startup must never toggle the default worker.
     visited = []
-    app._open_accounts = lambda: visited.append("B")
+    runtime = app._extra_runtimes[b.id]
+    runtime.monitoring = False
+    def start_b():
+        visited.append("B")
+        runtime.monitoring = True
+        return True
+    runtime.start_monitoring = start_b
     app._monitor_start_stop()
     assert visited == ["B"]
     assert app._monitor_active is True
+    assert app.monitor_button.options["text"] == "停止当前账号监控"
 
     # Switching back restores A's data, not B's.
     app._switch_main_account("default")
-    assert app.phone_var.get() == "+111"
     assert app.proxy_host_var.get() == "proxy-a"
     assert app._dialog_rows[0][2] == "A 频道"
     assert app._visible_monitors()[0]["target"] == "-10011"
@@ -201,7 +203,7 @@ def test_switch_uses_b_config_channel_list_and_monitor_without_modifying_a(tmp_p
     assert app._log_filter_options[app.log_account_filter.get()] == "default"
 
 
-def test_secondary_monitor_changes_in_management_window_are_reflected(tmp_path):
+def test_secondary_monitor_changes_on_disk_are_reflected(tmp_path):
     app, b = _make_app(tmp_path)
     app._switch_main_account(b.id)
     path = app._account_registry.monitor_path(b.id)
@@ -371,7 +373,7 @@ def test_account_manager_default_dialogs_do_not_show_main_window_b(tmp_path):
     assert calls == ["scheduled default"]
 
 
-def test_main_settings_dialog_merges_edits_after_account_manager_proxy_save(tmp_path):
+def test_main_settings_dialog_preserves_peer_edits_to_same_profile(tmp_path):
     from tgdl.config import read_env_values
 
     app, b = _make_app(tmp_path)
@@ -403,14 +405,107 @@ def test_main_settings_dialog_merges_edits_after_account_manager_proxy_save(tmp_
     app._log = lambda *_args: None
     app._open_settings()
 
-    # Account manager saves a SOCKS5 host while the main dialog is open.
+    # Another saved edit changes the SOCKS5 host while the dialog is open.
     update_env({**original, "proxy_host": "manager-proxy", "proxy_port": "9988"}, path)
     drafts[6].set(str(tmp_path / "new-download-dir"))
-    app.phone_var.set("+19998887777")  # Independent login draft.
     buttons["保存"]()
     saved = read_env_values(path)
     assert (saved["proxy_host"], saved["proxy_port"], saved["download_dir"]) == (
         "manager-proxy", "9988", str(tmp_path / "new-download-dir")
     )
     assert app.proxy_host_var.get() == "manager-proxy"
-    assert app.phone_var.get() == "+19998887777"
+    assert saved["phone"] == "+222"  # Login phone is account-local, not in this form.
+
+
+def test_dropdown_adds_and_selects_account_without_changing_active_account(tmp_path):
+    from tgdl.config import read_env_values
+    from tgdl.gui import _ADD_ACCOUNT_CHOICE
+
+    app, b = _make_app(tmp_path)
+    app.root = object()
+    app._refresh_main_account_choices()
+    assert _ADD_ACCOUNT_CHOICE in app._main_account_selector.options["values"]
+    a_path = app._account_registry.env_path("default")
+    before = a_path.read_bytes()
+    app.main_account_choice.set(_ADD_ACCOUNT_CHOICE)
+    app.simpledialog = SimpleNamespace(askstring=lambda *_args, **_kwargs: None)
+    app._switch_main_account()
+    assert app._selected_view_account() == "default"
+    assert app.main_account_choice.get() != _ADD_ACCOUNT_CHOICE
+
+    app.main_account_choice.set(_ADD_ACCOUNT_CHOICE)
+    app.simpledialog.askstring = lambda *_args, **_kwargs: "New account"
+    app._switch_main_account()
+    new_id = app._selected_view_account()
+    assert new_id not in ("default", b.id)
+    assert app._account_registry.accounts()[-1].name == "New account"
+    assert read_env_values(app._account_registry.env_path(new_id))["proxy_host"] == ""
+    assert a_path.read_bytes() == before
+    assert app._monitor_active is True
+
+
+def test_switch_keeps_a_first_run_credentials_out_of_b_view(tmp_path):
+    app, b = _make_app(tmp_path)
+    changes = []
+    app._login_frame = object()
+    app._setup_frame = SimpleNamespace(
+        pack=lambda **kwargs: changes.append(("show", kwargs["before"])),
+        pack_forget=lambda: changes.append(("hide",)),
+    )
+
+    app._switch_main_account(b.id)
+    app._switch_main_account("default")
+    assert changes == [("hide",), ("show", app._login_frame)]
+
+
+def test_b_stop_drains_and_cancel_routes_only_to_selected_account(tmp_path):
+    import concurrent.futures
+    import threading
+
+    app, b = _make_app(tmp_path)
+    runtime = app._extra_runtimes[b.id]
+    runtime.monitoring = True
+    runtime.active_count = 2
+    operations = []
+
+    def stop():
+        operations.append("stop B")
+        runtime.monitoring = False
+
+    runtime.stop_monitoring = stop
+    runtime.cancel_transfers = lambda: operations.append("cancel B")
+    app._download_future = concurrent.futures.Future()
+    app._monitor_download_future = concurrent.futures.Future()
+    app._stop_download = threading.Event()
+    app._switch_main_account(b.id)
+    app._monitor_start_stop()
+    app._cancel_current_download()
+    assert operations == ["stop B", "cancel B"]
+    assert app._monitor_active is True
+    assert not app._download_future.done()
+    assert not app._monitor_download_future.done()
+    assert not app._stop_download.is_set()
+
+    app._switch_main_account("default")
+    app._monitor_job = None
+    app._monitor_scan_stop = threading.Event()
+    app._monitor_download_stop = threading.Event()
+    app._monitor_total_transfers = 1
+    app._cancel_current_download()
+    assert operations == ["stop B", "cancel B"]
+    assert app._download_future.cancelled()
+    assert not app._monitor_download_future.cancelled()  # join waits for real cleanup
+    assert app._monitor_active is False
+
+
+def test_cancel_without_a_transfer_does_not_stop_current_monitor(tmp_path):
+    app, b = _make_app(tmp_path)
+    runtime = app._extra_runtimes[b.id]
+    runtime.monitoring = True
+    runtime.active_count = 0
+    def unexpected():
+        raise AssertionError("idle monitor should not stop")
+    runtime.cancel_transfers = unexpected
+    app._switch_main_account(b.id)
+    app._cancel_current_download()
+    assert runtime.monitoring

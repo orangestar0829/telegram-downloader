@@ -53,6 +53,7 @@ def monitor_worker(account_id, tmp_path, monkeypatch, db):
         ask=None, on_log=lambda *_: None, on_saved=lambda *_: None, on_progress=lambda *_: None,
     )
     runtime.client = Client()
+    assert runtime.start_monitoring()
     runtime.peer_by_target["@shared"] = 123
     monkeypatch.setattr(runtime, "_channels", lambda: channels)
     monkeypatch.setattr(multi_runtime, "resolve_channel", resolve)

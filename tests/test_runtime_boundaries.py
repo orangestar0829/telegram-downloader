@@ -32,6 +32,7 @@ def test_invalid_secondary_channel_does_not_stop_shared_loop(tmp_path):
         raise ValueError("no matching channel")
 
     runtime.client = SimpleNamespace(get_entity=get_entity)
+    assert runtime.start_monitoring()
     loop = AsyncLoop()
     try:
         scan = loop.submit(runtime._scan_loop())

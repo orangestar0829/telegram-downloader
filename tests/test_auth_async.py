@@ -86,20 +86,18 @@ def test_default_client_is_published_only_after_login_once(monkeypatch):
     started, release = asyncio.Event(), asyncio.Event()
     attempts = []
 
-    async def start(**_kwargs):
+    async def authenticate(_client, _phone):
         attempts.append(None)
         started.set()
         await release.wait()
-
-    async def get_me():
         return SimpleNamespace(first_name="A", last_name=None, username=None)
 
-    client = SimpleNamespace(start=start, get_me=get_me)
+    client = SimpleNamespace()
     monkeypatch.setattr(gui, "load_settings", lambda: SimpleNamespace(phone="+12223334444"))
     monkeypatch.setattr(gui, "build_client", lambda _: client)
 
     async def scenario():
-        first = asyncio.create_task(app._ensure_client())
+        first = asyncio.create_task(app._ensure_client(authenticate=authenticate))
         await started.wait()
         second = asyncio.create_task(app._ensure_client())
         await asyncio.sleep(0)

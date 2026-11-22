@@ -23,7 +23,7 @@ import threading
 import time
 from pathlib import Path
 
-from tgdl.accounts import AccountRegistry
+from tgdl.accounts import AccountRegistry, DEFAULT_ACCOUNT
 from tgdl.account_context import current_account_id
 from tgdl.account_identity import account_identity
 from tgdl.account_view import progress_owner
@@ -39,10 +39,13 @@ from tgdl.config import (
     default_download_dir,
     load_settings,
     read_env_values,
+    resolve_api_credentials,
     update_env,
 )
 from tgdl.downloader import download_channel, resolve_channel, scan_monitor_slice
+from tgdl.errors import TGDLInputError
 from tgdl.history import DownloadHistory
+from tgdl.login_dialog import TelegramLoginDialog
 from tgdl.log_format import LogChunk, TimestampedLines
 from tgdl.monitor import (
     MonitorDispatchSummary, choose_monitor_download, load_channels, next_due_channel,
@@ -62,6 +65,8 @@ from tgdl import torrent_fetch as _torrent_fetch
 from tgdl.cli import parse_day, parse_types
 from tgdl.parser import parse_channel
 
+
+_ADD_ACCOUNT_CHOICE = "＋ 添加账号…"
 
 class _SilentBar:
     """Minimal no-op stand-in for tqdm used inside the GUI."""
@@ -192,6 +197,9 @@ class _App:
             account_identity.register(registered.id, registered.name)
         self._extra_runtimes = {}
         self._extra_futures = {}
+        self._login_dialog = None
+        self._default_login_future = None
+        self._default_login_task = None
         self._view_account_id = "default"
         self._view_monitored = []
         self._default_dialog_rows = []
@@ -232,7 +240,6 @@ class _App:
         self.creds_available = credentials_available()
         self.api_id_var = tk.StringVar(value=env["api_id"])
         self.api_hash_var = tk.StringVar(value=env["api_hash"])
-        self.phone_var = tk.StringVar(value=env["phone"])
         self.download_dir_var = tk.StringVar(value=env["download_dir"] or str(default_download_dir()))
         self.temp_download_dir_var = tk.StringVar(value=env["temp_download_dir"])
         # The GUI lock is acquired before initialization; no other GUI
@@ -267,11 +274,6 @@ class _App:
         self.type_video = tk.BooleanVar(value=True)
         self.type_anim = tk.BooleanVar(value=False)
         self.dl_limit = tk.StringVar()
-        self.auto_minutes_var = tk.StringVar(value="30")
-        self.auto_status_var = tk.StringVar(value="定时下载：未启动")
-        self._default_auto_status_text = "定时下载：未启动"
-        self._auto_job_id = None
-        self._auto_config = None
         self._download_future = None
         self._download_task = None
         self._stop_download = threading.Event()
@@ -361,30 +363,28 @@ class _App:
             ttk.Button(setup, text="保存", command=self.on_save_creds).grid(row=1, column=4, **pad)
             self._setup_frame = setup
 
-        # Login row (phone → code, like the official client).
-        login = ttk.LabelFrame(self.root, text="登录")
+        # Shared account header: selection and status on the left, actions on the right.
+        login = ttk.Frame(self.root)
+        self._login_frame = login
         login.pack(fill="x", **pad)
-        ttk.Label(login, text="主界面当前账号").grid(row=1, column=0, sticky="w", **pad)
+        login.columnconfigure(3, weight=1)
+        ttk.Label(login, text="当前账号").grid(row=0, column=0, sticky="w", **pad)
         self.main_account_choice = tk.StringVar()
         self._main_account_choices = {}
         self._main_account_selector = ttk.Combobox(
             login, textvariable=self.main_account_choice, state="readonly", width=27
         )
-        self._main_account_selector.grid(row=1, column=1, columnspan=3, sticky="w", **pad)
+        self._main_account_selector.grid(row=0, column=1, sticky="w", **pad)
         self._main_account_selector.bind(
             "<<ComboboxSelected>>", lambda _event: self._switch_main_account()
         )
         self._refresh_main_account_choices()
-        ttk.Label(login, text="手机号(带国际区号,可留空登录时再输)").grid(
-            row=0, column=0, sticky="w", **pad
+        self.login_btn = ttk.Button(login, text="Telegram 登录", command=self.on_login)
+        self.login_btn.grid(row=0, column=5, **pad)
+        ttk.Button(login, text="账号设置", command=self._open_settings).grid(row=0, column=4, **pad)
+        ttk.Label(login, textvariable=self.status_var, foreground="#0a6").grid(
+            row=0, column=2, sticky="w", **pad
         )
-        ttk.Entry(login, textvariable=self.phone_var, width=22).grid(row=0, column=1, sticky="w", **pad)
-        self.login_btn = ttk.Button(login, text="登录 Telegram", command=self.on_login)
-        self.login_btn.grid(row=0, column=2, **pad)
-        ttk.Button(login, text="设置", command=self._open_settings).grid(row=0, column=3, **pad)
-        ttk.Button(login, text="多账号", command=self._open_accounts).grid(row=0, column=6, **pad)
-        ttk.Label(login, text="状态:").grid(row=0, column=4, sticky="e", **pad)
-        ttk.Label(login, textvariable=self.status_var, foreground="#0a6").grid(row=0, column=5, sticky="w", **pad)
 
         # Let the user give the log panel more room without enlarging
         # the entire window. Pack the outer login row above the splitter.
@@ -439,8 +439,11 @@ class _App:
         nb.pack(side="left", fill="x", expand=True)
         nb.add(self._build_gallery_tab(), text="浏览媒体(选图/视频)")
         nb.add(self._build_download_tab(), text="批量下载")
-        nb.add(self._build_monitor_tab(), text="多频道监控")
+        monitor_tab = self._build_monitor_tab()
+        nb.add(monitor_tab, text="多频道监控")
+        nb.add(self._build_download_settings_tab(), text="下载设置")
         nb.add(self._build_parse_tab(), text="解析链接(高级)")
+        nb.select(monitor_tab)
 
         # Download folder row.
         folder = ttk.Frame(main_panel)
@@ -575,14 +578,17 @@ class _App:
         self.monitor_tree.bind("<<TreeviewSelect>>", self._monitor_selection_changed)
         actions = ttk.Frame(frame)
         actions.pack(fill="x", padx=6, pady=4)
-        self.monitor_button = ttk.Button(actions, text="启动全部监控", command=self._monitor_start_stop)
+        self.monitor_button = ttk.Button(actions, text="启动当前账号监控", command=self._monitor_start_stop)
         self.monitor_button.pack(side="left")
-        ttk.Button(actions, text="取消当前下载", command=self._cancel_current_download).pack(side="left", padx=6)
-        ttk.Label(actions, text="重启后保留频道配置；需手动启动监控", foreground="#555").pack(side="left", padx=10)
+        ttk.Button(actions, text="取消当前账号下载", command=self._cancel_current_download).pack(side="left", padx=6)
+        ttk.Label(actions, text="停止会等文件下完；取消会中断下载并暂停监控", foreground="#555").pack(
+            side="left", padx=10
+        )
         self._monitor_refresh()
         return frame
 
     def _monitor_refresh(self):
+        self._refresh_monitor_button()
         monitors = self._visible_monitors()
         due_map = self._visible_monitor_next()
         is_running = self._visible_monitor_running()
@@ -776,32 +782,77 @@ class _App:
             self._save_visible_monitors()
             self._monitor_refresh()
 
-    def _monitor_start_stop(self):
-        if self._closing and not self._monitor_active:
+    def _primary_monitor_draining(self) -> bool:
+        return not getattr(self, "_monitor_active", False) and any(
+            worker is not None and not worker.done()
+            for worker in (
+                getattr(self, "_monitor_download_future", None),
+                getattr(self, "_monitor_worker_task", None),
+            )
+        )
+
+    def _refresh_monitor_button(self) -> None:
+        button = getattr(self, "monitor_button", None)
+        if button is None:
             return
-        if self._selected_view_account() != "default" and not self._closing:
-            self._open_accounts()
-            return
-        self._monitor_active = not self._monitor_active
-        if self._monitor_active:
-            self._stop_auto() if self._auto_config is not None else None
-            self._monitor_scan_stop.clear()
-            self._monitor_download_stop.clear()
-            self._monitor_batch_used.clear()
-            self._monitor_totals.clear()
-            self._monitor_next = {item["target"]: time.time() for item in self._monitored}
-            self.monitor_button.config(text="停止全部监控")
-            self._log("[监控] 多频道监控已启动\n")
-            self._monitor_tick()
+        account_id = self._selected_view_account()
+        runtime = self._extra_runtimes.get(account_id) if account_id != DEFAULT_ACCOUNT else None
+        draining = (
+            self._primary_monitor_draining() if account_id == DEFAULT_ACCOUNT
+            else bool(getattr(runtime, "monitoring_draining", False))
+        )
+        if draining:
+            button.configure(text="正在停止监控…", state="disabled")
         else:
-            self._monitor_scan_stop.set()
-            self._monitor_download_stop.set()
-            if self._monitor_job is not None:
-                self.root.after_cancel(self._monitor_job)
-                self._monitor_job = None
-            self.monitor_button.config(text="启动全部监控")
-            self._log("[监控] 已停止调度，正在下载的任务不受影响\n")
+            text = "停止当前账号监控" if self._visible_monitor_running() else "启动当前账号监控"
+            button.configure(text=text, state="normal")
+
+    def _stop_primary_monitor(self) -> None:
+        self._monitor_active = False
+        self._monitor_scan_stop.set()
+        self._monitor_download_stop.set()
+        if self._monitor_job is not None:
+            self.root.after_cancel(self._monitor_job)
+            self._monitor_job = None
+        self._log("[监控] 已停止调度，正在下载的文件会继续完成\n")
+        self._monitor_refresh()
+
+    def _monitor_start_stop(self):
+        if getattr(self, "_closing", False):
+            return
+        account_id = self._selected_view_account()
+        if account_id != DEFAULT_ACCOUNT:
+            runtime = self._extra_runtimes.get(account_id)
+            if runtime is None or runtime.client is None or not runtime.status.startswith("已连接"):
+                self.messagebox.showinfo("当前账号未登录", "请先使用主窗口的「Telegram 登录」。")
+                return
+            if runtime.monitoring:
+                runtime.stop_monitoring()
+                self._log_account(account_id, "[监控] 已停止调度，正在下载的文件会继续完成")
+            elif runtime.start_monitoring():
+                self._log_account(account_id, "[监控] 已启动当前账号监控")
+            else:
+                return
             self._monitor_refresh()
+            return
+        if self._monitor_active:
+            self._stop_primary_monitor()
+            return
+        if self._primary_monitor_draining():
+            return
+        if self.client is None:
+            self.messagebox.showinfo("当前账号未登录", "请先使用主窗口的「Telegram 登录」。")
+            return
+        self._monitor_active = True
+        # Existing scans get the old (possibly set) event and cannot resume
+        # unobserved when a new monitor session starts.
+        self._monitor_scan_stop = threading.Event()
+        self._monitor_download_stop.clear()
+        self._monitor_batch_used.clear()
+        self._monitor_totals.clear()
+        self._monitor_next = {item["target"]: time.time() for item in self._monitored}
+        self._log("[监控] 已启动当前账号监控\n")
+        self._monitor_tick()
 
     def _apply_media_settings(self) -> None:
         """Atomically validate, save, and apply all numeric download settings."""
@@ -883,15 +934,17 @@ class _App:
                         f"[扫描] {display}：开始｜间隔{item['minutes']}分钟｜"
                         f"本轮上限{quota}\n"
                     )
+                scan_stop = self._monitor_scan_stop
                 def resolved(title, peer_id):
-                    self.root.after(0, lambda: self._monitor_set_name(target, title, peer_id))
+                    self.root.after(0, lambda: None if scan_stop.is_set() else
+                                    self._monitor_set_name(target, title, peer_id))
                 async def scan():
                     await self._ensure_client()
                     return await scan_monitor_slice(
                         self.client, target=target, types=parse_types(item["types"]),
                         monitor_direction=item.get("direction", "newest"),
                         slice_size=20, match_limit=min(20, remaining),
-                        stop_event=self._monitor_scan_stop,
+                        stop_event=scan_stop,
                         on_channel_resolved=resolved,
                     )
                 # Reserve a slice for this channel without blocking Tk or
@@ -899,15 +952,24 @@ class _App:
                 future = self.loop.submit(scan())
                 self._monitor_scan_future = future
                 self._monitor_scan_inflight = True
+                def finish_scan(result=None, error=None):
+                    self._monitor_scan_inflight = False
+                    if scan_stop.is_set():
+                        return
+                    if error is not None:
+                        self._monitor_scan_error(target, error)
+                    elif result is not None:
+                        self._monitor_slice_done(target, result)
+
                 def scanned(done):
                     try:
                         result = done.result()
                     except concurrent.futures.CancelledError:
-                        return
+                        self.root.after(0, finish_scan)
                     except Exception as exc:
-                        self.root.after(0, lambda exc=exc: self._monitor_scan_error(target, exc))
-                        return
-                    self.root.after(0, lambda: self._monitor_slice_done(target, result))
+                        self.root.after(0, lambda exc=exc: finish_scan(error=exc))
+                    else:
+                        self.root.after(0, lambda: finish_scan(result=result))
                 future.add_done_callback(scanned)
         if self._monitor_download_future is not None and self._monitor_download_future.done():
             try:
@@ -1237,6 +1299,9 @@ class _App:
                         if token is None:
                             await asyncio.sleep(0.03)
                             continue
+                        if self._monitor_download_stop.is_set():
+                            history.release_claim("default", job.peer_id, job.message_id, token=token)
+                            continue
                         pause = MonitorPause()
                         preempted = any(ctl.suspended for ctl in pauses.values())
                         flow = MonitorFlow(
@@ -1531,39 +1596,38 @@ class _App:
         ttk.Entry(frame, textvariable=self.dl_limit, width=10).grid(row=1, column=1, sticky="w", **pad)
         self.download_btn = ttk.Button(frame, text="下载所选", command=self.on_download)
         self.download_btn.grid(row=1, column=3, sticky="e", **pad)
-        ttk.Label(frame, text="自动下载间隔(分钟)").grid(row=4, column=0, sticky="w", **pad)
-        ttk.Entry(frame, textvariable=self.auto_minutes_var, width=8).grid(
-            row=4, column=1, sticky="w", **pad
-        )
-        self.auto_btn = ttk.Button(frame, text="启动定时", command=self.on_toggle_auto)
-        self.auto_btn.grid(row=4, column=2, sticky="w", **pad)
-        ttk.Label(frame, textvariable=self.auto_status_var).grid(
-            row=5, column=0, columnspan=4, sticky="w", **pad
-        )
-        ttk.Label(frame, text="并发数 (1-8)").grid(row=2, column=0, sticky="w", **pad)
-        ttk.Entry(frame, textvariable=self.media_concurrency_var, width=8).grid(
-            row=2, column=1, sticky="w", **pad
-        )
-        ttk.Label(frame, text="失败重试 (0-5)").grid(row=2, column=2, sticky="w", **pad)
-        ttk.Entry(frame, textvariable=self.media_retries_var, width=8).grid(
-            row=2, column=3, sticky="w", **pad
-        )
-        ttk.Label(frame, text="单文件分块并发 (1-8)").grid(row=3, column=0, sticky="w", **pad)
-        ttk.Entry(frame, textvariable=self.chunk_concurrency_var, width=8).grid(
-            row=3, column=1, sticky="w", **pad
-        )
-        ttk.Label(frame, text="监控总限速 (KiB/s，0=不限)").grid(row=6, column=0, sticky="w", **pad)
-        ttk.Entry(frame, textvariable=self.media_speed_kib_var, width=10).grid(
-            row=6, column=1, sticky="w", **pad
-        )
-        ttk.Button(
-            frame, text="应用并保存下载设置", command=self._apply_media_settings
-        ).grid(row=6, column=2, columnspan=2, sticky="e", **pad)
         ttk.Label(
-            frame, text="编辑数值时不生效；点击应用后监控下载立即使用新设置",
-            foreground="#555",
-        ).grid(row=7, column=0, columnspan=4, sticky="w", **pad)
+            frame, text="手动下载一次。自动任务请使用「多频道监控」。", foreground="#555",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", **pad)
         frame.columnconfigure(2, weight=1)
+        return frame
+
+    def _build_download_settings_tab(self):
+        ttk = self.ttk
+        pad = {"padx": 6, "pady": 4}
+        frame = ttk.Frame(self.root)
+        ttk.Label(frame, text="这些设置只应用于当前账号。", foreground="#555").grid(
+            row=0, column=0, columnspan=4, sticky="w", **pad
+        )
+        for row, col, title, var in (
+            (1, 0, "文件并发数 (1–8)", self.media_concurrency_var),
+            (1, 2, "失败重试 (0–5)", self.media_retries_var),
+            (2, 0, "单文件分块并发 (1–8)", self.chunk_concurrency_var),
+            (2, 2, "监控总限速 (KiB/s，0=不限)", self.media_speed_kib_var),
+        ):
+            ttk.Label(frame, text=title).grid(row=row, column=col, sticky="w", **pad)
+            ttk.Entry(frame, textvariable=var, width=10).grid(
+                row=row, column=col + 1, sticky="w", **pad
+            )
+        ttk.Button(
+            frame, text="应用并保存", command=self._apply_media_settings,
+        ).grid(row=3, column=3, sticky="e", **pad)
+        ttk.Label(
+            frame, text="保存后监控下载逐步使用新设置；已开始的手动任务不受影响。",
+            foreground="#555",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+        frame.columnconfigure(0, weight=1, uniform="settings_labels")
+        frame.columnconfigure(2, weight=1, uniform="settings_labels")
         return frame
 
     def _build_parse_tab(self):
@@ -1613,17 +1677,45 @@ class _App:
     def _log_download_account(self, account_id: str, text: str) -> None:
         self._log_download(text, owner_id=account_id)
 
-    def _open_accounts(self) -> None:
-        from tgdl.accounts_gui import AccountWindow
-        existing = getattr(self, "_accounts_window", None)
-        if existing is not None and existing.win.winfo_exists():
-            existing.win.lift()
-            if self._selected_view_account() != "default":
-                existing._refresh_choices(self._selected_view_account())
+    def _add_main_account(self) -> None:
+        if self._closing:
             return
-        self._accounts_window = AccountWindow(self)
-        if self._selected_view_account() != "default":
-            self._accounts_window._refresh_choices(self._selected_view_account())
+        name = self.simpledialog.askstring(
+            "添加 Telegram 账号", "输入用于区分此账号的备注", parent=self.root
+        )
+        if not name or not name.strip():
+            self._refresh_main_account_choices()
+            return
+        try:
+            account = self._account_registry.add(name)
+            account_identity.register(account.id, account.name)
+        except (ValueError, OSError) as exc:
+            self.messagebox.showerror("添加失败", str(exc), parent=self.root)
+            self._refresh_main_account_choices()
+            return
+        self._switch_main_account(account.id)
+        self._log_account(account.id, "[账号] 已创建；使用「Telegram 登录」连接此账号")
+
+    def _rename_main_account(self, account_id: str) -> None:
+        if self._closing or account_id == DEFAULT_ACCOUNT or self._selected_view_account() != account_id:
+            return
+        account = next((row for row in self._account_registry.accounts() if row.id == account_id), None)
+        if account is None:
+            return
+        name = self.simpledialog.askstring(
+            "修改账号备注", "输入新备注，不会更改 Telegram 名称",
+            initialvalue=account.name, parent=self.root,
+        )
+        if not name or not name.strip() or name.strip() == account.name:
+            return
+        try:
+            self._account_registry.rename(account_id, name)
+            account_identity.rename_fallback(account_id, name)
+        except (ValueError, OSError) as exc:
+            self.messagebox.showerror("修改失败", str(exc), parent=self.root)
+            return
+        self._refresh_main_account_choices()
+        self._refresh_log_accounts()
 
     def _selected_view_account(self) -> str:
         return getattr(self, "_view_account_id", "default")
@@ -1642,8 +1734,7 @@ class _App:
         if self._selected_view_account() == "default":
             return self._monitor_active
         runtime = self._extra_runtimes.get(self._selected_view_account())
-        return bool(runtime is not None and runtime.client is not None
-                    and runtime.status.startswith("已连接"))
+        return bool(getattr(runtime, "monitoring", False))
 
     def _save_visible_monitors(self) -> None:
         account_id = self._selected_view_account()
@@ -1653,12 +1744,6 @@ class _App:
             path = self._account_registry.monitor_path(account_id)
             save_channels(self._view_monitored, path)
             self._view_monitor_stamp = path.stat().st_mtime_ns
-            # Account manager and main view may be open simultaneously.
-            other = getattr(self, "_accounts_window", None)
-            if (other is not None and other.win.winfo_exists()
-                    and other._selected_id() == account_id):
-                other._channel_rows = load_channels(path)
-                other._refresh_channel_tree()
 
     def _refresh_main_account_choices(self) -> None:
         from tgdl.account_view import account_choices
@@ -1668,7 +1753,7 @@ class _App:
         self._main_account_choices = choices
         selector = getattr(self, "_main_account_selector", None)
         if selector is not None and changed:
-            selector.configure(values=list(choices))
+            selector.configure(values=(*choices, _ADD_ACCOUNT_CHOICE))
         choice = getattr(self, "main_account_choice", None)
         if choice is not None:
             current = next((label for label, account_id in choices.items()
@@ -1679,17 +1764,36 @@ class _App:
     def _switch_main_account(self, account_id: str | None = None) -> None:
         """Switch the visible account without changing any running client's identity."""
         if account_id is None:
-            account_id = self._main_account_choices.get(self.main_account_choice.get())
+            selection = self.main_account_choice.get()
+            if selection == _ADD_ACCOUNT_CHOICE:
+                self._add_main_account()
+                return
+            account_id = self._main_account_choices.get(selection)
         if account_id is None or account_id == self._selected_view_account():
             return
         if account_id not in {a.id for a in self._account_registry.accounts()}:
             return
+        try:
+            env = read_env_values(self._account_registry.env_path(account_id))
+            if account_id != DEFAULT_ACCOUNT:
+                monitor_path = self._account_registry.monitor_path(account_id)
+                monitors = load_channels(monitor_path)
+                stamp = monitor_path.stat().st_mtime_ns if monitor_path.exists() else None
+        except (ValueError, OSError) as exc:
+            self._refresh_main_account_choices()
+            self.messagebox.showwarning("无法切换账号", str(exc))
+            return
         self._view_account_id = account_id
         self._refresh_main_account_choices()
-        env = read_env_values(self._account_registry.env_path(account_id))
+        setup = getattr(self, "_setup_frame", None)
+        if setup is not None:
+            if account_id == DEFAULT_ACCOUNT:
+                setup.pack(before=self._login_frame, fill="x", padx=6, pady=4)
+            else:
+                setup.pack_forget()
         for name, var in (
             ("api_id", self.api_id_var), ("api_hash", self.api_hash_var),
-            ("phone", self.phone_var), ("download_dir", self.download_dir_var),
+            ("download_dir", self.download_dir_var),
             ("temp_download_dir", self.temp_download_dir_var),
             ("proxy_host", self.proxy_host_var), ("proxy_port", self.proxy_port_var),
             ("proxy_username", self.proxy_username_var),
@@ -1706,13 +1810,8 @@ class _App:
             self._dialog_rows = getattr(self, "_default_dialog_rows", [])
         else:
             from tgdl.account_view import dialog_rows
-            self._view_monitored = load_channels(
-                self._account_registry.monitor_path(account_id)
-            )
-            monitor_path = self._account_registry.monitor_path(account_id)
-            self._view_monitor_stamp = (
-                monitor_path.stat().st_mtime_ns if monitor_path.exists() else None
-            )
+            self._view_monitored = monitors
+            self._view_monitor_stamp = stamp
             self._dialog_rows = dialog_rows(
                 getattr(self, "_account_dialog_cache", {}).get(account_id, [])
             )
@@ -1734,23 +1833,12 @@ class _App:
         safe_default = account_id == "default"
         for widget in (
             self.download_btn, self.load_gallery_btn, self.save_sel_btn,
-            self.parse_btn, self.auto_btn,
+            self.parse_btn,
         ):
             widget.configure(state="normal" if safe_default else "disabled")
-        self.monitor_button.configure(
-            text=("停止全部监控" if self._monitor_active else "启动全部监控")
-            if safe_default else "在多账号管理中启停"
-        )
-        self.login_btn.configure(
-            text="登录 Telegram" if safe_default else "管理账号登录"
-        )
         self._populate_gallery([])
         self._gallery_entity = None
         self._gallery_title = ""
-        self.auto_status_var.set(
-            self._default_auto_status_text if account_id == "default"
-            else "当前账号请使用多频道监控（手动定时下载暂仅原账号可用）"
-        )
         self._set_main_log_account_filter(account_id)
         self._refresh_log_views()
         self.status_var.set(
@@ -1813,7 +1901,7 @@ class _App:
         future.add_done_callback(finished)
 
     def _sync_secondary_monitor_settings(self, account_id: str) -> None:
-        """Observe edits saved in the other account window without polling Telegram."""
+        """Observe edits to this account's on-disk monitors without Telegram polls."""
         if account_id == "default":
             return
         path = self._account_registry.monitor_path(account_id)
@@ -1835,13 +1923,15 @@ class _App:
         expected_logs.update(account_choices(self._account_registry.accounts()))
         if expected_logs != getattr(self, "_log_filter_options", {}):
             self._refresh_log_accounts()
-        if account_id == "default":
+        if account_id == DEFAULT_ACCOUNT:
             self.status_var.set(getattr(self, "_default_status_text", "未登录"))
         else:
             runtime = self._extra_runtimes.get(account_id)
             status = runtime.status if runtime is not None else "未登录"
             count = runtime.active_count if runtime is not None else 0
-            self.status_var.set(f"{status}｜下载中 {count} 个")
+            monitor = ("监控运行中" if getattr(runtime, "monitoring", False) else
+                       "监控停止中" if getattr(runtime, "monitoring_draining", False) else "监控未启动")
+            self.status_var.set(f"{status}｜{monitor}｜下载中 {count} 个")
             cache = getattr(self, "_account_dialog_cache", {})
             if (runtime is not None and runtime.status.startswith("已连接")
                     and account_id not in cache):
@@ -1858,6 +1948,8 @@ class _App:
                 self._filter_dialog_tree()
             self._sync_secondary_monitor_settings(account_id)
             self._monitor_refresh()
+        else:
+            self._refresh_monitor_button()
         self.root.after(1000, self._refresh_main_account_status)
 
     def _refresh_log_accounts(self) -> None:
@@ -2102,7 +2194,7 @@ class _App:
         self.root.after(0, apply)
 
     def _current_download_dir(self) -> Path:
-        raw = self.download_dir_var.get().strip()
+        raw = self.download_dir_var.get()
         if not raw:
             return default_download_dir()
         path = Path(raw).expanduser()
@@ -2220,7 +2312,7 @@ class _App:
                     def restore():
                         legacy_only = button in (
                             self.load_gallery_btn, self.parse_btn, self.download_btn,
-                            self.save_sel_btn, self.auto_btn,
+                            self.save_sel_btn,
                         )
                         state = ("disabled" if legacy_only and
                                  self._selected_view_account() != "default" else "normal")
@@ -2230,13 +2322,30 @@ class _App:
         future.add_done_callback(finished)
 
     def _save_dir_only(self) -> None:
-        path = self._account_registry.env_path(self._selected_view_account())
+        account_id = self._selected_view_account()
+        path = self._account_registry.env_path(account_id)
         values = read_env_values(path)
-        values["download_dir"] = self.download_dir_var.get().strip() or str(default_download_dir())
+        values["download_dir"] = self.download_dir_var.get() or str(default_download_dir())
         update_env(values, path)
+        self._apply_storage_paths(account_id, values)
+
+    def _apply_storage_paths(self, account_id: str, values: dict[str, str]) -> None:
+        directory = self._cleanup_path(values["download_dir"]) or default_download_dir()
+        staging = self._cleanup_path(values["temp_download_dir"])
+        if account_id == DEFAULT_ACCOUNT:
+            if self.settings is not None:
+                from dataclasses import replace
+
+                self.settings = replace(
+                    self.settings, download_dir=directory, temp_download_dir=staging,
+                )
+        else:
+            runtime = self._extra_runtimes.get(account_id)
+            if set_paths := getattr(runtime, "set_download_paths", None):
+                set_paths(directory, staging)
 
     # ---------- client ----------
-    async def _ensure_client(self):
+    async def _ensure_client(self, *, authenticate=None):
         if self.client is not None:
             return self.client
         async with self._client_lock:
@@ -2252,10 +2361,19 @@ class _App:
                 settings = load_settings()
                 client = build_client(settings)
                 try:
-                    await self.client_start(client, settings)
-                    me = await client.get_me()
-                    if me is None:
-                        raise RuntimeError("登录失败")
+                    if authenticate is not None:
+                        me = await authenticate(client, settings.phone)
+                    else:
+                        # Normal handlers may reuse stored authorization, but
+                        # only the explicit Login action opens an auth dialog.
+                        if not client.is_connected():
+                            await client.connect()
+                        me = await client.get_me()
+                        if me is None:
+                            raise TGDLInputError("请先点击主窗口的「Telegram 登录」。")
+                        if settings.phone and getattr(me, "phone", None):
+                            if validate_login_phone(settings.phone) != validate_login_phone(me.phone):
+                                raise TGDLInputError("当前会话的 Telegram 号码与设置不符。")
                 except (asyncio.CancelledError, Exception):
                     self._client_starting_cleanup = True
                     await client.disconnect()
@@ -2287,57 +2405,146 @@ class _App:
     # ---------- handlers ----------
     def on_save_creds(self) -> None:
         if self._selected_view_account() != "default":
-            self._open_accounts()
+            self.messagebox.showinfo("首次设置", "请切回原账号，或在当前账号的设置中修改 API 凭据。")
             return
-        if not self.api_id_var.get().strip() or not self.api_hash_var.get().strip():
+        api_id = self.api_id_var.get().strip()
+        api_hash = self.api_hash_var.get().strip()
+        if not api_id or not api_hash:
             self.messagebox.showwarning("缺少信息", "请先填写 api_id 和 api_hash。")
             return
-        update_env(
-            {
-                "api_id": self.api_id_var.get().strip(),
-                "api_hash": self.api_hash_var.get().strip(),
-                "phone": self.phone_var.get().strip(),
-                "download_dir": self.download_dir_var.get().strip() or str(default_download_dir()),
-            }
-        )
+        path = self._account_registry.env_path("default")
+        values = read_env_values(path)
+        values.update(api_id=api_id, api_hash=api_hash)
+        update_env(values, path)
         self.creds_available = True
         if getattr(self, "_setup_frame", None) is not None:
             self._setup_frame.destroy()
             self._setup_frame = None
-        self._log("已保存凭据。现在点『登录 Telegram』。\n")
+        self._log("已保存凭据。现在点「Telegram 登录」。\n")
 
     def on_login(self) -> None:
-        if self._selected_view_account() != "default":
-            self._open_accounts()
+        self._open_account_login(self._selected_view_account())
+
+    def _open_account_login(self, account_id: str) -> None:
+        """Open the same pinned login dialog for a selected account."""
+        from tgdl.multi_runtime import AccountMonitorRuntime
+
+        if self._closing:
             return
-        if not credentials_available() and not (
-            self.api_id_var.get().strip() and self.api_hash_var.get().strip()
-        ):
-            self.messagebox.showwarning("缺少信息", "请先在『首次设置』里填写 api_id / api_hash 并保存。")
+        existing = self._login_dialog
+        if existing is not None:
+            existing.win.lift()
             return
-        # persist phone/dir so they are remembered
-        update_env(
-            {
-                "api_id": self.api_id_var.get().strip(),
-                "api_hash": self.api_hash_var.get().strip(),
-                "phone": self.phone_var.get().strip(),
-                "download_dir": self.download_dir_var.get().strip() or str(default_download_dir()),
-            }
+
+        account = next((item for item in self._account_registry.accounts() if item.id == account_id), None)
+        if account is None:
+            return
+        if account_id == "default" and self.client is not None:
+            self._run_task(self._load_dialogs(), self.login_btn)
+            return
+        if account_id != "default":
+            runtime = self._extra_runtimes.get(account_id)
+            if (runtime is not None and runtime.client is not None
+                    and runtime.status.startswith("已连接")):
+                self._load_secondary_dialogs(account_id, force=True)
+                return
+            pending = self._extra_futures.get(account_id)
+        else:
+            pending = self._default_login_future
+        if pending is not None and not pending.done():
+            self.messagebox.showinfo("登录 Telegram", "该账号正在关闭上一次登录，请稍后重试。")
+            return
+
+        path = self._account_registry.env_path(account_id)
+        values = read_env_values(path)
+        if resolve_api_credentials({
+            "TELEGRAM_API_ID": values["api_id"], "TELEGRAM_API_HASH": values["api_hash"],
+        }) is None:
+            if account_id == "default" and self.api_id_var.get().strip() and self.api_hash_var.get().strip():
+                self.on_save_creds()
+            else:
+                self.messagebox.showwarning("缺少信息", "请先在当前账号的设置中填写 API ID 和 API Hash。")
+                return
+
+        def remember(phone: str) -> None:
+            try:
+                current = read_env_values(path)
+                current["phone"] = phone
+                update_env(current, path)
+            except (OSError, ValueError):
+                self._log_account(account_id, "[登录] 登录成功，但未能保存手机号。")
+
+        def closed(dialog) -> None:
+            if self._login_dialog is dialog:
+                self._login_dialog = None
+
+        dialog = TelegramLoginDialog(
+            self, account_identity.label(account_id),
+            on_close=closed, remember_phone=remember,
         )
-        self._log("正在登录…(首次会向你的 Telegram 发送验证码)\n")
+        self._login_dialog = dialog
 
-        async def coro():
-            await self._ensure_client()
-            await self._load_dialogs()
+        def connected() -> None:
+            if self._login_dialog is dialog:
+                dialog.done()
+            if not self._closing and account_id != "default":
+                self._load_secondary_dialogs(account_id)
 
-        self._run_task(coro(), self.login_btn)
+        if account_id == "default":
+            async def start_default():
+                if self._closing:
+                    return
+                self._default_login_task = asyncio.current_task()
+                try:
+                    await self._ensure_client(authenticate=dialog.flow.authenticate)
+                    self.root.after(0, connected)
+                    try:
+                        await self._load_dialogs()
+                    except Exception as exc:
+                        self._log_account(account_id, f"[频道列表] 加载失败：{type(exc).__name__}")
+                finally:
+                    self._default_login_task = None
+
+            future = self.loop.submit(start_default())
+            self._default_login_future = future
+        else:
+            runtime = AccountMonitorRuntime(
+                account, self._account_registry, ask=self._ask,
+                on_log=self._log_account, on_saved=self._log_download_account,
+                on_progress=self._update_download_progress,
+                authenticate=dialog.flow.authenticate,
+                on_authenticated=lambda: self.root.after(0, connected),
+            )
+            self._extra_runtimes[account_id] = runtime
+            future = self.loop.submit(runtime.run())
+            self._extra_futures[account_id] = future
+
+        def finished(done) -> None:
+            try:
+                done.result()
+            except concurrent.futures.CancelledError:
+                pass
+            except Exception as exc:
+                self._log_account(account_id, f"[登录] 启动失败：{type(exc).__name__}")
+
+            def apply() -> None:
+                if self._login_dialog is dialog:
+                    dialog.done()
+                    if not self._closing:
+                        self.messagebox.showwarning(
+                            "登录未完成", "请检查当前账号设置或日志，然后重试登录。",
+                        )
+            if not self._closing:
+                self.root.after(0, apply)
+
+        future.add_done_callback(finished)
 
     def on_list(self) -> None:
         account_id = self._selected_view_account()
         if account_id != "default":
             runtime = self._extra_runtimes.get(account_id)
             if runtime is None or runtime.client is None or not runtime.status.startswith("已连接"):
-                self.messagebox.showinfo("当前账号未连接", "请到『多账号』中登录并启动该账号。")
+                self.messagebox.showinfo("当前账号未连接", "请先使用主窗口的「Telegram 登录」。")
                 return
             self._load_secondary_dialogs(account_id, force=True)
             return
@@ -2523,61 +2730,6 @@ class _App:
         )
         self._monitor_totals.pop(target, None)
 
-    def on_toggle_auto(self) -> None:
-        if self._selected_view_account() != "default":
-            self.messagebox.showinfo("定时下载", "此入口目前只支持原账号；请使用当前账号的频道监控。")
-            return
-        if self._auto_config is not None:
-            self._stop_auto()
-            return
-        if self._monitor_active:
-            self._monitor_start_stop()
-        target = self._selected_target()
-        types_raw = self._types_string()
-        if not target or not types_raw:
-            self.messagebox.showwarning("定时下载", "请先选择频道和下载类型。")
-            return
-        try:
-            minutes = int(self.auto_minutes_var.get().strip())
-            if not 1 <= minutes <= 1440:
-                raise ValueError("间隔必须在 1-1440 分钟之间")
-            limit = self.dl_limit.get().strip()
-            if limit and int(limit) <= 0:
-                raise ValueError("数量上限必须为正整数")
-            concurrency, retries, chunks = self._media_options()
-        except ValueError as exc:
-            self.messagebox.showwarning("定时下载", f"参数错误：{exc}")
-            return
-        self._auto_config = (target, types_raw, limit, concurrency, retries, chunks)
-        self._auto_interval_ms = minutes * 60 * 1000
-        self.auto_btn.config(text="停止定时")
-        self._log(f"[定时] 已启动：频道 {target}，每 {minutes} 分钟检查一次，立即执行首轮。\n")
-        self._auto_tick()
-
-    def _set_default_auto_status(self, text: str) -> None:
-        self._default_auto_status_text = text
-        if self._selected_view_account() == "default":
-            self.auto_status_var.set(text)
-
-    def _auto_tick(self) -> None:
-        if self._auto_config is None:
-            return
-        self._auto_job_id = None
-        self._start_channel_download(*self._auto_config)
-        self._set_default_auto_status(
-            f"定时下载：运行中（{self._auto_config[0]}，每 {self._auto_interval_ms // 60000} 分钟）"
-        )
-        self._auto_job_id = self.root.after(self._auto_interval_ms, self._auto_tick)
-
-    def _stop_auto(self) -> None:
-        if self._auto_job_id is not None:
-            self.root.after_cancel(self._auto_job_id)
-            self._auto_job_id = None
-        self._auto_config = None
-        self.auto_btn.config(text="启动定时")
-        self._set_default_auto_status("定时下载：未启动")
-        self._log("[定时] 已停止后续检查；当前下载不会中断。\n")
-
     def on_parse(self) -> None:
         if self._selected_view_account() != "default":
             self.messagebox.showinfo("解析链接", "此入口尚未接入 B 账号，请先切回原账号。")
@@ -2616,14 +2768,16 @@ class _App:
     def _change_dir(self) -> None:
         from tkinter import filedialog
 
+        account_id = self._selected_view_account()
         chosen = filedialog.askdirectory()
-        if chosen:
+        if chosen and self._selected_view_account() == account_id:
+            previous = self.download_dir_var.get()
             self.download_dir_var.set(chosen)
-            self._save_dir_only()
-            if self._selected_view_account() == "default" and self.settings is not None:
-                from dataclasses import replace
-
-                self.settings = replace(self.settings, download_dir=Path(chosen))
+            try:
+                self._save_dir_only()
+            except (ValueError, OSError) as exc:
+                self.download_dir_var.set(previous)
+                self.messagebox.showwarning("无法保存下载目录", str(exc))
 
     def _open_folder(self) -> None:
         folder = self._current_download_dir()
@@ -2642,7 +2796,7 @@ class _App:
         settings_account_id = self._selected_view_account()
         tk, ttk = self.tk, self.ttk
         win = tk.Toplevel(self.root)
-        win.title("设置：Telegram API / SOCKS5 代理")
+        win.title(f"账号设置：{account_identity.label(settings_account_id)}")
         win.transient(self.root)
         pad = {"padx": 8, "pady": 6}
         path = self._account_registry.env_path(settings_account_id)
@@ -2656,6 +2810,7 @@ class _App:
             ("proxy_password", "代理密码（可空）", self.proxy_password_var, True),
             ("download_dir", "下载目录", self.download_dir_var, False),
             ("temp_download_dir", "分块临时目录（建议 SSD，留空=下载目录）", self.temp_download_dir_var, False),
+            ("phone", "手机号（选填，带国际区号）", None, False),
         )
         draft = {key: tk.StringVar(master=win, value=original[key])
                  for key, _label, _main_var, _secret in fields}
@@ -2688,7 +2843,9 @@ class _App:
                 for key, var in draft.items():
                     value = var.get()
                     if value != original[key]:
-                        edits[key] = value if key == "proxy_password" else value.strip()
+                        edits[key] = value if key in (
+                            "proxy_username", "proxy_password", "download_dir", "temp_download_dir",
+                        ) else value.strip()
                 values.update(edits)
                 host, port = values["proxy_host"], values["proxy_port"]
                 if port and not host:
@@ -2701,24 +2858,33 @@ class _App:
                 self.messagebox.showwarning("账号设置无效", str(exc))
                 return
             for key, _label, main_var, _secret in fields:
-                main_var.set(values[key])
+                if main_var is not None:
+                    main_var.set(values[key])
+            self._apply_storage_paths(settings_account_id, values)
             win.destroy()
-            runtime = self._extra_runtimes.get(self._selected_view_account())
-            if self.client is not None or (runtime is not None and runtime.client is not None):
-                self.messagebox.showinfo("设置已保存", "代理设置在重启下载器后生效。")
-            else:
-                self._log_account(settings_account_id, "设置已保存。\n")
+            runtime = self._extra_runtimes.get(settings_account_id)
+            connected = (self.client is not None if settings_account_id == DEFAULT_ACCOUNT
+                         else runtime is not None and runtime.client is not None)
+            network_fields = {"api_id", "api_hash", "phone", "proxy_host", "proxy_port",
+                              "proxy_username", "proxy_password"}
+            if connected and network_fields.intersection(edits):
+                self.messagebox.showinfo("设置已保存", "此账号的登录 / SOCKS5 更改在重启下载器后生效。")
+            self._log_account(settings_account_id, "设置已保存。\n")
 
         ttk.Button(win, text="保存", command=save_and_close).grid(
             row=len(fields), column=1, sticky="e", **pad
         )
+        if settings_account_id != DEFAULT_ACCOUNT:
+            ttk.Button(win, text="修改备注", command=lambda: self._rename_main_account(
+                settings_account_id
+            )).grid(row=len(fields) + 1, column=0, sticky="w", **pad)
 
     # ---------- lifecycle ----------
     @staticmethod
     def _cleanup_path(raw: str) -> Path | None:
-        if not raw.strip():
+        if not raw:
             return None
-        path = Path(raw.strip()).expanduser()
+        path = Path(raw).expanduser()
         return path if path.is_absolute() else data_dir() / path
 
     def _manual_cache_cleanup(self, ssd_raw=None, hdd_raw=None, *, owner_id=None):
@@ -2758,29 +2924,42 @@ class _App:
             self.root.after(0, lambda: self._log_account(owner, result.summary() + "\n"))
         threading.Thread(target=worker, daemon=True).start()
 
+    def _interrupt_primary_monitor(self) -> None:
+        worker = getattr(self, "_monitor_worker_task", None)
+        if worker is None or worker is getattr(self, "_interrupted_monitor_worker", None):
+            return
+        self._interrupted_monitor_worker = worker
+        # Keep the cross-thread Future joinable until child cleanup finishes.
+        worker.get_loop().call_soon_threadsafe(lambda: None if worker.done() else worker.cancel())
+
     def _cancel_current_download(self) -> None:
-        if self._selected_view_account() != "default" and not self._closing:
-            self.messagebox.showinfo("取消下载", "B 账号监控下载由『多账号』独立管理；不会取消 A 账号任务。")
+        if getattr(self, "_closing", False):
+            return
+        account_id = self._selected_view_account()
+        if account_id != DEFAULT_ACCOUNT:
+            runtime = self._extra_runtimes.get(account_id)
+            if runtime is not None and runtime.active_count:
+                runtime.cancel_transfers()
+                self._log_account(account_id, "[监控] 正在取消当前下载并暂停监控；重新启动后继续未完成项目")
+                self._monitor_refresh()
+            else:
+                self._log_account(account_id, "[下载] 当前没有可取消的下载任务")
             return
         self._stop_download.set()
+        cancelled = False
         if self._download_future is not None and not self._download_future.done():
             self._download_future.cancel()
             self._log("[下载] 正在取消当前扫描及未完成文件；已成功的文件不会删除\n")
-        elif (getattr(self, "_monitor_download_future", None) is not None
-              and not self._monitor_download_future.done()):
-            # Cancel active transfers, leave uncommitted media in the durable
-            # queue, and let the monitor tick start a fresh worker afterwards.
-            self._monitor_download_stop.set()
-            self._monitor_download_future.cancel()
-            self._log("[监控] 正在取消当前媒体传输，未完成项目保留在队列\n")
-            if self._monitor_active:
-                self.root.after(1500, self._resume_monitor_downloads)
-        else:
+            cancelled = True
+        future = getattr(self, "_monitor_download_future", None)
+        worker_running = future is not None and not future.done()
+        if worker_running and getattr(self, "_monitor_total_transfers", 0) > 0:
+            self._stop_primary_monitor()
+            self._interrupt_primary_monitor()
+            self._log("[监控] 正在取消当前下载并暂停监控；重新启动后继续未完成项目\n")
+            cancelled = True
+        if not cancelled:
             self._log("[下载] 当前没有可取消的下载任务\n")
-
-    def _resume_monitor_downloads(self) -> None:
-        if self._monitor_active and not self._closing:
-            self._monitor_download_stop.clear()
 
     def _finish_close(self) -> None:
         if self._download_future is not None and not self._download_future.done():
@@ -2798,6 +2977,12 @@ class _App:
                         and not getattr(starting, "cancelling", lambda: 0)()):
                     starting.cancel()
                 await asyncio.gather(starting, return_exceptions=True)
+            # The authentication lock is released before Telegram's channel
+            # list loads; join the still-running explicit login handler too.
+            login = getattr(self, "_default_login_task", None)
+            if login is not None and not login.done():
+                login.cancel()
+                await asyncio.gather(login, return_exceptions=True)
             # Cancellation can settle the thread-safe Future before the real
             # asyncio download task has removed its temporary chunk files.
             active = self._download_task
@@ -2876,10 +3061,10 @@ class _App:
                 self.root.winfo_screenheight(),
             )
         self._closing = True
+        if dialog := getattr(self, "_login_dialog", None):
+            dialog.cancel()
         if self._monitor_active:
-            self._monitor_start_stop()
-        if self._auto_config is not None:
-            self._stop_auto()
+            self._stop_primary_monitor()
         self._stop_download.set()
         for runtime in getattr(self, "_extra_runtimes", {}).values():
             runtime.stop(cancel=not decision)
@@ -2891,8 +3076,8 @@ class _App:
             if not decision:
                 if manual_busy:
                     self._download_future.cancel()
-                if monitor_busy and self._monitor_download_future is not None:
-                    self._monitor_download_future.cancel()
+                if monitor_busy:
+                    self._interrupt_primary_monitor()
             self._log(
                 "[退出] 等待当前已开始的文件完成后关闭\n"
                 if decision else "[退出] 正在取消下载\n"

@@ -38,38 +38,33 @@ def test_silence_progress_bars_patches_modules() -> None:
     assert torrent_fetch.tqdm is gui._SilentBar
 
 
-def test_scheduler_skips_overlapping_download_and_can_stop():
-    events = []
-
-    class FakeRoot:
-        def after(self, interval, callback):
-            events.append(("after", interval, callback))
-            return "timer1"
-
-        def after_cancel(self, timer):
-            events.append(("cancel", timer))
-
-    class Var:
-        def __init__(self, value=""):
-            self.value = value
-        def set(self, value):
-            self.value = value
+def test_batch_and_download_settings_are_separate_tabs():
+    def widgets():
+        created = []
+        def make(*args, **kwargs):
+            created.append(kwargs)
+            return SimpleNamespace(grid=lambda **kw: None, pack=lambda **kw: None,
+                                   columnconfigure=lambda *a, **kw: None)
+        return SimpleNamespace(Frame=make, Label=make, Checkbutton=make, Entry=make, Button=make), created
 
     app = object.__new__(gui._App)
-    app.root = FakeRoot()
-    app._auto_config = ("channel1", "video", "", 2, 2, 4)
-    app._auto_interval_ms = 30 * 60 * 1000
-    app._auto_job_id = None
-    app._download_future = SimpleNamespace(done=lambda: False)
-    app.auto_status_var = Var()
-    app.auto_btn = SimpleNamespace(config=lambda **kw: events.append(("button", kw)))
-    app._log = lambda message: events.append(("log", message))
-    app._start_channel_download = lambda *args: events.append(("download", args))
+    app.root = object()
+    for name in ("type_photo", "type_video", "type_anim", "dl_limit", "media_concurrency_var",
+                 "media_retries_var", "chunk_concurrency_var", "media_speed_kib_var"):
+        setattr(app, name, object())
+    app.ttk, batch = widgets()
+    app._build_download_tab()
+    assert any(w.get("command") == app.on_download for w in batch)
+    assert {w.get("variable") or w.get("textvariable") for w in batch} - {None} == {
+        app.type_photo, app.type_video, app.type_anim, app.dl_limit,
+    }
+    assert not any("启动定时" in w.get("text", "") for w in batch)
+    assert not hasattr(app, "on_toggle_auto")
 
-    app._auto_tick()
-    assert events[0] == ("download", app._auto_config)
-    assert events[1][0:2] == ("after", 1800000)
-    app._stop_auto()
-    assert ("cancel", "timer1") in events
-    assert app._auto_config is None
-    assert app.auto_status_var.value == "定时下载：未启动"
+    app.ttk, settings = widgets()
+    app._build_download_settings_tab()
+    assert any(w.get("command") == app._apply_media_settings for w in settings)
+    assert {w.get("textvariable") for w in settings} - {None} == {
+        app.media_concurrency_var, app.media_retries_var,
+        app.chunk_concurrency_var, app.media_speed_kib_var,
+    }

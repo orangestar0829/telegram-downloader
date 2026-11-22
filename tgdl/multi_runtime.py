@@ -10,6 +10,7 @@ import asyncio
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -38,15 +39,15 @@ from tgdl.qr_auth import login_with_qr
 _LOGIN_CODE_HINTS = {
     "SentCodeTypeApp": (
         "Telegram 应用内",
-        "请在 B 账号已登录的 Telegram 客户端查看官方“Telegram”服务消息；不是手机短信。",
+        "请在 该账号已登录的 Telegram 客户端查看官方“Telegram”服务消息；不是手机短信。",
     ),
-    "SentCodeTypeSms": ("手机短信", "查看 B 账号手机号的短信收件箱。"),
-    "SentCodeTypeSmsWord": ("短信单词验证码", "查看 B 账号手机短信。"),
-    "SentCodeTypeSmsPhrase": ("短信短语验证码", "查看 B 账号手机短信。"),
-    "SentCodeTypeCall": ("语音电话", "留意 B 账号绑定号码的来电。"),
-    "SentCodeTypeMissedCall": ("未接来电", "请查看 B 账号绑定号码的未接来电。"),
-    "SentCodeTypeFlashCall": ("闪电来电", "请查看 B 账号绑定号码的来电。"),
-    "SentCodeTypeEmailCode": ("登录邮箱", "请检查 B 账号已设置的 Telegram 登录邮箱（含垃圾邮件）。"),
+    "SentCodeTypeSms": ("手机短信", "查看 该账号的手机号的短信收件箱。"),
+    "SentCodeTypeSmsWord": ("短信单词验证码", "查看 该账号的手机短信。"),
+    "SentCodeTypeSmsPhrase": ("短信短语验证码", "查看 该账号的手机短信。"),
+    "SentCodeTypeCall": ("语音电话", "留意 该账号绑定号码的来电。"),
+    "SentCodeTypeMissedCall": ("未接来电", "请查看 该账号绑定号码的未接来电。"),
+    "SentCodeTypeFlashCall": ("闪电来电", "请查看 该账号绑定号码的来电。"),
+    "SentCodeTypeEmailCode": ("登录邮箱", "请检查 该账号已设置的 Telegram 登录邮箱（含垃圾邮件）。"),
     "SentCodeTypeSetUpEmailRequired": (
         "需先设置登录邮箱",
         "Telegram 要求设置或验证登录邮箱；本预览版不支持此设置流程，请先用官方客户端完成。",
@@ -70,7 +71,7 @@ def describe_login_code_delivery(sent_code: object) -> tuple[str, str]:
     """Return safe user-facing delivery info without logging phone/code/hash."""
     type_name = type(getattr(sent_code, "type", sent_code)).__name__
     return _LOGIN_CODE_HINTS.get(
-        type_name, ("未知投递方式", f"Telegram 返回 {type_name}；请先检查 B 账号其他已登录客户端。")
+        type_name, ("未知投递方式", f"Telegram 返回 {type_name}；请先检查 该账号其他已登录客户端。")
     )
 
 
@@ -85,6 +86,8 @@ class AccountMonitorRuntime:
         on_progress: Callable[[str, str, int, int, str], None],
         login_method: str = "code",
         on_qr: Callable[[str, Any], None] | None = None,
+        authenticate: Callable[[Any, str | None], Awaitable[Any]] | None = None,
+        on_authenticated: Callable[[], None] | None = None,
     ) -> None:
         self.account = account
         self.registry = registry
@@ -94,7 +97,14 @@ class AccountMonitorRuntime:
         self.on_progress = on_progress
         self.login_method = login_method
         self.on_qr = on_qr
+        self.authenticate = authenticate
+        self.on_authenticated = on_authenticated
         self.stop_event = threading.Event()
+        self._monitor_controls = threading.RLock()
+        self._monitor_scan_stop = threading.Event()
+        self._monitor_scan_stop.set()
+        self._configured_paths: tuple[Path, Path | None] | None = None
+        self._cancel_transfers_requested = threading.Event()
         self.status = "未启动"
         self.active_count = 0
         self.peer_by_target: dict[str, int] = {}
@@ -111,9 +121,48 @@ class AccountMonitorRuntime:
     def log(self, text: str) -> None:
         self.on_log(self.account.id, text)
 
+    @property
+    def monitoring(self) -> bool:
+        return not (self._monitor_scan_stop.is_set() or self.stop_event.is_set())
+
+    @property
+    def monitoring_draining(self) -> bool:
+        return not self.monitoring and (
+            self.active_count > 0 or self._cancel_transfers_requested.is_set()
+        )
+
+    def start_monitoring(self) -> bool:
+        """Begin scanning and claiming, without reconnecting the account."""
+        with self._monitor_controls:
+            if self.stop_event.is_set() or self.monitoring or self.monitoring_draining:
+                return False
+            self._next_at.clear()
+            self._batch_used.clear()
+            self._blocked.clear()
+            self.peer_by_target.clear()
+            # A scan still unwinding from an earlier Stop keeps its set event.
+            self._monitor_scan_stop = threading.Event()
+            return True
+
+    def stop_monitoring(self) -> None:
+        """Stop claiming new work and let active files finish."""
+        with self._monitor_controls:
+            self._monitor_scan_stop.set()
+
+    def cancel_transfers(self) -> None:
+        """Pause the monitor and interrupt incomplete files, without logout."""
+        with self._monitor_controls:
+            self._monitor_scan_stop.set()
+            self._cancel_transfers_requested.set()
+
+    def set_download_paths(self, directory: Path, staging: Path | None) -> None:
+        """Apply storage settings only to this account's future files."""
+        self._configured_paths = directory, staging
+
     def stop(self, *, cancel: bool = False) -> None:
-        """Stop claiming work; optionally cancel transfers rather than draining."""
+        """Stop the account itself (application shutdown), not just monitoring."""
         self.stop_event.set()
+        self.stop_monitoring()
         task = self._run_task
         if task is not None:
             # Never cancel the cross-thread Future used to join this runtime:
@@ -136,28 +185,40 @@ class AccountMonitorRuntime:
             self._interrupt_requested = True
             target.cancel()
 
-    def _channel_resolved(self, target: str, title: str, peer_id: int) -> None:
-        self.peer_by_target[target] = peer_id
+    def _channel_resolved(
+        self, target: str, title: str, peer_id: int, scan_stop: threading.Event,
+    ) -> None:
+        with self._monitor_controls:
+            if not scan_stop.is_set():
+                self.peer_by_target[target] = peer_id
 
     def _channels(self) -> list[dict]:
         return load_channels(self.registry.monitor_path(self.account.id))
 
     async def _scan_loop(self) -> None:
         while not self.stop_event.is_set():
+            scan_stop = self._monitor_scan_stop
+            if scan_stop.is_set():
+                await asyncio.sleep(0.25)
+                continue
             try:
                 channels = self._channels()
                 now = time.time()
-                item = next_due_channel(
-                    [x for x in channels if x["target"] not in self._blocked],
-                    self._next_at, now, self._slice_cursor,
-                )
+                with self._monitor_controls:
+                    if scan_stop.is_set():
+                        continue
+                    item = next_due_channel(
+                        [x for x in channels if x["target"] not in self._blocked],
+                        self._next_at, now, self._slice_cursor,
+                    )
+                    if item is not None:
+                        self._slice_cursor += 1
+                        target = item["target"]
+                        quota = int(item.get("batch_size", 100))
+                        remaining = max(1, quota - self._batch_used.get(target, 0))
                 if item is None:
                     await asyncio.sleep(0.7)
                     continue
-                self._slice_cursor += 1
-                target = item["target"]
-                quota = int(item.get("batch_size", 100))
-                remaining = max(1, quota - self._batch_used.get(target, 0))
                 try:
                     result = await scan_monitor_slice(
                         self.client,
@@ -166,35 +227,45 @@ class AccountMonitorRuntime:
                         account_id=self.account.id,
                         monitor_direction=item.get("direction", "newest"),
                         slice_size=20, match_limit=min(20, remaining),
-                        stop_event=self.stop_event,
+                        stop_event=scan_stop,
                         on_channel_resolved=lambda title, peer_id: self._channel_resolved(
-                            target, title, peer_id
+                            target, title, peer_id, scan_stop
                         ),
                     )
                 except asyncio.CancelledError:
                     raise
                 except UnsupportedSharedMonitorPeer as exc:
-                    self.peer_by_target.pop(target, None)
-                    self._blocked.add(target)
+                    with self._monitor_controls:
+                        if scan_stop.is_set():
+                            continue
+                        self.peer_by_target.pop(target, None)
+                        self._blocked.add(target)
                     self.log(f"[监控已暂停] {item.get('name') or '该目标'}：{exc}")
                     continue
                 except Exception as exc:
+                    with self._monitor_controls:
+                        if scan_stop.is_set():
+                            continue
+                        self._next_at[target] = time.time() + 60
                     self.log(f"[扫描异常] {target}: {exc}; 60秒后重试")
-                    self._next_at[target] = time.time() + 60
                     await asyncio.sleep(0)
                     continue
-                self._batch_used[target] = self._batch_used.get(target, 0) + result.matched
-                at_limit = self._batch_used[target] >= quota
-                if not result.more_pending or at_limit:
+                with self._monitor_controls:
+                    if scan_stop.is_set():
+                        continue
+                    self._batch_used[target] = self._batch_used.get(target, 0) + result.matched
+                    round_done = not result.more_pending or self._batch_used[target] >= quota
+                    if round_done:
+                        self._batch_used[target] = 0
+                        self._next_at[target] = time.time() + int(item["minutes"]) * 60
+                    else:
+                        self._next_at[target] = time.time()
+                if round_done:
                     self.log(
                         f"[扫描] {item.get('name') or target} 完成: "
                         f"检查{result.scanned_messages}条, 匹配{result.matched}, "
                         f"新增{result.queued}, 跳过{result.skipped}"
                     )
-                    self._batch_used[target] = 0
-                    self._next_at[target] = time.time() + int(item["minutes"]) * 60
-                else:
-                    self._next_at[target] = time.time()
                 # Ensure the scan loop yields before requesting more messages.
                 await asyncio.sleep(0.1)
             except asyncio.CancelledError:
@@ -305,6 +376,12 @@ class AccountMonitorRuntime:
         try:
             while not self.stop_event.is_set() or active:
                 now = time.monotonic()
+                if self._cancel_transfers_requested.is_set():
+                    for key, (task, _target, _began, token) in active.items():
+                        if key not in retiring and token not in committed and not task.done():
+                            retiring.add(key)
+                            task.cancel()
+                    self._cancel_transfers_requested.clear()
                 for key, (task, target, began, token) in list(active.items()):
                     if not task.done():
                         continue
@@ -319,6 +396,9 @@ class AccountMonitorRuntime:
                     except Exception as exc:
                         self.log(f"[下载协程异常] {type(exc).__name__}: {exc}")
                 self.active_count = len(active)
+                if not self.monitoring and not active:
+                    await asyncio.sleep(0.25)
+                    continue
                 if now - last_renew >= 30:
                     for key, (task, _target, _began, token) in active.items():
                         if key in retiring or token in committed:
@@ -340,7 +420,8 @@ class AccountMonitorRuntime:
                     except (ValueError, TypeError):
                         self.log("[下载设置] 无效的并发/限速参数；继续使用原值")
                     last_refresh = now
-                if not self.stop_event.is_set() and len(active) < workers:
+                generation = self._monitor_scan_stop
+                if self.monitoring and len(active) < workers:
                     try:
                         channels = [
                             item for item in self._channels()
@@ -350,7 +431,9 @@ class AccountMonitorRuntime:
                         ]
                         candidates = []
                         for item in channels:
-                            peer = self.peer_by_target[item["target"]]
+                            peer = self.peer_by_target.get(item["target"])
+                            if peer is None:
+                                continue
                             for job in history.pending_for_peer(
                                 peer, account_id=self.account.id, limit=6,
                                 kinds={value.strip() for value in
@@ -367,15 +450,26 @@ class AccountMonitorRuntime:
                         selected = choose_monitor_download(candidates, counts, elapsed)
                         if selected is not None:
                             item, job = selected
+                            storage = self._configured_paths
+                            transfer_settings = settings if storage is None else replace(
+                                settings, download_dir=storage[0], temp_download_dir=storage[1],
+                            )
                             token = history.try_claim(self.account.id, job.peer_id, job.message_id)
                             if token is not None:
                                 key = (job.peer_id, job.message_id)
-                                task = asyncio.create_task(
-                                    self._transfer(history, item, job, settings,
-                                                   limiter, retries, chunks, token,
-                                                   on_claim_committed=lambda token=token: committed.add(token))
-                                )
-                                active[key] = (task, item["target"], time.monotonic(), token)
+                                with self._monitor_controls:
+                                    if self.monitoring and self._monitor_scan_stop is generation:
+                                        task = asyncio.create_task(
+                                            self._transfer(history, item, job, transfer_settings,
+                                                           limiter, retries, chunks, token,
+                                                           on_claim_committed=lambda token=token: committed.add(token))
+                                        )
+                                        active[key] = (task, item["target"], time.monotonic(), token)
+                                        self.active_count = len(active)
+                                    else:
+                                        task = None
+                                if task is None:
+                                    history.release_claim(self.account.id, *key, token=token)
                                 continue
                     except asyncio.CancelledError:
                         raise
@@ -413,57 +507,64 @@ class AccountMonitorRuntime:
                 env_path=self.registry.env_path(self.account.id),
                 session_path=self.registry.session_path(self.account.id),
             )
-            configured_phone = validate_login_phone(settings.phone) if settings.phone else None
-            self.client = build_client(settings)
-            if self.login_method == "qr":
-                if self.on_qr is None:
-                    raise RuntimeError("没有二维码显示窗口")
-                self.status = "等待 Telegram 扫码授权"
-                self.log("[扫码登录] 请在 B 账号 Telegram App 的 设置 → 设备 → 连接桌面设备 中扫码")
-                await login_with_qr(
-                    self.client,
-                    show_qr=self.on_qr,
-                    ask_password=lambda: self.ask("Telegram 两步验证密码", True),
-                    should_stop=self.stop_event.is_set,
-                )
+            if self.authenticate is not None:
+                self.client = build_client(settings)
+                me = await self.authenticate(self.client, settings.phone)
             else:
-                # Telethon.start() requests a login code internally, but hides
-                # the server-selected channel. Observe the same request.
-                original_send_code = self.client.send_code_request
-                delivery = {"label": "请查看 B 账号 Telegram App、短信或邮箱"}
-
-                async def observed_send_code(*args, **kwargs):
-                    sent = await original_send_code(*args, **kwargs)
-                    label, guidance = describe_login_code_delivery(sent)
-                    delivery["label"] = label
-                    self.status = f"等待验证码（{label}）"
-                    self.log(f"[登录验证码] Telegram 响应：{label}。{guidance}")
-                    return sent
-
-                self.client.send_code_request = observed_send_code
-                try:
-                    async def ask_phone() -> str:
-                        return validate_login_phone(await self.ask("手机号（带国际区号）", False))
-
-                    await self.client.start(
-                        phone=configured_phone or ask_phone,
-                        code_callback=lambda: self.ask(
-                            f"Telegram 验证码（{delivery['label']}）", False
-                        ),
-                        password=lambda: self.ask("Telegram 两步验证密码", True),
+                # No live dialog: preserve the noninteractive/legacy callbacks.
+                configured_phone = validate_login_phone(settings.phone) if settings.phone else None
+                self.client = build_client(settings)
+                if self.login_method == "qr":
+                    if self.on_qr is None:
+                        raise RuntimeError("没有二维码显示窗口")
+                    self.status = "等待 Telegram 扫码授权"
+                    self.log("[扫码登录] 请在 B 账号 Telegram App 的 设置 → 设备 → 连接桌面设备 中扫码")
+                    await login_with_qr(
+                        self.client,
+                        show_qr=self.on_qr,
+                        ask_password=lambda: self.ask("Telegram 两步验证密码", True),
+                        should_stop=self.stop_event.is_set,
                     )
-                finally:
-                    self.client.send_code_request = original_send_code
-            me = await self.client.get_me()
-            if me is None:
-                raise RuntimeError("Telegram login failed")
-            if configured_phone and getattr(me, "phone", None):
-                if configured_phone != validate_login_phone(me.phone):
-                    raise RuntimeError(
-                        "此账号 Session 已登录其他号码；请检查 B 账号是否误用了别的 Session 文件"
-                    )
+                else:
+                    # Telethon.start() requests a login code internally, but hides
+                    # the server-selected channel. Observe the same request.
+                    original_send_code = self.client.send_code_request
+                    delivery = {"label": "请查看 B 账号 Telegram App、短信或邮箱"}
+
+                    async def observed_send_code(*args, **kwargs):
+                        sent = await original_send_code(*args, **kwargs)
+                        label, guidance = describe_login_code_delivery(sent)
+                        delivery["label"] = label
+                        self.status = f"等待验证码（{label}）"
+                        self.log(f"[登录验证码] Telegram 响应：{label}。{guidance}")
+                        return sent
+
+                    self.client.send_code_request = observed_send_code
+                    try:
+                        async def ask_phone() -> str:
+                            return validate_login_phone(await self.ask("手机号（带国际区号）", False))
+
+                        await self.client.start(
+                            phone=configured_phone or ask_phone,
+                            code_callback=lambda: self.ask(
+                                f"Telegram 验证码（{delivery['label']}）", False
+                            ),
+                            password=lambda: self.ask("Telegram 两步验证密码", True),
+                        )
+                    finally:
+                        self.client.send_code_request = original_send_code
+                me = await self.client.get_me()
+                if me is None:
+                    raise RuntimeError("Telegram login failed")
+                if configured_phone and getattr(me, "phone", None):
+                    if configured_phone != validate_login_phone(me.phone):
+                        raise RuntimeError(
+                            "此账号 Session 已登录其他号码；请检查 B 账号是否误用了别的 Session 文件"
+                        )
             self.status = f"已连接：{account_identity.update(self.account.id, me)}"
             self.log(f"[账号连接] {self.status}")
+            if self.on_authenticated is not None:
+                self.on_authenticated()
             scan = asyncio.create_task(self._scan_loop())
             self._download_task = asyncio.create_task(self._download_loop(settings))
             while not self.stop_event.is_set():
