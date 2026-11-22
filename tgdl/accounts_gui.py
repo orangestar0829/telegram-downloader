@@ -45,6 +45,7 @@ class AccountWindow:
         ttk.Button(toolbar, text="添加账号", command=self._add_account).pack(side="left", padx=3)
         ttk.Button(toolbar, text="重命名", command=self._rename_account).pack(side="left", padx=3)
         ttk.Button(toolbar, text="登录并启动监控", command=self._start_account).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="扫码登录", command=lambda: self._start_account(qr=True)).pack(side="left", padx=3)
         ttk.Button(toolbar, text="停止该账号", command=self._stop_account).pack(side="left", padx=3)
 
         ttk.Label(self.win, textvariable=self.status).pack(anchor="w", padx=12, pady=(0, 5))
@@ -207,8 +208,9 @@ class AccountWindow:
         self.app._log_account(account_id, "[账号设置] 已保存；代理变更重启账号生效\n")
         return True
 
-    def _start_account(self) -> None:
+    def _start_account(self, qr: bool = False) -> None:
         from tgdl.multi_runtime import AccountMonitorRuntime
+        from tgdl.qr_gui import QrLoginWindow
         account_id = self._selected_id()
         if account_id == DEFAULT_ACCOUNT:
             self.app.messagebox.showinfo(
@@ -222,6 +224,7 @@ class AccountWindow:
         if not self._save_settings():
             return
         account = next(a for a in self.registry.accounts() if a.id == account_id)
+        qr_window = None
         runtime = AccountMonitorRuntime(
             account, self.registry,
             ask=lambda prompt, secret: self.app._ask(
@@ -230,9 +233,30 @@ class AccountWindow:
             on_log=self.app._log_account,
             on_saved=self.app._log_download_account,
             on_progress=self.app._update_download_progress,
+            login_method="qr" if qr else "code",
+            on_qr=lambda url, expires: qr_window.on_qr(url, expires) if qr_window else None,
         )
+        if qr:
+            qr_window = QrLoginWindow(self.app, account.name, runtime.stop)
         self.app._extra_runtimes[account_id] = runtime
-        self.app._extra_futures[account_id] = self.app.loop.submit(runtime.run())
+        future = self.app.loop.submit(runtime.run())
+        self.app._extra_futures[account_id] = future
+        if qr_window is not None:
+            def finish(_done):
+                self.app.root.after(0, qr_window.done)
+            future.add_done_callback(finish)
+            self._poll_qr_login(qr_window, runtime)
+
+    def _poll_qr_login(self, window, runtime) -> None:
+        if window._closed or not window.win.winfo_exists():
+            return
+        if runtime.status.startswith("已连接"):
+            window.done()
+            return
+        if runtime.stop_event.is_set():
+            window.done()
+            return
+        self.win.after(500, lambda: self._poll_qr_login(window, runtime))
 
     def _stop_account(self) -> None:
         account_id = self._selected_id()

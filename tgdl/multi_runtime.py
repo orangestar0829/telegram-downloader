@@ -26,6 +26,7 @@ from tgdl.downloader import (
 from tgdl.history import DownloadHistory, PendingMedia
 from tgdl.monitor import choose_monitor_download, load_channels, next_due_channel
 from tgdl.monitor_flow import MonitorFlow, MonitorPause, SharedSpeedLimiter
+from tgdl.qr_auth import login_with_qr
 
 
 
@@ -79,6 +80,8 @@ class AccountMonitorRuntime:
         on_log: Callable[[str, str], None],
         on_saved: Callable[[str, str], None],
         on_progress: Callable[[str, str, int, int, str], None],
+        login_method: str = "code",
+        on_qr: Callable[[str, Any], None] | None = None,
     ) -> None:
         self.account = account
         self.registry = registry
@@ -86,6 +89,8 @@ class AccountMonitorRuntime:
         self.on_log = on_log
         self.on_saved = on_saved
         self.on_progress = on_progress
+        self.login_method = login_method
+        self.on_qr = on_qr
         self.stop_event = threading.Event()
         self.status = "未启动"
         self.active_count = 0
@@ -344,32 +349,42 @@ class AccountMonitorRuntime:
                 session_path=self.registry.session_path(self.account.id),
             )
             self.client = build_client(settings)
-            # Telethon.start() requests a login code internally, but normally
-            # hides the Telegram server's delivery type from the GUI. Observe
-            # the *same* request without sending any additional code or
-            # changing Telethon's built-in 2FA / retry behavior.
-            original_send_code = self.client.send_code_request
-            delivery = {"label": "请查看 B 账号 Telegram App、短信或邮箱"}
-
-            async def observed_send_code(*args, **kwargs):
-                sent = await original_send_code(*args, **kwargs)
-                label, guidance = describe_login_code_delivery(sent)
-                delivery["label"] = label
-                self.status = f"等待验证码（{label}）"
-                self.log(f"[登录验证码] Telegram 响应：{label}。{guidance}")
-                return sent
-
-            self.client.send_code_request = observed_send_code
-            try:
-                await self.client.start(
-                    phone=lambda: settings.phone or self.ask("手机号（带国际区号）", False),
-                    code_callback=lambda: self.ask(
-                        f"Telegram 验证码（{delivery['label']}）", False
-                    ),
-                    password=lambda: self.ask("Telegram 两步验证密码", True),
+            if self.login_method == "qr":
+                if self.on_qr is None:
+                    raise RuntimeError("没有二维码显示窗口")
+                self.status = "等待 Telegram 扫码授权"
+                self.log("[扫码登录] 请在 B 账号 Telegram App 的 设置 → 设备 → 连接桌面设备 中扫码")
+                await login_with_qr(
+                    self.client,
+                    show_qr=self.on_qr,
+                    ask_password=lambda: self.ask("Telegram 两步验证密码", True),
+                    should_stop=self.stop_event.is_set,
                 )
-            finally:
-                self.client.send_code_request = original_send_code
+            else:
+                # Telethon.start() requests a login code internally, but hides
+                # the server-selected channel. Observe the same request.
+                original_send_code = self.client.send_code_request
+                delivery = {"label": "请查看 B 账号 Telegram App、短信或邮箱"}
+
+                async def observed_send_code(*args, **kwargs):
+                    sent = await original_send_code(*args, **kwargs)
+                    label, guidance = describe_login_code_delivery(sent)
+                    delivery["label"] = label
+                    self.status = f"等待验证码（{label}）"
+                    self.log(f"[登录验证码] Telegram 响应：{label}。{guidance}")
+                    return sent
+
+                self.client.send_code_request = observed_send_code
+                try:
+                    await self.client.start(
+                        phone=lambda: settings.phone or self.ask("手机号（带国际区号）", False),
+                        code_callback=lambda: self.ask(
+                            f"Telegram 验证码（{delivery['label']}）", False
+                        ),
+                        password=lambda: self.ask("Telegram 两步验证密码", True),
+                    )
+                finally:
+                    self.client.send_code_request = original_send_code
             me = await self.client.get_me()
             if me is None:
                 raise RuntimeError("Telegram login failed")
