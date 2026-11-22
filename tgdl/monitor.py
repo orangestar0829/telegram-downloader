@@ -141,6 +141,8 @@ def load_channels(path: Path | None = None) -> list[dict]:
                 "direction": item.get("direction", "newest") if item.get("direction") in ("newest", "oldest") else "newest",
                 "name": str(item.get("name", "")).strip(),
             })
+            if item.get("peer_id"):
+                result[-1]["peer_id"] = int(item["peer_id"])
     return result
 
 

@@ -1,6 +1,6 @@
 # Multi-account, multi-proxy downloader — design baseline
 
-Status: proposal / implementation not started. Base: main after PR #3.
+Status: PR #4 preview implementation in progress; real Telegram integration testing pending. Base: main after PR #3.
 
 ## Agreed requirements
 
@@ -41,4 +41,4 @@ Status: proposal / implementation not started. Base: main after PR #3.
 5. Add persistent rotating diagnostics, bounded log rendering and account-specific filtering. Capture completion/account metadata without changing successful-download deduplication.
 6. Full regression suite, Windows package CI, two-account real-world preview validation, then request review.
 
-This PR starts with the design baseline only; functional multi-account implementation and verification remain outstanding.
+PR #4 now includes account-specific settings, SQLite claims and per-account scan cursors, a secondary-account monitor runtime, an account-management window and rotating logs. Offline tests validate concurrency and migration. Live Telegram, GUI smoke and Windows packaging validation remain required before review/merge.

@@ -11,7 +11,7 @@ class TimestampedLines:
         self._lock = threading.Lock()
         self._line_start = True
 
-    def format(self, text: str) -> str:
+    def format(self, text: str, *, prefix: str = "") -> str:
         if not text:
             return ""
         with self._lock:
@@ -19,6 +19,8 @@ class TimestampedLines:
             for part in text.splitlines(keepends=True):
                 if self._line_start:
                     result.append(f"[{self._clock():%Y-%m-%d %H:%M:%S}] ")
+                    if prefix:
+                        result.append(prefix)
                 result.append(part)
                 self._line_start = part.endswith(("\n", "\r"))
             return "".join(result)

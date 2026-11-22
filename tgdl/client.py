@@ -88,7 +88,7 @@ def build_client(settings: Settings) -> TelegramClient:
             settings.proxy_password,
         )
     return DiagnosticTelegramClient(
-        str(SESSION_PATH),
+        str(settings.session_path or SESSION_PATH),
         settings.api_id,
         settings.api_hash,
         proxy=proxy,

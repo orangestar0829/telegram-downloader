@@ -12,6 +12,8 @@ to it and receives log output through a thread-safe queue.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
+from collections.abc import Callable
 import concurrent.futures
 import os
 import queue
@@ -20,6 +22,10 @@ import sys
 import threading
 import time
 from pathlib import Path
+
+from tgdl.accounts import AccountRegistry
+from tgdl.account_context import current_account_id
+from tgdl.log_store import DailyLogStore
 
 from tgdl.browser import list_media, save_items
 from tgdl.channels import list_media_dialogs
@@ -118,13 +124,21 @@ class AsyncLoop:
 
 
 class _QueueWriter:
-    def __init__(self, sink: "queue.Queue[str]", formatter: TimestampedLines | None = None) -> None:
+    def __init__(self, sink: "queue.Queue[str]", formatter: TimestampedLines | None = None,
+                 persist: Callable[[str], None] | None = None) -> None:
         self._sink = sink
         self._formatter = formatter or TimestampedLines()
+        self._persist = persist
 
     def write(self, text: str) -> int:
         if text:
-            self._sink.put(self._formatter.format(text))
+            owner = current_account_id.get()
+            formatted = self._formatter.format(
+                text, prefix=f"[账号:{owner}] " if owner != "default" else ""
+            )
+            self._sink.put(formatted)
+            if self._persist is not None:
+                self._persist(formatted)
         return len(text)
 
     def flush(self) -> None:
@@ -166,6 +180,12 @@ class _App:
         self.loop = AsyncLoop()
         self.client = None
         self.settings: Settings | None = None
+        self._account_registry = AccountRegistry(data_dir())
+        self._extra_runtimes = {}
+        self._extra_futures = {}
+        self._log_store = DailyLogStore(data_dir() / "logs")
+        self._run_log_records = deque(maxlen=5000)
+        self._download_log_records = deque(maxlen=5000)
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.download_queue: "queue.Queue[str]" = queue.Queue()
         self.progress_queue: "queue.Queue[tuple[str, str, int, int, str]]" = queue.Queue()
@@ -177,6 +197,8 @@ class _App:
         self._download_popup_text = None
 
         self.root = tk.Tk()
+        self.log_account_filter = tk.StringVar(value="全部账号")
+        self._log_filter_options: dict[str, str | None] = {"全部账号": None}
         self.root.title("Telegram 下载器")
         self.root.geometry(load_window_geometry(
             self.root.winfo_screenwidth(), self.root.winfo_screenheight()
@@ -284,7 +306,8 @@ class _App:
         self._stdout, self._stderr = sys.stdout, sys.stderr
         self._timestamp_formatter = TimestampedLines()
         self._download_timestamp_formatter = TimestampedLines()
-        writer = _QueueWriter(self.log_queue, self._timestamp_formatter)
+        writer = _QueueWriter(self.log_queue, self._timestamp_formatter,
+                              persist=self._log_store.write)
         sys.stdout = writer
         sys.stderr = writer
         self._telethon_diag_uninstall = install_telethon_diagnostics(self._log)
@@ -326,6 +349,7 @@ class _App:
         self.login_btn = ttk.Button(login, text="登录 Telegram", command=self.on_login)
         self.login_btn.grid(row=0, column=2, **pad)
         ttk.Button(login, text="设置", command=self._open_settings).grid(row=0, column=3, **pad)
+        ttk.Button(login, text="多账号", command=self._open_accounts).grid(row=0, column=6, **pad)
         ttk.Label(login, text="状态:").grid(row=0, column=4, sticky="e", **pad)
         ttk.Label(login, textvariable=self.status_var, foreground="#0a6").grid(row=0, column=5, sticky="w", **pad)
 
@@ -413,6 +437,14 @@ class _App:
         self.download_log.pack(fill="both", expand=True)
         ttk.Button(toolbar, text="跳转最新", command=self._jump_to_latest_log).pack(side="right", padx=3)
         ttk.Button(toolbar, text="放大查看", command=self._open_active_log_window).pack(side="right", padx=3)
+        self._log_filter_selector = ttk.Combobox(
+            toolbar, textvariable=self.log_account_filter, state="readonly", width=23
+        )
+        self._log_filter_selector.pack(side="left", padx=3)
+        self._log_filter_selector.bind(
+            "<<ComboboxSelected>>", lambda _event: self._refresh_log_views()
+        )
+        self._refresh_log_accounts()
         self.root.after_idle(self._set_initial_log_split)
 
     @staticmethod
@@ -530,14 +562,22 @@ class _App:
         )):
             self.monitor_tree.move(str(index), "", rank)
 
-    def _monitor_set_name(self, target: str, title: str) -> None:
-        """Called only on Tk's main thread, never directly from Telethon."""
+    def _monitor_set_name(self, target: str, title: str, peer_id: int | None = None) -> None:
+        """Persist canonical channel peer ID for cross-account task matching."""
         for item in self._monitored:
-            if item["target"] == target and title and title != item.get("name"):
+            if item["target"] != target:
+                continue
+            changed = False
+            if title and title != item.get("name"):
                 item["name"] = title
+                changed = True
+            if peer_id is not None and int(peer_id) != item.get("peer_id"):
+                item["peer_id"] = int(peer_id)
+                changed = True
+            if changed:
                 save_channels(self._monitored)
                 self._monitor_refresh()
-                break
+            break
 
     def _monitor_add(self):
         target = self._selected_target()
@@ -772,7 +812,7 @@ class _App:
                         f"本轮上限{quota}\n"
                     )
                 def resolved(title, peer_id):
-                    self.root.after(0, lambda: self._monitor_set_name(target, title))
+                    self.root.after(0, lambda: self._monitor_set_name(target, title, peer_id))
                 async def scan():
                     await self._ensure_client()
                     return await scan_monitor_slice(
@@ -872,10 +912,16 @@ class _App:
         cancelled = False
         try:
             await self._ensure_client()
+            last_lease_refresh = time.monotonic()
             while not self._monitor_download_stop.is_set():
                 for line in dispatch_log.drain():
                     print(line)
                 limiter.bytes_per_second = getattr(self, "_monitor_live_speed_kib", 0) * 1024
+                now_lease = time.monotonic()
+                if now_lease - last_lease_refresh >= 30:
+                    for peer, mid in active:
+                        history.renew_claim("default", peer, mid)
+                    last_lease_refresh = now_lease
                 finished = [key for key, task in active.items() if task.done()]
                 for key in finished:
                     task = active.pop(key)
@@ -967,7 +1013,21 @@ class _App:
                             continue  # Resume all paused files before new ones at this priority.
                         if not item["enabled"]:
                             continue  # Only finish an already-started disabled channel.
-                        for job in history.pending_for_target(item["target"], limit=16):
+                        enabled_kinds = {
+                            value.strip() for value in item.get("types", "photo,video").split(",")
+                            if value.strip()
+                        }
+                        if item.get("peer_id"):
+                            eligible_jobs = history.pending_for_peer(
+                                item["peer_id"], account_id="default", limit=16,
+                                kinds=enabled_kinds,
+                            )
+                        else:
+                            eligible_jobs = history.pending_for_target(
+                                item["target"], limit=16, account_id="default",
+                                kinds=enabled_kinds,
+                            )
+                        for job in eligible_jobs:
                             if (job.peer_id, job.message_id) not in active:
                                 pending.append((item, job))
                                 break
@@ -1062,6 +1122,9 @@ class _App:
                             self._monitor_progress_state(key[0], key[1], "恢复中")
                             dispatch_log.add("resumed", item.get("name") or item["target"])
                             continue
+                        if not history.try_claim("default", job.peer_id, job.message_id):
+                            await asyncio.sleep(0.03)
+                            continue
                         pause = MonitorPause()
                         preempted = any(ctl.suspended for ctl in pauses.values())
                         flow = MonitorFlow(
@@ -1069,18 +1132,22 @@ class _App:
                             limiter=limiter,
                             chunks=lambda: getattr(self, "_monitor_live_chunks", None) or chunks,
                         )
-                        async def transfer(job=job, flow=flow):
+                        async def transfer(job=job, flow=flow, target=item["target"],
+                                           media_types=item.get("types", "photo,video")):
+                            cooldown = 0
                             try:
-                                entity = await resolve_channel(self.client, job.target)
+                                # Always resolve with the account's own channel target.
+                                entity = await resolve_channel(self.client, target)
                                 message = await self.client.get_messages(entity, ids=job.message_id)
                                 if message is None or message.date is None:
-                                    history.remove_pending(job.peer_id, job.message_id)
-                                    history.clear_failure(job.peer_id, job.message_id)
+                                    cooldown = 3600
+                                    print(f"[监控] {target}/{job.message_id} 在本账号不可读取")
                                     return
                                 kind = job.kind or _downloader.classify_message(message)
-                                if kind is None:
-                                    history.remove_pending(job.peer_id, job.message_id)
-                                    history.clear_failure(job.peer_id, job.message_id)
+                                if kind is None or kind not in {
+                                    value.strip() for value in media_types.split(",") if value.strip()
+                                }:
+                                    cooldown = 3600
                                     return
                                 folder = self.settings.download_dir / safe_name(
                                     getattr(entity, "title", None) or job.title
@@ -1098,16 +1165,23 @@ class _App:
                                     on_progress=self._update_download_progress,
                                     monitor_flow=flow,
                                 )
-                                if stats.failed:
-                                    history.mark_failure(job.peer_id, job.message_id)
+                                if history.contains(job.peer_id, job.message_id):
+                                    history.attribute_saved(job.peer_id, job.message_id, "default")
+                                elif stats.failed:
+                                    cooldown = 60
                                 elif path is None:
-                                    history.remove_pending(job.peer_id, job.message_id)
-                                    history.clear_failure(job.peer_id, job.message_id)
+                                    cooldown = 300
                             except asyncio.CancelledError:
                                 raise
                             except Exception as exc:
+                                cooldown = 60
                                 print(f"[监控] 下载 {job.title}/{job.message_id} 失败：{exc}")
-                                history.mark_failure(job.peer_id, job.message_id)
+                            finally:
+                                # Keep the global pending row retryable by another
+                                # eligible account instead of deleting it on failure.
+                                history.release_claim(
+                                    "default", job.peer_id, job.message_id, cooldown=cooldown
+                                )
                         active[key] = asyncio.create_task(transfer())
                         active_jobs[key] = job
                         pauses[key] = pause
@@ -1137,6 +1211,8 @@ class _App:
                 self._monitor_progress_state(key[0], key[1], "结束")
             self._monitor_active_transfers = 0
             self._monitor_total_transfers = 0
+            for peer, mid in active:
+                history.release_claim("default", peer, mid)
             history.close()
             self._monitor_worker_task = None
 
@@ -1366,10 +1442,79 @@ class _App:
 
     # ---------- helpers ----------
     def _log(self, text: str) -> None:
-        self.log_queue.put(self._timestamp_formatter.format(text))
+        owner = current_account_id.get()
+        if owner != "default" and "[账号:" not in text:
+            text = f"[账号:{owner}] {text}"
+        line = self._timestamp_formatter.format(text)
+        self.log_queue.put(line)
+        store = getattr(self, "_log_store", None)
+        if store is not None:
+            store.write(line)
 
     def _log_download(self, text: str) -> None:
-        self.download_queue.put(self._download_timestamp_formatter.format(text + "\n"))
+        line = self._download_timestamp_formatter.format(text + "\n")
+        self.download_queue.put(line)
+        store = getattr(self, "_log_store", None)
+        if store is not None:
+            store.write("[下载记录] " + line)
+
+    def _log_account(self, account_id: str, text: str) -> None:
+        self._log(f"[账号:{account_id}] {text.rstrip()}" + "\n")
+
+    def _log_download_account(self, account_id: str, text: str) -> None:
+        self._log_download(f"[账号:{account_id}] {text}")
+
+    def _open_accounts(self) -> None:
+        from tgdl.accounts_gui import AccountWindow
+        existing = getattr(self, "_accounts_window", None)
+        if existing is not None and existing.win.winfo_exists():
+            existing.win.lift()
+            return
+        self._accounts_window = AccountWindow(self)
+
+    def _refresh_log_accounts(self) -> None:
+        choices = {"全部账号": None}
+        registry = getattr(self, "_account_registry", None)
+        if registry is not None:
+            for account in registry.accounts():
+                choices[f"{account.name}（{account.id}）"] = account.id
+        self._log_filter_options = choices
+        selector = getattr(self, "_log_filter_selector", None)
+        if selector is not None:
+            selector.configure(values=list(choices))
+        var = getattr(self, "log_account_filter", None)
+        if var is not None and var.get() not in choices:
+            var.set("全部账号")
+
+    @staticmethod
+    def _line_account(line: str) -> str:
+        marker = "[账号:"
+        start = line.find(marker)
+        if start < 0:
+            return "default"
+        end = line.find("]", start + len(marker))
+        return line[start + len(marker):end] if end > start else "default"
+
+    def _log_visible(self, chunk: str) -> bool:
+        var = getattr(self, "log_account_filter", None)
+        selected = self._log_filter_options.get(var.get()) if var is not None else None
+        return selected is None or selected == self._line_account(chunk)
+
+    def _refresh_log_views(self) -> None:
+        for widget, records, popup in (
+            (self.log, getattr(self, "_run_log_records", ()), self._log_popup_text),
+            (self.download_log, getattr(self, "_download_log_records", ()), self._download_popup_text),
+        ):
+            visible = "".join(line for line in records if self._log_visible(line))
+            widget.configure(state="normal")
+            widget.delete("1.0", "end")
+            widget.insert("end", visible)
+            widget.configure(state="disabled")
+            if popup is not None:
+                popup.configure(state="normal")
+                popup.delete("1.0", "end")
+                popup.insert("end", visible)
+                popup.configure(state="disabled")
 
     def _update_download_progress(self, key: str, label: str, done: int, total: int, status: str) -> None:
         """Called from background downloads; only enqueue, never touch Tk."""
@@ -1465,17 +1610,25 @@ class _App:
         try:
             while True:
                 chunk = self.log_queue.get_nowait()
-                self._append_to_log(self.log, chunk)
-                if self._log_popup_text is not None:
-                    self._append_to_log(self._log_popup_text, chunk)
+                records = getattr(self, "_run_log_records", None)
+                if records is not None:
+                    records.append(chunk)
+                if self._log_visible(chunk):
+                    self._append_to_log(self.log, chunk)
+                    if self._log_popup_text is not None:
+                        self._append_to_log(self._log_popup_text, chunk)
         except queue.Empty:
             pass
         try:
             while True:
                 chunk = self.download_queue.get_nowait()
-                self._append_to_log(self.download_log, chunk)
-                if self._download_popup_text is not None:
-                    self._append_to_log(self._download_popup_text, chunk)
+                records = getattr(self, "_download_log_records", None)
+                if records is not None:
+                    records.append(chunk)
+                if self._log_visible(chunk):
+                    self._append_to_log(self.download_log, chunk)
+                    if self._download_popup_text is not None:
+                        self._append_to_log(self._download_popup_text, chunk)
         except queue.Empty:
             pass
         self.root.after(100, self._drain_log)
@@ -1485,6 +1638,14 @@ class _App:
         follow = widget.yview()[1] >= 0.999
         widget.configure(state="normal")
         widget.insert("end", chunk)
+        # Tk text widgets otherwise retain unlimited lines during long downloads.
+        if hasattr(widget, "index") and hasattr(widget, "delete"):
+            try:
+                lines = int(widget.index("end-1c").split(".", 1)[0])
+                if lines > 6000:
+                    widget.delete("1.0", f"{lines - 5000}.0")
+            except (ValueError, TypeError):
+                pass
         if follow:
             widget.see("end")
         widget.configure(state="disabled")
@@ -1736,7 +1897,7 @@ class _App:
 
         def channel_resolved(title: str, peer_id: int) -> None:
             if monitor_item is not None:
-                self.root.after(0, lambda: self._monitor_set_name(target, title))
+                self.root.after(0, lambda: self._monitor_set_name(target, title, peer_id))
 
         async def coro():
             self._download_task = asyncio.current_task()
@@ -2079,6 +2240,13 @@ class _App:
                         await asyncio.wrap_future(future)
                     except (asyncio.CancelledError, Exception):
                         pass
+            # Stop all secondary account clients before stopping the loop.
+            for extra in getattr(self, "_extra_futures", {}).values():
+                if not extra.done():
+                    try:
+                        await asyncio.wrap_future(extra)
+                    except (asyncio.CancelledError, Exception):
+                        pass
             if self.client is not None:
                 await self.client.disconnect()
 
@@ -2089,6 +2257,9 @@ class _App:
             self._destroy_after_disconnect()
 
     def _destroy_after_disconnect(self) -> None:
+        store = getattr(self, "_log_store", None)
+        if store is not None:
+            store.close()
         self.loop.stop()
         self.root.destroy()
 
@@ -2097,7 +2268,10 @@ class _App:
             return
         manual_busy = self._download_future is not None and not self._download_future.done()
         monitor_busy = getattr(self, "_monitor_total_transfers", 0) > 0
-        busy = manual_busy or monitor_busy
+        extra_busy = any(
+            runtime.active_count > 0 for runtime in getattr(self, "_extra_runtimes", {}).values()
+        )
+        busy = manual_busy or monitor_busy or extra_busy
         if busy:
             decision = self.messagebox.askyesnocancel(
                 "安全退出",
@@ -2122,6 +2296,8 @@ class _App:
             self._stop_auto()
         self._closing = True
         self._stop_download.set()
+        for runtime in getattr(self, "_extra_runtimes", {}).values():
+            runtime.stop()
         if hasattr(self, "_monitor_scan_stop"):
             self._monitor_scan_stop.set()
         if hasattr(self, "_monitor_download_stop"):
@@ -2132,6 +2308,9 @@ class _App:
                     self._download_future.cancel()
                 if monitor_busy and self._monitor_download_future is not None:
                     self._monitor_download_future.cancel()
+                for extra in getattr(self, "_extra_futures", {}).values():
+                    if not extra.done():
+                        extra.cancel()
             self._log(
                 "[退出] 等待当前已开始的文件完成后关闭\n"
                 if decision else "[退出] 正在取消下载\n"

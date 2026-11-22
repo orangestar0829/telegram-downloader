@@ -225,6 +225,7 @@ async def scan_monitor_slice(
     monitor_direction: str = "newest",
     slice_size: int = 20,
     match_limit: int = 20,
+    account_id: str = "default",
     stop_event: threading.Event | None = None,
     on_channel_resolved: Callable[[str, int], None] | None = None,
 ) -> DownloadStats:
@@ -246,9 +247,9 @@ async def scan_monitor_slice(
     stats = DownloadStats()
     history = DownloadHistory()
     try:
-        completed, upper, cursor, saved_direction = history.scan_state(peer_id)
+        completed, upper, cursor, saved_direction = history.scan_state(peer_id, account_id=account_id)
         media_types = ",".join(sorted(types))
-        previous_types = history.scan_media_types(peer_id)
+        previous_types = history.scan_media_types(peer_id, account_id=account_id)
         if previous_types not in ("", media_types) or (previous_types == "" and completed):
             completed, upper, cursor = 0, 0, 0
         elif upper and saved_direction != monitor_direction:
@@ -268,7 +269,8 @@ async def scan_monitor_slice(
             if upper <= completed:
                 stats.scan_completed = completed
                 return stats
-            history.save_scan_state(peer_id, completed, upper, 0, monitor_direction, media_types)
+            history.save_scan_state(peer_id, completed, upper, 0, monitor_direction, media_types,
+                                    account_id=account_id)
 
         stats.scan_upper = upper
         stats.scan_completed = completed
@@ -323,7 +325,7 @@ async def scan_monitor_slice(
             completed=upper if completed_window else completed,
             upper=0 if completed_window else upper,
             cursor=0 if completed_window else (last_seen or cursor),
-            direction=monitor_direction, media_types=media_types,
+            direction=monitor_direction, media_types=media_types, account_id=account_id,
         )
         stats.more_pending = not completed_window
         if completed_window:

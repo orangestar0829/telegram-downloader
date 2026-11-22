@@ -44,6 +44,7 @@ class Settings:
     chunk_concurrency: int = 1
     media_speed_kib: int = 0
     temp_download_dir: Path | None = None
+    session_path: Path | None = None
 
 
 def default_download_dir() -> Path:
@@ -89,7 +90,7 @@ def credentials_available() -> bool:
     return resolve_api_credentials() is not None
 
 
-def read_env_values() -> dict[str, str]:
+def read_env_values(path: Path | None = None) -> dict[str, str]:
     """Read raw .env values for pre-filling the GUI (no validation)."""
     values = {
         "api_id": "", "api_hash": "", "phone": "",
@@ -100,8 +101,9 @@ def read_env_values() -> dict[str, str]:
         "media_concurrency": "3", "media_retries": "2",
         "chunk_concurrency": "1", "media_speed_kib": "0",
     }
-    if ENV_PATH.exists():
-        for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
+    source_path = Path(path) if path is not None else ENV_PATH
+    if source_path.exists():
+        for line in source_path.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or "=" not in line:
                 continue
@@ -113,7 +115,7 @@ def read_env_values() -> dict[str, str]:
     return values
 
 
-def update_env(values: dict[str, str]) -> Path:
+def update_env(values: dict[str, str], path: Path | None = None) -> Path:
     """Create/update .env with the given values, preserving other lines."""
     desired = {
         "TELEGRAM_API_ID": values.get("api_id", ""),
@@ -135,7 +137,9 @@ def update_env(values: dict[str, str]) -> Path:
     ):
         if name in values:
             desired[key] = values[name]
-    existing_lines = ENV_PATH.read_text(encoding="utf-8").splitlines() if ENV_PATH.exists() else []
+    destination = Path(path) if path is not None else ENV_PATH
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    existing_lines = destination.read_text(encoding="utf-8").splitlines() if destination.exists() else []
     seen: set[str] = set()
     out: list[str] = []
     for line in existing_lines:
@@ -148,18 +152,33 @@ def update_env(values: dict[str, str]) -> Path:
     for key, value in desired.items():
         if key not in seen:
             out.append(f"{key}={value}")
-    ENV_PATH.write_text("\n".join(out) + "\n", encoding="utf-8")
-    return ENV_PATH
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.write_text("\n".join(out) + "\n", encoding="utf-8")
+    temporary.replace(destination)
+    return destination
 
 
-def load_settings() -> Settings:
-    creds = resolve_api_credentials()  # loads .env and checks bundled defaults
-    phone = os.getenv("TELEGRAM_PHONE", "").strip() or None
-    dd_raw = os.getenv("DOWNLOAD_DIR", "").strip()
+def load_settings(*, env_path: Path | None = None, session_path: Path | None = None) -> Settings:
+    if env_path is None:
+        creds = resolve_api_credentials()  # legacy .env, process env and bundled defaults
+        raw = os.environ.get
+    else:
+        # No process-wide dotenv mutation for another concurrently running account.
+        file_values: dict[str, str] = {}
+        source = Path(env_path)
+        if source.exists():
+            for line in source.read_text(encoding="utf-8").splitlines():
+                key, sep, value = line.partition("=")
+                if sep and not key.strip().startswith("#"):
+                    file_values[key.strip()] = value.strip()
+        creds = resolve_api_credentials(file_values) or resolve_api_credentials()
+        raw = file_values.get
+    phone = raw("TELEGRAM_PHONE", "").strip() or None
+    dd_raw = raw("DOWNLOAD_DIR", "").strip()
     download_dir = Path(dd_raw).expanduser() if dd_raw else default_download_dir()
     if not download_dir.is_absolute():
         download_dir = DATA_DIR / download_dir
-    staging_raw = os.getenv("TEMP_DOWNLOAD_DIR", "").strip()
+    staging_raw = raw("TEMP_DOWNLOAD_DIR", "").strip()
     staging_dir = Path(staging_raw).expanduser() if staging_raw else None
     if staging_dir is not None and not staging_dir.is_absolute():
         staging_dir = DATA_DIR / staging_dir
@@ -176,8 +195,8 @@ def load_settings() -> Settings:
     except ValueError as exc:
         raise SystemExit("TELEGRAM_API_ID must be a number.") from exc
 
-    host = os.getenv("SOCKS5_HOST", "").strip() or None
-    raw_port = os.getenv("SOCKS5_PORT", "").strip()
+    host = raw("SOCKS5_HOST", "").strip() or None
+    raw_port = raw("SOCKS5_PORT", "").strip()
     if raw_port and host is None:
         raise SystemExit("SOCKS5_PORT requires SOCKS5_HOST.")
     proxy_port = _bounded_int(raw_port or "1080", "SOCKS5_PORT", 1, 65535) if host else None
@@ -189,21 +208,22 @@ def load_settings() -> Settings:
         download_dir=download_dir,
         proxy_host=host,
         proxy_port=proxy_port,
-        proxy_username=os.getenv("SOCKS5_USERNAME", "").strip() or None,
-        proxy_password=os.getenv("SOCKS5_PASSWORD", "") or None,
+        proxy_username=raw("SOCKS5_USERNAME", "").strip() or None,
+        proxy_password=raw("SOCKS5_PASSWORD", "") or None,
         media_concurrency=_bounded_int(
-            os.getenv("MEDIA_CONCURRENCY", "3"), "MEDIA_CONCURRENCY", 1, 8
+            raw("MEDIA_CONCURRENCY", "3"), "MEDIA_CONCURRENCY", 1, 8
         ),
         media_retries=_bounded_int(
-            os.getenv("MEDIA_RETRIES", "2"), "MEDIA_RETRIES", 0, 5
+            raw("MEDIA_RETRIES", "2"), "MEDIA_RETRIES", 0, 5
         ),
         chunk_concurrency=_bounded_int(
-            os.getenv("CHUNK_CONCURRENCY", "1"), "CHUNK_CONCURRENCY", 1, 8
+            raw("CHUNK_CONCURRENCY", "1"), "CHUNK_CONCURRENCY", 1, 8
         ),
         media_speed_kib=_bounded_int(
-            os.getenv("MEDIA_SPEED_KIB", "0"), "MEDIA_SPEED_KIB", 0, 1048576
+            raw("MEDIA_SPEED_KIB", "0"), "MEDIA_SPEED_KIB", 0, 1048576
         ),
         temp_download_dir=staging_dir,
+        session_path=session_path,
     )
 
 
