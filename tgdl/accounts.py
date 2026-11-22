@@ -29,6 +29,9 @@ class AccountRegistry:
     def __init__(self, root: Path | None = None) -> None:
         self.root = Path(root) if root is not None else prepare_data_dir()
         self.registry_file = self.root / "accounts.json"
+        # Keep the default's optional remark alongside its other account data.
+        # Older builds expect accounts.json to contain secondary accounts only.
+        self._default_remark_file = self.root / "accounts" / DEFAULT_ACCOUNT / "remark.json"
 
     @staticmethod
     def validate(account_id: str) -> str:
@@ -37,7 +40,13 @@ class AccountRegistry:
         return account_id
 
     def accounts(self) -> list[Account]:
-        result = [Account(DEFAULT_ACCOUNT, "账号 A（原有账号）")]
+        try:
+            raw_remark = json.loads(self._default_remark_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            # An optional display setting must not block access to any account.
+            raw_remark = ""
+        remark = raw_remark.strip() if isinstance(raw_remark, str) else ""
+        result = [Account(DEFAULT_ACCOUNT, remark)]
         if not self.registry_file.exists():
             return result
         rows = json.loads(self.registry_file.read_text(encoding="utf-8"))
@@ -55,14 +64,18 @@ class AccountRegistry:
             result.append(Account(account_id, name))
         return result
 
+    @staticmethod
+    def _write_json(path: Path, data: object) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
+        try:
+            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
     def _write(self, rows: list[Account]) -> None:
-        self.root.mkdir(parents=True, exist_ok=True)
-        temporary = self.registry_file.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps([{"id": a.id, "name": a.name} for a in rows],
-                       ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        temporary.replace(self.registry_file)
+        self._write_json(self.registry_file, [{"id": a.id, "name": a.name} for a in rows])
 
     def add(self, name: str) -> Account:
         name = name.strip()
@@ -90,9 +103,10 @@ class AccountRegistry:
         return account
 
     def rename(self, account_id: str, name: str) -> None:
-        if account_id == DEFAULT_ACCOUNT:
-            raise ValueError("Original account cannot be renamed")
         name = name.strip()
+        if account_id == DEFAULT_ACCOUNT:
+            self._write_json(self._default_remark_file, name)
+            return
         if not name:
             raise ValueError("Account name is required")
         rows = self.accounts()[1:]

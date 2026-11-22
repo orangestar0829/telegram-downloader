@@ -322,3 +322,38 @@ def test_legacy_migration_preserves_existing_tokenless_lease_and_serializes_star
     assert two.try_claim("new-account", 17, 8, now=110)
     one.close()
     two.close()
+
+
+def test_default_account_remark_survives_restart_without_overwriting_session_or_registry(tmp_path):
+    registry = AccountRegistry(tmp_path)
+    extra = registry.add("extra")
+    assert registry.accounts()[0].name == ""
+    paths = [registry.session_path(account_id).with_suffix(".session")
+             for account_id in ("default", extra.id)]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"mock-unchanged-session")
+    registry_before = registry.registry_file.read_bytes()
+    registry.rename("default", "  我的主账号  ")
+
+    reopened = AccountRegistry(tmp_path)
+    assert [(row.id, row.name) for row in reopened.accounts()] == [
+        ("default", "我的主账号"), (extra.id, "extra"),
+    ]
+    assert registry.registry_file.read_bytes() == registry_before
+    assert all(path.read_bytes() == b"mock-unchanged-session" for path in paths)
+    reopened.rename("default", "  ")
+    assert AccountRegistry(tmp_path).accounts()[0].name == ""
+
+
+def test_invalid_default_account_remark_does_not_block_accounts(tmp_path):
+    registry = AccountRegistry(tmp_path)
+    extra = registry.add("extra")
+    remark = tmp_path / "accounts" / "default" / "remark.json"
+    remark.parent.mkdir(parents=True, exist_ok=True)
+    remark.write_text("{invalid", encoding="utf-8")
+
+    assert [(row.id, row.name) for row in registry.accounts()] == [
+        ("default", ""), (extra.id, "extra"),
+    ]
+    assert remark.read_text(encoding="utf-8") == "{invalid"

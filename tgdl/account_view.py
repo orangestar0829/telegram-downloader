@@ -13,8 +13,10 @@ from tgdl.account_identity import account_identity
 def account_choices(accounts: Iterable) -> dict[str, str]:
     """Human-readable, unique selector labels with stable IDs as values."""
     choices: dict[str, str] = {}
-    for index, account in enumerate(accounts):
-        label = f"{account_identity.label(account.id)}（{account.name}）"
+    for account in accounts:
+        identity = account_identity.label(account.id)
+        remark = account.name
+        label = f"{identity}（{remark}）" if remark and remark != identity else identity
         base = label
         suffix = 2
         while label in choices:

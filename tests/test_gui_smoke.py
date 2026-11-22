@@ -68,3 +68,82 @@ def test_batch_and_download_settings_are_separate_tabs():
         app.media_concurrency_var, app.media_retries_var,
         app.chunk_concurrency_var, app.media_speed_kib_var,
     }
+
+
+def test_split_prefers_full_log_height_when_space_is_available():
+    split = gui._App._initial_split_position
+    # A roomy window allocates about the natural 15-line log pane, not half.
+    assert split(1000, main_height=405, log_height=365) == 630
+    # A smaller window preserves the main controls before enlarging logs.
+    assert split(685, main_height=405, log_height=365) == 405
+    assert split(540, main_height=405, log_height=365) == 320
+
+
+def test_feature_notebook_resizes_to_the_selected_page():
+    captured = []
+    notebook = SimpleNamespace(
+        winfo_exists=lambda: True,
+        select=lambda: "monitor",
+        nametowidget=lambda name: SimpleNamespace(winfo_reqheight=lambda: {
+            "monitor": 240, "gallery": 345,
+        }[name]),
+        configure=lambda **kw: captured.append(kw["height"]),
+    )
+    gui._App._resize_selected_feature_tab(notebook)
+    notebook.select = lambda: "gallery"
+    gui._App._resize_selected_feature_tab(notebook)
+    assert captured == [240, 345]
+
+
+def test_monitor_table_requests_five_rows_and_uses_vertical_scrollbar():
+    resources = {}
+
+    def widget(*args, **kwargs):
+        return SimpleNamespace(pack=lambda **kw: None)
+
+    def tree(*args, **kwargs):
+        resources["tree_options"] = kwargs
+        return SimpleNamespace(
+            pack=lambda **kw: resources.update(tree_pack=kw),
+            configure=lambda **kw: resources.update(scroll_config=kw),
+            bind=lambda *_: None,
+            heading=lambda *_a, **_kw: None,
+            column=lambda *_a, **_kw: None,
+            yview=lambda *_: None,
+        )
+
+    def scrollbar(*args, **kwargs):
+        resources["bar_options"] = kwargs
+        return SimpleNamespace(pack=lambda **_kw: None, set=lambda *_: None)
+
+    app = object.__new__(gui._App)
+    app.root = object()
+    app.tk = SimpleNamespace(StringVar=widget, BooleanVar=widget)
+    app.ttk = SimpleNamespace(
+        Frame=widget, Label=widget, Entry=widget, Combobox=widget, Checkbutton=widget,
+        Button=widget, Treeview=tree, Scrollbar=scrollbar,
+    )
+    app._monitor_refresh = lambda: None
+    app._build_monitor_tab()
+    assert resources["tree_options"]["height"] == 5
+    assert resources["bar_options"]["orient"] == "vertical"
+    assert resources["bar_options"]["command"] is app.monitor_tree.yview
+    assert resources["scroll_config"]["yscrollcommand"]
+    assert resources["tree_pack"]["fill"] == "x"
+
+
+def test_settings_dialog_is_positioned_before_showing_on_its_parent():
+    app = object.__new__(gui._App)
+    app.root = SimpleNamespace(
+        winfo_rootx=lambda: 300, winfo_rooty=lambda: 180,
+        winfo_width=lambda: 1000, winfo_height=lambda: 800,
+    )
+    calls = []
+    window = SimpleNamespace(
+        update_idletasks=lambda: calls.append("measure"),
+        winfo_reqwidth=lambda: 440, winfo_reqheight=lambda: 340,
+        geometry=lambda coordinates: calls.append(coordinates),
+        deiconify=lambda: calls.append("show"),
+    )
+    app._show_centered_settings(window)
+    assert calls == ["measure", "+580+410", "show"]

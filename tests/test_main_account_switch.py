@@ -2,6 +2,8 @@
 from queue import Queue
 from types import SimpleNamespace
 
+import pytest
+
 from tgdl.account_identity import account_identity
 from tgdl.account_view import account_choices, dialog_rows, progress_owner
 from tgdl.accounts import AccountRegistry
@@ -397,12 +399,13 @@ def test_main_settings_dialog_preserves_peer_edits_to_same_profile(tmp_path):
         raise AssertionError("unexpected warning")
 
     app.tk = SimpleNamespace(Toplevel=lambda _parent: SimpleNamespace(
-        title=lambda _text: None, transient=lambda _parent: None, destroy=lambda: None,
+        title=lambda _text: None, transient=lambda _parent: None, withdraw=lambda: None, destroy=lambda: None,
     ), StringVar=variable)
     widget = lambda *_args, **_kwargs: SimpleNamespace(grid=lambda **_kwargs: None)
     app.ttk = SimpleNamespace(Label=widget, Entry=widget, Button=button)
     app.messagebox = SimpleNamespace(showwarning=unexpected, showinfo=lambda *_: None)
     app._log = lambda *_args: None
+    app._show_centered_settings = lambda _window: None
     app._open_settings()
 
     # Another saved edit changes the SOCKS5 host while the dialog is open.
@@ -509,3 +512,85 @@ def test_cancel_without_a_transfer_does_not_stop_current_monitor(tmp_path):
     app._switch_main_account(b.id)
     app._cancel_current_download()
     assert runtime.monitoring
+
+
+@pytest.mark.parametrize("kind", ["default", "secondary"])
+def test_settings_saves_inline_remark_and_updates_dropdown_without_relogin(tmp_path, monkeypatch, kind):
+    from tgdl.account_identity import AccountIdentity
+
+    identity = AccountIdentity()
+    monkeypatch.setattr("tgdl.gui.account_identity", identity)
+    monkeypatch.setattr("tgdl.account_view.account_identity", identity)
+    app, b = _make_app(tmp_path)
+    account_id = "default" if kind == "default" else b.id
+    profile = SimpleNamespace(first_name="Telegram Profile", last_name="", username="actual_profile")
+    identity.update(account_id, profile)
+    label = identity.label(account_id)
+    app._switch_main_account(account_id)
+    app._set_main_log_account_filter(account_id)
+    client = app.client = object()
+    app.settings = None
+    app.root = object()
+    path = app._account_registry.env_path(account_id)
+    before_env = path.read_bytes()
+
+    drafts, buttons, labels, destroyed = [], {}, [], []
+
+    def make_var(**kwargs):
+        var = Var(kwargs["value"])
+        drafts.append(var)
+        return var
+
+    widget = SimpleNamespace(grid=lambda **_kwargs: None)
+
+    def label_widget(_parent, *, text, **_kwargs):
+        labels.append(text)
+        return widget
+
+    def button(_parent, *, text, command):
+        buttons[text] = command
+        return widget
+
+    app.tk = SimpleNamespace(Toplevel=lambda _parent: SimpleNamespace(
+        title=lambda _text: None, transient=lambda _parent: None, withdraw=lambda: None,
+        destroy=lambda: destroyed.append(True),
+    ), StringVar=make_var)
+    app.ttk = SimpleNamespace(Label=label_widget, Entry=lambda *_args, **_kwargs: widget, Button=button)
+
+    app._show_centered_settings = lambda _window: None
+    app._open_settings()
+    assert "修改备注" not in buttons  # One settings form, one Save action.
+    assert ("本地备注（可留空）" if kind == "default" else "本地备注") in labels
+    assert drafts[-1].get() == ("" if kind == "default" else b.name)
+    drafts[-1].set("  下载专用  ")
+    buttons["保存"]()
+
+    reopened = AccountRegistry(tmp_path)
+    assert next(row.name for row in reopened.accounts() if row.id == account_id) == "下载专用"
+    assert app._selected_view_account() == account_id
+    assert app.main_account_choice.get() == f"{label}（下载专用）"
+    assert app._log_filter_options[app.log_account_filter.get()] == account_id
+    assert identity.label(account_id) == label  # Telegram display / logs keep their real identity.
+    assert app.client is client
+    assert path.read_bytes() == before_env
+    assert destroyed == [True]
+
+    if kind == "default":
+        app._open_settings()
+        assert drafts[-1].get() == "下载专用"
+        drafts[-1].set("")
+        buttons["保存"]()
+        assert reopened.accounts()[0].name == ""
+        assert app.main_account_choice.get() == label
+
+
+def test_account_selector_omits_redundant_remark(tmp_path, monkeypatch):
+    from tgdl.account_identity import AccountIdentity
+
+    identity = AccountIdentity()
+    monkeypatch.setattr("tgdl.account_view.account_identity", identity)
+    registry = AccountRegistry(tmp_path)
+    account = registry.add("显示备注")
+    identity.register(account.id, account.name)
+    assert account_choices(registry.accounts())["显示备注"] == account.id
+    assert "显示备注（显示备注）" not in account_choices(registry.accounts())

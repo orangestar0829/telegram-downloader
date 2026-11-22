@@ -7,6 +7,7 @@ coordinate pending files through DownloadHistory's SQLite claims.
 from __future__ import annotations
 
 import asyncio
+import stat
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -14,7 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from telethon.errors import FloodWaitError
+from telethon.errors import AuthKeyDuplicatedError, FloodWaitError, UnauthorizedError
 
 from tgdl.accounts import Account, AccountRegistry
 from tgdl.account_context import current_account_id
@@ -75,6 +76,10 @@ def describe_login_code_delivery(sent_code: object) -> tuple[str, str]:
     )
 
 
+class _SavedSessionUnavailable(Exception):
+    """Expected, noninteractive resume failure without mutating authorization."""
+
+
 class AccountMonitorRuntime:
     """One service per secondary account; no Tk work on the asyncio thread."""
 
@@ -88,6 +93,7 @@ class AccountMonitorRuntime:
         on_qr: Callable[[str, Any], None] | None = None,
         authenticate: Callable[[Any, str | None], Awaitable[Any]] | None = None,
         on_authenticated: Callable[[], None] | None = None,
+        restore_session_only: bool = False,
     ) -> None:
         self.account = account
         self.registry = registry
@@ -99,6 +105,7 @@ class AccountMonitorRuntime:
         self.on_qr = on_qr
         self.authenticate = authenticate
         self.on_authenticated = on_authenticated
+        self.restore_session_only = restore_session_only
         self.stop_event = threading.Event()
         self._monitor_controls = threading.RLock()
         self._monitor_scan_stop = threading.Event()
@@ -493,21 +500,54 @@ class AccountMonitorRuntime:
                 self.active_count = 0
                 history.close()
 
+    async def _restore_saved_session(self, settings):
+        configured_phone = validate_login_phone(settings.phone) if settings.phone else None
+        self.client = build_client(settings)
+        # A previously abandoned login can leave a SQLite file without an
+        # authorization key. Never initiate authentication for that file.
+        if not self.client.session.auth_key:
+            raise _SavedSessionUnavailable("登录已失效")
+        try:
+            if not self.client.is_connected():
+                await self.client.connect()
+            me = await self.client.get_me()
+        except (UnauthorizedError, AuthKeyDuplicatedError):
+            raise _SavedSessionUnavailable("登录已失效") from None
+        if me is None:
+            raise _SavedSessionUnavailable("登录已失效")
+        if configured_phone and getattr(me, "phone", None):
+            if configured_phone != validate_login_phone(me.phone):
+                raise _SavedSessionUnavailable("会话与账号不匹配")
+        return me
+
     async def run(self) -> None:
         """Login, run one independent scan loop and download loop; stop gracefully."""
-        self.status = "正在登录"
+        self.status = "正在恢复登录" if self.restore_session_only else "正在登录"
         self._run_task = asyncio.current_task()
         token = current_account_id.set(self.account.id)
         scan = None
         error_status = None
+        connected = False
         try:
             if self.stop_event.is_set():
                 return
+            session_path = self.registry.session_path(self.account.id)
+            if self.restore_session_only:
+                session_file = session_path.with_suffix(".session")
+                try:
+                    session_stat = session_file.stat()
+                except (FileNotFoundError, NotADirectoryError):
+                    raise _SavedSessionUnavailable("未登录") from None
+                if not stat.S_ISREG(session_stat.st_mode):
+                    raise _SavedSessionUnavailable("未登录")
+                if session_stat.st_size == 0:
+                    raise _SavedSessionUnavailable("登录已失效")
             settings = load_settings(
-                env_path=self.registry.env_path(self.account.id),
-                session_path=self.registry.session_path(self.account.id),
+                env_path=self.registry.env_path(self.account.id), session_path=session_path,
             )
-            if self.authenticate is not None:
+            if self.restore_session_only:
+                me = await self._restore_saved_session(settings)
+            elif self.authenticate is not None:
                 self.client = build_client(settings)
                 me = await self.authenticate(self.client, settings.phone)
             else:
@@ -562,6 +602,7 @@ class AccountMonitorRuntime:
                             "此账号 Session 已登录其他号码；请检查 B 账号是否误用了别的 Session 文件"
                         )
             self.status = f"已连接：{account_identity.update(self.account.id, me)}"
+            connected = True
             self.log(f"[账号连接] {self.status}")
             if self.on_authenticated is not None:
                 self.on_authenticated()
@@ -578,9 +619,18 @@ class AccountMonitorRuntime:
             # If run itself is externally cancelled, interrupt transfers too.
             if self._download_task is not None:
                 self._interrupt_for_stop(cancel=True)
+        except _SavedSessionUnavailable as exc:
+            error_status = str(exc)
+            self.log(f"[登录恢复] {error_status}")
         except Exception as exc:
-            error_status = f"异常：{type(exc).__name__}"
-            self.log(f"[账号运行异常] {type(exc).__name__}: {exc}")
+            if self.restore_session_only and not connected:
+                # Network/proxy and config failures are not evidence that the
+                # persisted login expired. Don't expose transport credentials.
+                error_status = "恢复登录失败"
+                self.log(f"[登录恢复] 无法连接或读取设置：{type(exc).__name__}")
+            else:
+                error_status = f"异常：{type(exc).__name__}"
+                self.log(f"[账号运行异常] {type(exc).__name__}: {exc}")
         finally:
             self._run_finishing = True
             self.stop_event.set()

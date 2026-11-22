@@ -17,11 +17,14 @@ from collections.abc import Callable
 import concurrent.futures
 import os
 import queue
+import stat
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+
+from telethon.errors import AuthKeyDuplicatedError, UnauthorizedError
 
 from tgdl.accounts import AccountRegistry, DEFAULT_ACCOUNT
 from tgdl.account_context import current_account_id
@@ -67,6 +70,16 @@ from tgdl.parser import parse_channel
 
 
 _ADD_ACCOUNT_CHOICE = "＋ 添加账号…"
+
+class _SavedSessionMissing(TGDLInputError):
+    """The stored session file no longer exists."""
+
+class _SavedSessionExpired(TGDLInputError):
+    """Telegram did not authorize the saved session."""
+
+class _SavedSessionMismatch(TGDLInputError):
+    """The authenticated profile differs from the configured account."""
+
 
 class _SilentBar:
     """Minimal no-op stand-in for tqdm used inside the GUI."""
@@ -339,6 +352,7 @@ class _App:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._drain_log)
         self.root.after(1000, self._refresh_main_account_status)
+        self.root.after_idle(self._check_saved_sessions_at_startup)
 
     # ---------- UI ----------
     def _build_ui(self) -> None:
@@ -382,9 +396,8 @@ class _App:
         self.login_btn = ttk.Button(login, text="Telegram 登录", command=self.on_login)
         self.login_btn.grid(row=0, column=5, **pad)
         ttk.Button(login, text="账号设置", command=self._open_settings).grid(row=0, column=4, **pad)
-        ttk.Label(login, textvariable=self.status_var, foreground="#0a6").grid(
-            row=0, column=2, sticky="w", **pad
-        )
+        self._account_status_label = ttk.Label(login, textvariable=self.status_var, foreground="#546174")
+        self._account_status_label.grid(row=0, column=2, sticky="w", **pad)
 
         # Let the user give the log panel more room without enlarging
         # the entire window. Pack the outer login row above the splitter.
@@ -394,6 +407,14 @@ class _App:
         log_panel = ttk.Frame(self.main_split)
         self.main_split.add(main_panel, weight=1)
         self.main_split.add(log_panel, weight=1)
+
+        # Reserve the folder row before the flexible panes use the available height.
+        folder = ttk.Frame(main_panel)
+        folder.pack(side="bottom", fill="x", **pad)
+        ttk.Label(folder, text="下载到:").pack(side="left")
+        ttk.Label(folder, textvariable=self.download_dir_var, foreground="#333").pack(side="left", padx=6)
+        ttk.Button(folder, text="更改", command=self._change_dir).pack(side="left")
+        ttk.Button(folder, text="打开下载文件夹", command=self._open_folder).pack(side="left", padx=6)
 
         # Your chats.
         chats = ttk.LabelFrame(main_panel, text="我的群组 / 频道(登录后自动加载)")
@@ -444,14 +465,11 @@ class _App:
         nb.add(self._build_download_settings_tab(), text="下载设置")
         nb.add(self._build_parse_tab(), text="解析链接(高级)")
         nb.select(monitor_tab)
+        def resize_tab(_event=None):
+            self.root.after_idle(self._resize_selected_feature_tab, nb)
 
-        # Download folder row.
-        folder = ttk.Frame(main_panel)
-        folder.pack(fill="x", **pad)
-        ttk.Label(folder, text="下载到:").pack(side="left")
-        ttk.Label(folder, textvariable=self.download_dir_var, foreground="#333").pack(side="left", padx=6)
-        ttk.Button(folder, text="更改", command=self._change_dir).pack(side="left")
-        ttk.Button(folder, text="打开下载文件夹", command=self._open_folder).pack(side="left", padx=6)
+        nb.bind("<<NotebookTabChanged>>", resize_tab, add="+")
+        resize_tab()
 
         logframe = ttk.LabelFrame(log_panel, text="日志和实时进度（拖动上方分隔线调整高度）")
         logframe.pack(fill="both", expand=True, **pad)
@@ -481,9 +499,9 @@ class _App:
         downloads_tab = ttk.Frame(self.log_tabs)
         self.log_tabs.add(runtime_tab, text="运行日志")
         self.log_tabs.add(downloads_tab, text="下载记录")
-        self.log = self.scrolledtext.ScrolledText(runtime_tab, height=8, wrap="word", state="disabled", font=("Consolas", 10))
+        self.log = self.scrolledtext.ScrolledText(runtime_tab, height=15, wrap="word", state="disabled", font=("Consolas", 10))
         self.log.pack(fill="both", expand=True)
-        self.download_log = self.scrolledtext.ScrolledText(downloads_tab, height=8, wrap="word", state="disabled", font=("Consolas", 10))
+        self.download_log = self.scrolledtext.ScrolledText(downloads_tab, height=15, wrap="word", state="disabled", font=("Consolas", 10))
         self.download_log.pack(fill="both", expand=True)
         ttk.Button(toolbar, text="跳转最新", command=self._jump_to_latest_log).pack(side="right", padx=3)
         ttk.Button(toolbar, text="放大查看", command=self._open_active_log_window).pack(side="right", padx=3)
@@ -495,22 +513,36 @@ class _App:
             "<<ComboboxSelected>>", lambda _event: self._refresh_log_views()
         )
         self._refresh_log_accounts()
-        self.root.after_idle(self._set_initial_log_split)
+        self.root.after_idle(self._set_initial_log_split, main_panel, log_panel)
 
     @staticmethod
-    def _initial_split_position(height: int) -> int:
-        """Give logs roughly half the window; keep both panes usable."""
-        return max(180, min(int(height * 0.52), height - 220))
+    def _resize_selected_feature_tab(notebook) -> None:
+        """Do not let a tall gallery create empty space in compact pages."""
+        if notebook.winfo_exists() and (selected := notebook.select()):
+            page = notebook.nametowidget(selected)
+            notebook.configure(height=max(1, page.winfo_reqheight()))
 
-    def _set_initial_log_split(self) -> None:
+    @staticmethod
+    def _initial_split_position(
+        height: int, main_height: int | None = None, log_height: int | None = None,
+    ) -> int:
+        """Aim for the requested log height without crowding out the main panel."""
+        last = max(180, height - 220)
+        if main_height is None or log_height is None:
+            return max(180, min(int(height * 0.52), last))
+        return max(180, min(last, max(main_height, height - log_height - 5)))
+
+    def _set_initial_log_split(self, main_panel, log_panel) -> None:
         """Set the sash once; later user adjustments remain untouched."""
         if not self.main_split.winfo_exists():
             return
         height = self.main_split.winfo_height()
         if height <= 1:
-            self.root.after(100, self._set_initial_log_split)
+            self.root.after(100, self._set_initial_log_split, main_panel, log_panel)
             return
-        self.main_split.sashpos(0, self._initial_split_position(height))
+        self.main_split.sashpos(0, self._initial_split_position(
+            height, main_panel.winfo_reqheight(), log_panel.winfo_reqheight(),
+        ))
 
     def _active_log_widget(self):
         return self.download_log if self.log_tabs.index("current") == 1 else self.log
@@ -560,7 +592,12 @@ class _App:
         ttk.Button(edit_actions, text="删除所选", command=self._monitor_remove).pack(side="left", padx=5)
         ttk.Button(edit_actions, text="启用/暂停所选", command=self._monitor_toggle).pack(side="left")
         columns = ("name", "target", "types", "minutes", "priority", "batch_size", "direction", "enabled", "next")
-        self.monitor_tree = ttk.Treeview(frame, columns=columns, show="headings", height=4)
+        table = ttk.Frame(frame)
+        table.pack(fill="x", padx=6)
+        self.monitor_tree = ttk.Treeview(table, columns=columns, show="headings", height=5)
+        monitor_scroll = ttk.Scrollbar(table, orient="vertical", command=self.monitor_tree.yview)
+        monitor_scroll.pack(side="right", fill="y")
+        self.monitor_tree.configure(yscrollcommand=monitor_scroll.set)
         for column, label, width in (
             ("name", "群组 / 频道名称", 180),
             ("target", "频道 ID / 用户名", 155),
@@ -574,7 +611,7 @@ class _App:
         ):
             self.monitor_tree.heading(column, text=label)
             self.monitor_tree.column(column, width=width)
-        self.monitor_tree.pack(fill="both", expand=True, padx=6)
+        self.monitor_tree.pack(side="left", fill="x", expand=True)
         self.monitor_tree.bind("<<TreeviewSelect>>", self._monitor_selection_changed)
         actions = ttk.Frame(frame)
         actions.pack(fill="x", padx=6, pady=4)
@@ -1696,24 +1733,10 @@ class _App:
         self._switch_main_account(account.id)
         self._log_account(account.id, "[账号] 已创建；使用「Telegram 登录」连接此账号")
 
-    def _rename_main_account(self, account_id: str) -> None:
-        if self._closing or account_id == DEFAULT_ACCOUNT or self._selected_view_account() != account_id:
-            return
-        account = next((row for row in self._account_registry.accounts() if row.id == account_id), None)
-        if account is None:
-            return
-        name = self.simpledialog.askstring(
-            "修改账号备注", "输入新备注，不会更改 Telegram 名称",
-            initialvalue=account.name, parent=self.root,
-        )
-        if not name or not name.strip() or name.strip() == account.name:
-            return
-        try:
-            self._account_registry.rename(account_id, name)
-            account_identity.rename_fallback(account_id, name)
-        except (ValueError, OSError) as exc:
-            self.messagebox.showerror("修改失败", str(exc), parent=self.root)
-            return
+    def _save_account_remark(self, account_id: str, remark: str) -> None:
+        self._account_registry.rename(account_id, remark)
+        if account_id != DEFAULT_ACCOUNT:
+            account_identity.rename_fallback(account_id, remark)
         self._refresh_main_account_choices()
         self._refresh_log_accounts()
 
@@ -1841,11 +1864,12 @@ class _App:
         self._gallery_title = ""
         self._set_main_log_account_filter(account_id)
         self._refresh_log_views()
-        self.status_var.set(
+        self._paint_account_status(
             getattr(self, "_default_status_text", "未登录") if account_id == "default"
             else (self._extra_runtimes[account_id].status
                   if account_id in self._extra_runtimes else "未登录")
         )
+        self._restore_saved_session(account_id)
 
     def _set_main_log_account_filter(self, account_id: str) -> None:
         self._refresh_log_accounts()
@@ -1924,14 +1948,16 @@ class _App:
         if expected_logs != getattr(self, "_log_filter_options", {}):
             self._refresh_log_accounts()
         if account_id == DEFAULT_ACCOUNT:
-            self.status_var.set(getattr(self, "_default_status_text", "未登录"))
+            self._paint_account_status(getattr(self, "_default_status_text", "未登录"))
         else:
             runtime = self._extra_runtimes.get(account_id)
             status = runtime.status if runtime is not None else "未登录"
             count = runtime.active_count if runtime is not None else 0
             monitor = ("监控运行中" if getattr(runtime, "monitoring", False) else
                        "监控停止中" if getattr(runtime, "monitoring_draining", False) else "监控未启动")
-            self.status_var.set(f"{status}｜{monitor}｜下载中 {count} 个")
+            if status.startswith("已连接"):
+                status = f"{status}｜{monitor}｜下载中 {count} 个"
+            self._paint_account_status(status)
             cache = getattr(self, "_account_dialog_cache", {})
             if (runtime is not None and runtime.status.startswith("已连接")
                     and account_id not in cache):
@@ -2186,11 +2212,25 @@ class _App:
 
         win.protocol("WM_DELETE_WINDOW", on_close)
 
+    def _paint_account_status(self, status: str) -> None:
+        color = "#546174"
+        if status.startswith(("已登录", "已连接")):
+            color = "#13794d"
+        elif status in ("登录已失效", "会话与账号不匹配"):
+            color = "#b62d32"
+            status += "｜请重新登录"
+        elif status == "恢复登录失败":
+            color = "#a05a14"
+            status += "｜请检查此账号的网络、代理或设置"
+        self.status_var.set(status)
+        if (label := getattr(self, "_account_status_label", None)) is not None:
+            label.configure(foreground=color)
+
     def _set_status(self, text: str) -> None:
         def apply():
             self._default_status_text = text
             if self._selected_view_account() == "default":
-                self.status_var.set(text)
+                self._paint_account_status(text)
         self.root.after(0, apply)
 
     def _current_download_dir(self) -> Path:
@@ -2358,9 +2398,25 @@ class _App:
             # entering a code. Only publish a fully authorized client.
             self._client_starting_task = asyncio.current_task()
             try:
-                settings = load_settings()
+                if authenticate is None:
+                    try:
+                        saved = self._saved_session_file(DEFAULT_ACCOUNT).stat()
+                    except (FileNotFoundError, NotADirectoryError):
+                        raise _SavedSessionMissing("没有旧会话，请点击主窗口的「Telegram 登录」。") from None
+                    if not stat.S_ISREG(saved.st_mode):
+                        raise _SavedSessionMissing("没有旧会话，请点击主窗口的「Telegram 登录」。")
+                    if not saved.st_size:
+                        raise _SavedSessionExpired("旧会话没有授权")
+                    settings = load_settings(
+                        env_path=self._account_registry.env_path(DEFAULT_ACCOUNT),
+                        session_path=self._account_registry.session_path(DEFAULT_ACCOUNT),
+                    )
+                else:
+                    settings = load_settings()
                 client = build_client(settings)
                 try:
+                    if authenticate is None and not client.session.auth_key:
+                        raise _SavedSessionExpired("旧会话没有授权")
                     if authenticate is not None:
                         me = await authenticate(client, settings.phone)
                     else:
@@ -2370,10 +2426,10 @@ class _App:
                             await client.connect()
                         me = await client.get_me()
                         if me is None:
-                            raise TGDLInputError("请先点击主窗口的「Telegram 登录」。")
+                            raise _SavedSessionExpired("登录已失效，请点击主窗口的「Telegram 登录」。")
                         if settings.phone and getattr(me, "phone", None):
                             if validate_login_phone(settings.phone) != validate_login_phone(me.phone):
-                                raise TGDLInputError("当前会话的 Telegram 号码与设置不符。")
+                                raise _SavedSessionMismatch("当前会话的 Telegram 号码与设置不符。")
                 except (asyncio.CancelledError, Exception):
                     self._client_starting_cleanup = True
                     await client.disconnect()
@@ -2422,6 +2478,88 @@ class _App:
             self._setup_frame = None
         self._log("已保存凭据。现在点「Telegram 登录」。\n")
 
+    def _saved_session_file(self, account_id: str) -> Path:
+        # AccountRegistry provides a stem; Telethon's SQLite backend appends .session.
+        return self._account_registry.session_path(account_id).with_suffix(".session")
+
+    def _check_saved_sessions_at_startup(self) -> None:
+        if self._closing:
+            return
+        for account in self._account_registry.accounts():
+            self._restore_saved_session(account.id)
+
+    def _restore_saved_session(self, account_id: str) -> bool:
+        """Reuse only the selected account's existing authorization; never show an auth dialog."""
+        if getattr(self, "_closing", False):
+            return False
+        if account_id == DEFAULT_ACCOUNT:
+            if getattr(self, "client", None) is not None:
+                return False
+            pending = getattr(self, "_default_login_future", None)
+        else:
+            runtime = self._extra_runtimes.get(account_id)
+            if (runtime is not None and runtime.client is not None
+                    and runtime.status.startswith("已连接")):
+                return False
+            pending = getattr(self, "_extra_futures", {}).get(account_id)
+        if pending is not None and not pending.done():
+            return True
+        try:
+            if not self._saved_session_file(account_id).is_file():
+                return False
+        except OSError as exc:
+            self._log_account(account_id, f"[会话恢复] 无法读取会话文件：{type(exc).__name__}")
+            return False
+
+        if account_id == DEFAULT_ACCOUNT:
+            async def restore_default():
+                if self._closing:
+                    return
+                self._default_login_task = asyncio.current_task()
+                try:
+                    self._set_status("正在恢复登录")
+                    await self._ensure_client()
+                    try:
+                        await self._load_dialogs()
+                    except Exception as exc:
+                        self._log_account(account_id, f"[频道列表] 加载失败：{type(exc).__name__}")
+                except _SavedSessionMissing:
+                    self._set_status("未登录")
+                except (_SavedSessionExpired, UnauthorizedError, AuthKeyDuplicatedError):
+                    self._set_status("登录已失效")
+                except _SavedSessionMismatch:
+                    self._set_status("会话与账号不匹配")
+                except Exception as exc:
+                    self._set_status("恢复登录失败")
+                    self._log_account(account_id, f"[会话恢复] 连接失败：{type(exc).__name__}")
+                finally:
+                    self._default_login_task = None
+
+            self._default_login_future = self.loop.submit(restore_default())
+            return True
+
+        from tgdl.multi_runtime import AccountMonitorRuntime
+
+        account = next((item for item in self._account_registry.accounts()
+                        if item.id == account_id), None)
+        if account is None:
+            return False
+
+        def connected():
+            if (not self._closing and self._extra_runtimes.get(account_id) is runtime
+                    and self._selected_view_account() == account_id):
+                self._load_secondary_dialogs(account_id)
+
+        runtime = AccountMonitorRuntime(
+            account, self._account_registry, ask=self._ask,
+            on_log=self._log_account, on_saved=self._log_download_account,
+            on_progress=self._update_download_progress, restore_session_only=True,
+            on_authenticated=lambda: self.root.after(0, connected),
+        )
+        self._extra_runtimes[account_id] = runtime
+        self._extra_futures[account_id] = self.loop.submit(runtime.run())
+        return True
+
     def on_login(self) -> None:
         self._open_account_login(self._selected_view_account())
 
@@ -2452,7 +2590,7 @@ class _App:
         else:
             pending = self._default_login_future
         if pending is not None and not pending.done():
-            self.messagebox.showinfo("登录 Telegram", "该账号正在关闭上一次登录，请稍后重试。")
+            self.messagebox.showinfo("登录 Telegram", "该账号正在连接或清理上一次连接，请稍候。")
             return
 
         path = self._account_registry.env_path(account_id)
@@ -2544,6 +2682,8 @@ class _App:
         if account_id != "default":
             runtime = self._extra_runtimes.get(account_id)
             if runtime is None or runtime.client is None or not runtime.status.startswith("已连接"):
+                if self._restore_saved_session(account_id):
+                    return
                 self.messagebox.showinfo("当前账号未连接", "请先使用主窗口的「Telegram 登录」。")
                 return
             self._load_secondary_dialogs(account_id, force=True)
@@ -2792,10 +2932,24 @@ class _App:
         except Exception as exc:  # noqa: BLE001
             self._log_account(self._selected_view_account(), f"[错误] 打不开文件夹:{exc}\n")
 
+    def _show_centered_settings(self, window) -> None:
+        """Position the completed form relative to the running app, not the desktop."""
+        window.update_idletasks()
+        parent = self.root
+        left = parent.winfo_rootx() + (parent.winfo_width() - window.winfo_reqwidth()) // 2
+        top = parent.winfo_rooty() + (parent.winfo_height() - window.winfo_reqheight()) // 2
+        window.geometry(f"+{left}+{top}")
+        window.deiconify()
+
     def _open_settings(self) -> None:
         settings_account_id = self._selected_view_account()
+        account = next((row for row in self._account_registry.accounts()
+                        if row.id == settings_account_id), None)
+        if account is None:
+            return
         tk, ttk = self.tk, self.ttk
         win = tk.Toplevel(self.root)
+        win.withdraw()
         win.title(f"账号设置：{account_identity.label(settings_account_id)}")
         win.transient(self.root)
         pad = {"padx": 8, "pady": 6}
@@ -2814,7 +2968,11 @@ class _App:
         )
         draft = {key: tk.StringVar(master=win, value=original[key])
                  for key, _label, _main_var, _secret in fields}
-        for row, (key, label, _main_var, secret) in enumerate(fields):
+        remark_label = "本地备注（可留空）" if settings_account_id == DEFAULT_ACCOUNT else "本地备注"
+        remark = tk.StringVar(master=win, value=account.name)
+        ttk.Label(win, text=remark_label).grid(row=0, column=0, sticky="w", **pad)
+        ttk.Entry(win, textvariable=remark, width=43).grid(row=0, column=1, sticky="we", **pad)
+        for row, (key, label, _main_var, secret) in enumerate(fields, start=1):
             ttk.Label(win, text=label).grid(row=row, column=0, sticky="w", **pad)
             ttk.Entry(win, textvariable=draft[key], width=43, show="*" if secret else "").grid(
                 row=row, column=1, sticky="we", **pad
@@ -2823,21 +2981,26 @@ class _App:
             win,
             text="SSD 缓存：最大 20 GiB，至少保留 10 GiB 可用空间；满额排队等待，不回退机械盘",
             foreground="#555",
-        ).grid(row=len(fields), column=0, columnspan=2, sticky="w", **pad)
+        ).grid(row=len(fields) + 1, column=0, columnspan=2, sticky="w", **pad)
         ttk.Button(win, text="检查并清理残留缓存", command=lambda: self._manual_cache_cleanup(
             draft["temp_download_dir"].get(), draft["download_dir"].get(),
             owner_id=settings_account_id,
         )).grid(
-            row=len(fields) + 1, column=1, sticky="e", **pad
+            row=len(fields) + 2, column=0, sticky="w", **pad
         )
 
         def save_and_close():
+            if self._closing:
+                return
             if self._selected_view_account() != settings_account_id:
                 self.messagebox.showwarning(
                     "账号已切换", "设置窗口对应的账号已切换，请关闭窗口后重新打开。"
                 )
                 return
             try:
+                new_remark = remark.get().strip()
+                if settings_account_id != DEFAULT_ACCOUNT and not new_remark:
+                    raise ValueError("附加账号的本地备注不能为空。")
                 values = read_env_values(path)
                 edits = {}
                 for key, var in draft.items():
@@ -2847,15 +3010,17 @@ class _App:
                             "proxy_username", "proxy_password", "download_dir", "temp_download_dir",
                         ) else value.strip()
                 values.update(edits)
-                host, port = values["proxy_host"], values["proxy_port"]
-                if port and not host:
-                    raise ValueError("填写端口时必须填写 SOCKS5 主机。")
-                if host and not 1 <= int(port or "1080") <= 65535:
-                    raise ValueError("SOCKS5 端口必须在 1-65535 之间。")
                 if edits:
+                    host, port = values["proxy_host"], values["proxy_port"]
+                    if port and not host:
+                        raise ValueError("填写端口时必须填写 SOCKS5 主机。")
+                    if host and not 1 <= int(port or "1080") <= 65535:
+                        raise ValueError("SOCKS5 端口必须在 1-65535 之间。")
                     update_env(values, path)
+                if new_remark != account.name:
+                    self._save_account_remark(settings_account_id, new_remark)
             except (ValueError, OSError) as exc:
-                self.messagebox.showwarning("账号设置无效", str(exc))
+                self.messagebox.showwarning("账号设置无效", str(exc), parent=win)
                 return
             for key, _label, main_var, _secret in fields:
                 if main_var is not None:
@@ -2872,12 +3037,9 @@ class _App:
             self._log_account(settings_account_id, "设置已保存。\n")
 
         ttk.Button(win, text="保存", command=save_and_close).grid(
-            row=len(fields), column=1, sticky="e", **pad
+            row=len(fields) + 2, column=1, sticky="e", **pad
         )
-        if settings_account_id != DEFAULT_ACCOUNT:
-            ttk.Button(win, text="修改备注", command=lambda: self._rename_main_account(
-                settings_account_id
-            )).grid(row=len(fields) + 1, column=0, sticky="w", **pad)
+        self._show_centered_settings(win)
 
     # ---------- lifecycle ----------
     @staticmethod

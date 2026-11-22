@@ -75,7 +75,8 @@ The GUI's automatic migration already checks this safely.
 
 ## New files
 
-- `data/accounts.json`: account IDs and display names, not passwords
+- `data/accounts.json`: secondary account IDs and local remarks, not passwords.
+- `data/accounts/default/remark.json`: optional local remark for the original account. This is separate so earlier releases can still read the secondary-account registry.
 - `data/accounts/default/.env`: original account's API/phone/proxy/download settings. Automatically copied from legacy `data/.env` on the first start using a temporary file and atomic replace; the original file is left intact for rollback. Existing new file always takes precedence.
 - `data/accounts/default/tgdl_session.session`: original account's session,
   automatically copied from the legacy `data/tgdl_session.session` by a
