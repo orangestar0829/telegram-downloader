@@ -418,7 +418,6 @@ class _App:
 
         # Your chats.
         chats = ttk.LabelFrame(main_panel, text="我的群组 / 频道(登录后自动加载)")
-        chats.pack(fill="both", expand=True, **pad)
         self._dialog_rows: list[tuple[str, str, str, str]] = []
         self.dialog_search_var = tk.StringVar()
         search_row = ttk.Frame(chats)
@@ -434,7 +433,7 @@ class _App:
         ttk.Label(search_row, textvariable=self.dialog_search_count).pack(side="left")
         self.dialog_search_var.trace_add("write", lambda *_: self._filter_dialog_tree())
         cols = ("id", "kind", "name")
-        self.tree = ttk.Treeview(chats, columns=cols, show="headings", height=5, selectmode="browse")
+        self.tree = ttk.Treeview(chats, columns=cols, show="headings", height=10, selectmode="browse")
         self.tree.heading("id", text="ID")
         self.tree.heading("kind", text="类型")
         self.tree.heading("name", text="名称")
@@ -455,8 +454,12 @@ class _App:
 
         # Download / advanced tabs.
         tabs_row = ttk.Frame(main_panel)
-        tabs_row.pack(fill="x", **pad)
+        # Allocate space to the download controls before the chat list. The
+        # list can shrink and scroll, but must not grow to fill spare height.
+        tabs_row.pack(side="bottom", fill="x", **pad)
+        chats.pack(side="top", fill="x", **pad)
         nb = ttk.Notebook(tabs_row)
+        self.feature_tabs = nb
         nb.pack(side="left", fill="x", expand=True)
         nb.add(self._build_gallery_tab(), text="浏览媒体(选图/视频)")
         nb.add(self._build_download_tab(), text="批量下载")
@@ -465,11 +468,8 @@ class _App:
         nb.add(self._build_download_settings_tab(), text="下载设置")
         nb.add(self._build_parse_tab(), text="解析链接(高级)")
         nb.select(monitor_tab)
-        def resize_tab(_event=None):
-            self.root.after_idle(self._resize_selected_feature_tab, nb)
-
-        nb.bind("<<NotebookTabChanged>>", resize_tab, add="+")
-        resize_tab()
+        # Keep one shared page height. Selecting a shorter tab must not move
+        # the chat list, download path, or log sash.
 
         logframe = ttk.LabelFrame(log_panel, text="日志和实时进度（拖动上方分隔线调整高度）")
         logframe.pack(fill="both", expand=True, **pad)
@@ -514,13 +514,6 @@ class _App:
         )
         self._refresh_log_accounts()
         self.root.after_idle(self._set_initial_log_split, main_panel, log_panel)
-
-    @staticmethod
-    def _resize_selected_feature_tab(notebook) -> None:
-        """Do not let a tall gallery create empty space in compact pages."""
-        if notebook.winfo_exists() and (selected := notebook.select()):
-            page = notebook.nametowidget(selected)
-            notebook.configure(height=max(1, page.winfo_reqheight()))
 
     @staticmethod
     def _initial_split_position(
@@ -1466,7 +1459,7 @@ class _App:
 
         wrap = ttk.Frame(frame)
         wrap.pack(fill="both", expand=True, **pad)
-        self.gallery_canvas = tk.Canvas(wrap, height=300, background="#f5f5f5", highlightthickness=0)
+        self.gallery_canvas = tk.Canvas(wrap, height=160, background="#f5f5f5", highlightthickness=0)
         vbar = ttk.Scrollbar(wrap, orient="vertical", command=self.gallery_canvas.yview)
         self.gallery_canvas.configure(yscrollcommand=vbar.set)
         self.gallery_canvas.pack(side="left", fill="both", expand=True)
@@ -1718,9 +1711,9 @@ class _App:
         if self._closing:
             return
         name = self.simpledialog.askstring(
-            "添加 Telegram 账号", "输入用于区分此账号的备注", parent=self.root
+            "添加 Telegram 账号", "本地备注（选填，留空可直接添加）", parent=self.root
         )
-        if not name or not name.strip():
+        if name is None:
             self._refresh_main_account_choices()
             return
         try:
@@ -2968,9 +2961,8 @@ class _App:
         )
         draft = {key: tk.StringVar(master=win, value=original[key])
                  for key, _label, _main_var, _secret in fields}
-        remark_label = "本地备注（可留空）" if settings_account_id == DEFAULT_ACCOUNT else "本地备注"
         remark = tk.StringVar(master=win, value=account.name)
-        ttk.Label(win, text=remark_label).grid(row=0, column=0, sticky="w", **pad)
+        ttk.Label(win, text="本地备注（可留空）").grid(row=0, column=0, sticky="w", **pad)
         ttk.Entry(win, textvariable=remark, width=43).grid(row=0, column=1, sticky="we", **pad)
         for row, (key, label, _main_var, secret) in enumerate(fields, start=1):
             ttk.Label(win, text=label).grid(row=row, column=0, sticky="w", **pad)
@@ -2999,8 +2991,6 @@ class _App:
                 return
             try:
                 new_remark = remark.get().strip()
-                if settings_account_id != DEFAULT_ACCOUNT and not new_remark:
-                    raise ValueError("附加账号的本地备注不能为空。")
                 values = read_env_values(path)
                 edits = {}
                 for key, var in draft.items():

@@ -57,9 +57,10 @@ class AccountRegistry:
             if not isinstance(row, dict):
                 raise ValueError("Invalid account registry entry")
             account_id = self.validate(str(row.get("id", "")))
-            name = str(row.get("name", "")).strip()
-            if account_id in seen or not name:
-                raise ValueError("Duplicate account id or missing name")
+            raw_name = row.get("remark", row.get("name", ""))
+            name = raw_name.strip() if isinstance(raw_name, str) else ""
+            if account_id in seen:
+                raise ValueError("Duplicate account id")
             seen.add(account_id)
             result.append(Account(account_id, name))
         return result
@@ -75,12 +76,16 @@ class AccountRegistry:
             temporary.unlink(missing_ok=True)
 
     def _write(self, rows: list[Account]) -> None:
-        self._write_json(self.registry_file, [{"id": a.id, "name": a.name} for a in rows])
+        # Older builds require a nonempty name when reading accounts.json.
+        # Carry an explicit empty remark without making downgrade lose accounts.
+        self._write_json(self.registry_file, [
+            {"id": a.id, "name": a.name} if a.name else
+            {"id": a.id, "name": f"账号 {a.id[:8]}", "remark": ""}
+            for a in rows
+        ])
 
-    def add(self, name: str) -> Account:
+    def add(self, name: str = "") -> Account:
         name = name.strip()
-        if not name:
-            raise ValueError("Account name is required")
         existing = self.accounts()
         account = Account(uuid.uuid4().hex[:16], name)
         while account.id in {a.id for a in existing}:
@@ -107,8 +112,6 @@ class AccountRegistry:
         if account_id == DEFAULT_ACCOUNT:
             self._write_json(self._default_remark_file, name)
             return
-        if not name:
-            raise ValueError("Account name is required")
         rows = self.accounts()[1:]
         if not any(a.id == account_id for a in rows):
             raise ValueError("Unknown account")

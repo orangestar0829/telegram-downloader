@@ -357,3 +357,19 @@ def test_invalid_default_account_remark_does_not_block_accounts(tmp_path):
         ("default", ""), (extra.id, "extra"),
     ]
     assert remark.read_text(encoding="utf-8") == "{invalid"
+
+
+def test_secondary_remark_is_optional_on_disk_and_can_be_replaced(tmp_path):
+    import json
+    from tgdl.accounts import AccountRegistry
+
+    registry = AccountRegistry(tmp_path)
+    account = registry.add()
+    assert registry.accounts()[-1] == account
+    assert account.name == ""
+    raw = json.loads(registry.registry_file.read_text(encoding="utf-8"))
+    assert raw[0]["name"]  # An earlier preview still sees a valid account row.
+    registry.rename(account.id, "  Secondary  ")
+    assert registry.accounts()[-1].name == "Secondary"
+    registry.rename(account.id, "")
+    assert AccountRegistry(tmp_path).accounts()[-1] == account

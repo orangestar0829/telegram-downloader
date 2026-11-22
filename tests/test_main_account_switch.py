@@ -420,7 +420,8 @@ def test_main_settings_dialog_preserves_peer_edits_to_same_profile(tmp_path):
     assert saved["phone"] == "+222"  # Login phone is account-local, not in this form.
 
 
-def test_dropdown_adds_and_selects_account_without_changing_active_account(tmp_path):
+@pytest.mark.parametrize("remark", ["", "New account"])
+def test_dropdown_adds_and_selects_account_without_changing_active_account(tmp_path, remark):
     from tgdl.config import read_env_values
     from tgdl.gui import _ADD_ACCOUNT_CHOICE
 
@@ -437,11 +438,11 @@ def test_dropdown_adds_and_selects_account_without_changing_active_account(tmp_p
     assert app.main_account_choice.get() != _ADD_ACCOUNT_CHOICE
 
     app.main_account_choice.set(_ADD_ACCOUNT_CHOICE)
-    app.simpledialog.askstring = lambda *_args, **_kwargs: "New account"
+    app.simpledialog.askstring = lambda *_args, **_kwargs: remark
     app._switch_main_account()
     new_id = app._selected_view_account()
     assert new_id not in ("default", b.id)
-    assert app._account_registry.accounts()[-1].name == "New account"
+    assert app._account_registry.accounts()[-1].name == remark
     assert read_env_values(app._account_registry.env_path(new_id))["proxy_host"] == ""
     assert a_path.read_bytes() == before
     assert app._monitor_active is True
@@ -560,7 +561,7 @@ def test_settings_saves_inline_remark_and_updates_dropdown_without_relogin(tmp_p
     app._show_centered_settings = lambda _window: None
     app._open_settings()
     assert "修改备注" not in buttons  # One settings form, one Save action.
-    assert ("本地备注（可留空）" if kind == "default" else "本地备注") in labels
+    assert "本地备注（可留空）" in labels
     assert drafts[-1].get() == ("" if kind == "default" else b.name)
     drafts[-1].set("  下载专用  ")
     buttons["保存"]()
@@ -575,13 +576,12 @@ def test_settings_saves_inline_remark_and_updates_dropdown_without_relogin(tmp_p
     assert path.read_bytes() == before_env
     assert destroyed == [True]
 
-    if kind == "default":
-        app._open_settings()
-        assert drafts[-1].get() == "下载专用"
-        drafts[-1].set("")
-        buttons["保存"]()
-        assert reopened.accounts()[0].name == ""
-        assert app.main_account_choice.get() == label
+    app._open_settings()
+    assert drafts[-1].get() == "下载专用"
+    drafts[-1].set("")
+    buttons["保存"]()
+    assert next(row.name for row in reopened.accounts() if row.id == account_id) == ""
+    assert app.main_account_choice.get() == label
 
 
 def test_account_selector_omits_redundant_remark(tmp_path, monkeypatch):

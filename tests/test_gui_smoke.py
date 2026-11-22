@@ -79,20 +79,56 @@ def test_split_prefers_full_log_height_when_space_is_available():
     assert split(540, main_height=405, log_height=365) == 320
 
 
-def test_feature_notebook_resizes_to_the_selected_page():
-    captured = []
-    notebook = SimpleNamespace(
-        winfo_exists=lambda: True,
-        select=lambda: "monitor",
-        nametowidget=lambda name: SimpleNamespace(winfo_reqheight=lambda: {
-            "monitor": 240, "gallery": 345,
-        }[name]),
-        configure=lambda **kw: captured.append(kw["height"]),
-    )
-    gui._App._resize_selected_feature_tab(notebook)
-    notebook.select = lambda: "gallery"
-    gui._App._resize_selected_feature_tab(notebook)
-    assert captured == [240, 345]
+def test_group_list_scrolls_and_keeps_its_height_when_switching_tabs():
+    import pytest
+    tk = pytest.importorskip("tkinter")
+    from tkinter import scrolledtext, ttk
+    try:
+        root = tk.Tk()
+    except tk.TclError:
+        pytest.skip("Tk display unavailable")
+
+    try:
+        root.geometry("1100x900")
+        app = object.__new__(gui._App)
+        app.root, app.tk, app.ttk, app.scrolledtext = root, tk, ttk, scrolledtext
+        app.creds_available = True
+        app._refresh_main_account_choices = lambda: None
+        app._refresh_log_accounts = lambda: None
+        app._monitor_refresh = lambda: None
+        for name in ("download_dir_var", "manual_var", "status_var", "log_account_filter",
+                     "g_limit", "dl_limit", "media_concurrency_var", "media_retries_var",
+                     "chunk_concurrency_var", "media_speed_kib_var", "p_limit"):
+            setattr(app, name, tk.StringVar(root))
+        for name in ("type_photo", "type_video", "type_anim", "p_no_previews",
+                     "p_no_bt", "p_dry", "p_catalog_only"):
+            setattr(app, name, tk.BooleanVar(root))
+        app._build_ui()
+        root.update()
+        for i in range(30):
+            app.tree.insert("", "end", values=(i, "channel", f"Channel {i}"))
+        root.update()
+        assert int(app.tree.cget("height")) == 10
+        assert round(app.tree.yview()[1] * 30) == 10
+        app.tree.yview_moveto(1)
+        assert app.tree.yview()[1] == 1
+
+        def layout():
+            return (app.tree.winfo_height(), app.feature_tabs.winfo_y(),
+                    app.feature_tabs.winfo_height(), app.main_split.sashpos(0))
+
+        for height in (900, 620):
+            root.geometry(f"1100x{height}")
+            root.update()
+            before = layout()
+            for page in app.feature_tabs.tabs():
+                app.feature_tabs.select(page)
+                root.update()
+                assert layout() == before
+            assert app.feature_tabs.winfo_viewable()
+            assert app.log_tabs.winfo_viewable()
+    finally:
+        root.destroy()
 
 
 def test_monitor_table_requests_five_rows_and_uses_vertical_scrollbar():
