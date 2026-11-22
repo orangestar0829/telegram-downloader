@@ -73,7 +73,10 @@ class AccountWindow:
         # Embedded joined-channel selector; per-account cache avoids reloading on every switch.
         self._dialog_cache = getattr(app, "_account_dialog_cache", {})
         app._account_dialog_cache = self._dialog_cache
-        self._dialog_loading: set[str] = set()
+        # Share in-flight request tracking with the main account selector to
+        # avoid fetching the same Telegram dialogs in both windows.
+        self._dialog_loading = getattr(app, "_account_dialog_fetches", set())
+        app._account_dialog_fetches = self._dialog_loading
         self._dialog_retry_at: dict[str, float] = {}
         self.dialog_keyword = tk.StringVar()
         self.dialog_counter = tk.StringVar(value="未加载")
@@ -485,7 +488,9 @@ class AccountWindow:
     def _refresh_dialog_tree(self) -> None:
         account_id = self._selected_id()
         if account_id == DEFAULT_ACCOUNT:
-            rows = getattr(self.app, "_dialog_rows", [])
+            # The main window may currently display B's dialogs.
+            rows = getattr(self.app, "_default_dialog_rows",
+                           getattr(self.app, "_dialog_rows", []))
         else:
             rows = self._dialog_cache.get(account_id, [])
         selected = self.dialog_tree.selection()
@@ -511,8 +516,15 @@ class AccountWindow:
         from tgdl.channels import list_media_dialogs
         account_id = self._selected_id()
         if account_id == DEFAULT_ACCOUNT:
-            if force and self.app.client is not None:
-                self.app.on_list()
+            if force:
+                if self.app.client is not None:
+                    # Always request through A's client, even if the main
+                    # window is currently displaying account B.
+                    self.app._run_task(self.app._load_dialogs(), None)
+                else:
+                    self.app.messagebox.showinfo(
+                        "频道列表", "请先在主窗口登录原账号", parent=self.win
+                    )
             self._refresh_dialog_tree()
             return
         if account_id in self._dialog_loading:
