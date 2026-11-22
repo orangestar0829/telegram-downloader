@@ -36,6 +36,7 @@ GUI 的运行日志/下载记录支持账号筛选，避免一直累积日志导
 PR 构建在 Releases 使用独立的 `preview-pr-4-<提交SHA>` **预发布测试包**，按提交保留源码、Windows 安装包、便携包和 SHA256 校验文件，不覆盖历史预览或发布正式 Release。固定名称的旧 `preview-pr-4` 不再更新。
 
 用 Telegram **官方 MTProto API**（Telethon）登录你自己的账号，下载**你已经加入**的频道或群里的图片和视频。
+源码依赖、CI 测试和 Windows 打包统一使用 Telethon 1.46.0。
 
 它不能破解没权限的频道，也不能绕过 Telegram 的成员限制。
 
