@@ -22,8 +22,8 @@ class Account:
 class AccountRegistry:
     """The legacy root .env/session/monitor files *are* the default account.
 
-    Additional accounts store only their private settings/session/monitor files
-    in accounts/<id>/. All accounts share the one download history database.
+    All accounts keep separate session files under accounts/<id>/. The original
+    account keeps its legacy .env/monitor settings; all share download history.
     """
 
     def __init__(self, root: Path | None = None) -> None:
@@ -110,7 +110,8 @@ class AccountRegistry:
         return self.account_dir(account_id) / ".env"
 
     def session_path(self, account_id: str) -> Path:
-        return self.account_dir(account_id) / "tgdl_session"
+        self.validate(account_id)
+        return self.root / "accounts" / account_id / "tgdl_session"
 
     def monitor_path(self, account_id: str) -> Path:
         return self.account_dir(account_id) / "monitored_channels.json"

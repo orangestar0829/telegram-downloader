@@ -22,7 +22,7 @@ def test_second_account_uses_isolated_env_session_and_monitor_paths(tmp_path):
     second = registry.add("账号 B")
     assert len(registry.accounts()) == 2
     assert registry.env_path(DEFAULT_ACCOUNT).read_bytes() == original
-    assert registry.session_path(DEFAULT_ACCOUNT) == tmp_path / "tgdl_session"
+    assert registry.session_path(DEFAULT_ACCOUNT) == tmp_path / "accounts" / "default" / "tgdl_session"
     assert registry.session_path(second.id) != registry.session_path(DEFAULT_ACCOUNT)
     assert registry.monitor_path(second.id) != registry.monitor_path(DEFAULT_ACCOUNT)
     assert not registry.session_path(second.id).with_suffix(".session").exists()

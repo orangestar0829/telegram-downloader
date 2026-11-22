@@ -10,6 +10,7 @@ from tgdl.history import DownloadHistory, PendingMedia
 from tgdl.monitor import save_channels
 from tgdl import multi_runtime
 from tgdl.account_context import current_account_id
+from tgdl.account_identity import account_identity
 from tgdl.gui import _QueueWriter
 from tgdl.log_format import TimestampedLines
 import queue
@@ -129,9 +130,9 @@ def test_print_context_marks_secondary_account():
         writer.write("download started\n")
     finally:
         current_account_id.reset(token)
-    assert "[账号:acc-b]" in queue_out.get_nowait()
+    assert "[账号:" + account_identity.label("acc-b") + "]" in queue_out.get_nowait()
     writer.write("legacy\n")
-    assert "[账号:acc-b]" not in queue_out.get_nowait()
+    assert "[账号:原账号（未登录）]" in queue_out.get_nowait()
 
 
 def test_account_tag_is_not_repeated_when_print_splits_newline():
@@ -143,4 +144,4 @@ def test_account_tag_is_not_repeated_when_print_splits_newline():
         writer.write("\n")
     finally:
         current_account_id.reset(token)
-    assert "".join(out.get_nowait() for _ in range(2)).count("[账号:acc-b]") == 1
+    assert "".join(out.get_nowait() for _ in range(2)).count("[账号:" + account_identity.label("acc-b") + "]") == 1

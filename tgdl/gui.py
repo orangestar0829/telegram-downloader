@@ -25,6 +25,7 @@ from pathlib import Path
 
 from tgdl.accounts import AccountRegistry
 from tgdl.account_context import current_account_id
+from tgdl.account_identity import account_identity
 from tgdl.log_store import DailyLogStore
 
 from tgdl.browser import list_media, save_items
@@ -135,7 +136,7 @@ class _QueueWriter:
         if text:
             owner = current_account_id.get()
             formatted = self._formatter.format(
-                text, prefix=f"[账号:{owner}] " if owner != "default" else ""
+                text, prefix=f"[账号:{account_identity.label(owner)}] "
             )
             self._sink.put(formatted)
             if self._persist is not None:
@@ -182,6 +183,8 @@ class _App:
         self.client = None
         self.settings: Settings | None = None
         self._account_registry = AccountRegistry(data_dir())
+        for registered in self._account_registry.accounts():
+            account_identity.register(registered.id, registered.name)
         self._extra_runtimes = {}
         self._extra_futures = {}
         self._log_store = DailyLogStore(data_dir() / "logs")
@@ -227,9 +230,9 @@ class _App:
             self._cleanup_path(env["temp_download_dir"]),
             self._cleanup_path(env["download_dir"]),
         )
-        self.log_queue.put(startup_cache.summary() + "\n")
+        self.log_queue.put(f"[账号:{account_identity.label('default')}] {startup_cache.summary()}\n")
         for error in startup_cache.failed:
-            self.log_queue.put(f"[缓存清理] {error}\n")
+            self.log_queue.put(f"[账号:{account_identity.label('default')}] [缓存清理] {error}\n")
         self.proxy_host_var = tk.StringVar(value=env["proxy_host"])
         self.proxy_port_var = tk.StringVar(value=env["proxy_port"])
         self.proxy_username_var = tk.StringVar(value=env["proxy_username"])
@@ -1458,15 +1461,19 @@ class _App:
     # ---------- helpers ----------
     def _log(self, text: str) -> None:
         owner = current_account_id.get()
-        if owner != "default" and "[账号:" not in text:
-            text = f"[账号:{owner}] {text}"
-        line = self._timestamp_formatter.format(text)
+        label = account_identity.label(owner)
+        if not text.startswith("[账号:"):
+            line = self._timestamp_formatter.format(text, prefix=f"[账号:{label}] ")
+        else:
+            line = self._timestamp_formatter.format(text)
         self.log_queue.put(line)
         store = getattr(self, "_log_store", None)
         if store is not None:
             store.write(line)
 
     def _log_download(self, text: str) -> None:
+        if not text.startswith("[账号:"):
+            text = f"[账号:{account_identity.label(current_account_id.get())}] {text}"
         line = self._download_timestamp_formatter.format(text + "\n")
         self.download_queue.put(line)
         store = getattr(self, "_log_store", None)
@@ -1474,10 +1481,10 @@ class _App:
             store.write("[下载记录] " + line)
 
     def _log_account(self, account_id: str, text: str) -> None:
-        self._log(f"[账号:{account_id}] {text.rstrip()}" + "\n")
+        self._log(f"[账号:{account_identity.label(account_id)}] {text.rstrip()}" + "\n")
 
     def _log_download_account(self, account_id: str, text: str) -> None:
-        self._log_download(f"[账号:{account_id}] {text}")
+        self._log_download(f"[账号:{account_identity.label(account_id)}] {text}")
 
     def _open_accounts(self) -> None:
         from tgdl.accounts_gui import AccountWindow
@@ -1492,8 +1499,17 @@ class _App:
         registry = getattr(self, "_account_registry", None)
         if registry is not None:
             for account in registry.accounts():
-                choices[f"{account.name}（{account.id}）"] = account.id
+                choices[f"{account_identity.label(account.id)}（{account.name}）"] = account.id
+        current = getattr(self, "log_account_filter", None)
+        selected_id = (
+            self._log_filter_options.get(current.get())
+            if current is not None else None
+        )
         self._log_filter_options = choices
+        if current is not None and selected_id is not None:
+            new_value = next((name for name, account in choices.items()
+                              if account == selected_id), "全部账号")
+            current.set(new_value)
         selector = getattr(self, "_log_filter_selector", None)
         if selector is not None:
             selector.configure(values=list(choices))
@@ -1513,7 +1529,7 @@ class _App:
     def _log_visible(self, chunk: str) -> bool:
         var = getattr(self, "log_account_filter", None)
         selected = self._log_filter_options.get(var.get()) if var is not None else None
-        return selected is None or selected == self._line_account(chunk)
+        return selected is None or account_identity.belongs(selected, self._line_account(chunk))
 
     def _refresh_log_views(self) -> None:
         for widget, records, popup in (
@@ -1783,7 +1799,9 @@ class _App:
             raise RuntimeError("登录失败")
         name = " ".join(p for p in (me.first_name, me.last_name) if p)
         handle = f"@{me.username}" if me.username else ""
-        print(f"已登录:{name} {handle} (id={me.id})".strip())
+        account_identity.update("default", me)
+        self.root.after(0, self._refresh_log_accounts)
+        print(f"已登录:{name} {handle}".strip())
         self._set_status(f"已登录:{name} {handle}".strip())
         return self.client
 

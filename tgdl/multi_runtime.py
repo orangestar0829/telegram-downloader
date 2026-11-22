@@ -17,6 +17,7 @@ from telethon.errors import FloodWaitError
 
 from tgdl.accounts import Account, AccountRegistry
 from tgdl.account_context import current_account_id
+from tgdl.account_identity import account_identity
 from tgdl.client import build_client
 from tgdl.config import load_settings, read_env_values
 from tgdl.downloader import (
@@ -208,7 +209,7 @@ class AccountMonitorRuntime:
                 ),
                 temp_download_dir=settings.temp_download_dir,
                 on_progress=lambda key, label, done, total, state: self.on_progress(
-                    f"{self.account.id}:{key}", f"[{self.account.name}] {label}",
+                    f"{self.account.id}:{key}", f"[{account_identity.label(self.account.id)}] {label}",
                     done, total, state
                 ),
                 monitor_flow=flow,
@@ -394,7 +395,7 @@ class AccountMonitorRuntime:
                     raise RuntimeError(
                         "此账号 Session 已登录其他号码；请检查 B 账号是否误用了别的 Session 文件"
                     )
-            self.status = f"已连接：{getattr(me, 'first_name', '') or me.id}"
+            self.status = f"已连接：{account_identity.update(self.account.id, me)}"
             self.log(f"[账号连接] {self.status}")
             scan = asyncio.create_task(self._scan_loop())
             download = asyncio.create_task(self._download_loop(settings))

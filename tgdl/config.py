@@ -9,7 +9,7 @@ from tgdl.paths import prepare_data_dir
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = prepare_data_dir()
-SESSION_PATH = DATA_DIR / "tgdl_session"
+SESSION_PATH = DATA_DIR / "accounts" / "default" / "tgdl_session"
 ENV_PATH = DATA_DIR / ".env"
 
 _ENV_KEYS = {

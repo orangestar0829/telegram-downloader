@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from tgdl.accounts import DEFAULT_ACCOUNT
+from tgdl.account_identity import account_identity
 from tgdl.dialog_filter import filter_dialogs
 from tgdl.config import read_env_values, update_env
 from tgdl.monitor import load_channels, save_channels
@@ -29,8 +30,8 @@ class AccountWindow:
         self.tk, self.ttk = tk, ttk
         self.win = tk.Toplevel(app.root)
         self.win.title("多账号管理 · 各账号独立扫描和代理")
-        self.win.geometry("1050x760")
-        self.win.minsize(900, 660)
+        self.win.geometry("1140x900")
+        self.win.minsize(930, 750)
         self.choice = tk.StringVar()
         self._ids: dict[str, str] = {}
         self.status = tk.StringVar()
@@ -69,58 +70,116 @@ class AccountWindow:
         for column in (1, 3):
             settings_frame.columnconfigure(column, weight=1)
 
+        # Embedded joined-channel selector; per-account cache avoids reloading on every switch.
+        self._dialog_cache = getattr(app, "_account_dialog_cache", {})
+        app._account_dialog_cache = self._dialog_cache
+        self._dialog_loading: set[str] = set()
+        self._dialog_retry_at: dict[str, float] = {}
+        self.dialog_keyword = tk.StringVar()
+        self.dialog_counter = tk.StringVar(value="未加载")
+        joined = ttk.LabelFrame(self.win, text="我的群组 / 频道（当前 TG 账号）")
+        joined.pack(fill="both", expand=False, padx=10, pady=(5, 2))
+        search = ttk.Frame(joined)
+        search.pack(fill="x", padx=6, pady=3)
+        ttk.Label(search, text="筛选群组/频道").pack(side="left")
+        ttk.Entry(search, textvariable=self.dialog_keyword).pack(
+            side="left", fill="x", expand=True, padx=7
+        )
+        ttk.Button(search, text="清空", command=lambda: self.dialog_keyword.set("")).pack(side="left")
+        ttk.Button(search, text="刷新列表", command=lambda: self._ensure_dialogs(force=True)).pack(
+            side="left", padx=6
+        )
+        ttk.Label(search, textvariable=self.dialog_counter).pack(side="left")
+        self.dialog_keyword.trace_add("write", lambda *_: self._refresh_dialog_tree())
+        self.dialog_tree = ttk.Treeview(
+            joined, columns=("id", "kind", "name"), show="headings", height=5,
+            selectmode="browse",
+        )
+        for column, label, width in (
+            ("id", "ID", 175), ("kind", "类型", 105), ("name", "名称", 560),
+        ):
+            self.dialog_tree.heading(column, text=label)
+            self.dialog_tree.column(column, width=width, stretch=(column == "name"))
+        self.dialog_tree.pack(fill="both", expand=True, padx=6, pady=(0, 5))
+        self.dialog_tree.bind("<<TreeviewSelect>>", self._dialog_selected)
+
         monitors = ttk.LabelFrame(
             self.win, text="该账号独立监控的频道（未开启的频道绝不参与下载）"
         )
         monitors.pack(fill="both", expand=True, padx=10, pady=5)
-        cols = ("target", "name", "minutes", "priority", "batch_size", "types", "direction", "enabled")
-        self.tree = ttk.Treeview(monitors, columns=cols, show="headings", height=6)
+        cols = ("name", "target", "types", "minutes", "priority", "batch_size", "direction", "enabled", "next")
+        self.tree = ttk.Treeview(monitors, columns=cols, show="headings", height=5)
         for col, label, width in (
-            ("target", "频道 ID/@用户名", 170),
-            ("name", "名称", 130),
-            ("minutes", "扫描间隔", 80),
+            ("name", "群组 / 频道名称", 180),
+            ("target", "频道 ID / 用户名", 155),
+            ("types", "下载类型", 125),
+            ("minutes", "间隔(分钟)", 85),
             ("priority", "优先级", 70),
             ("batch_size", "每轮数量", 80),
-            ("types", "媒体类型", 115),
-            ("direction", "方向", 80),
+            ("direction", "扫描方向", 85),
             ("enabled", "状态", 65),
+            ("next", "下次扫描", 115),
         ):
             self.tree.heading(col, text=label)
-            self.tree.column(col, width=width, stretch=col in ("target", "name"))
+            self.tree.column(col, width=width, stretch=(col in ("name", "target")))
         self.tree.pack(fill="both", expand=True, padx=5, pady=4)
         self.tree.bind("<<TreeviewSelect>>", lambda _e: self._channel_selected())
-        editor = ttk.Frame(monitors)
-        editor.pack(fill="x", padx=5, pady=2)
+
         self.target = tk.StringVar()
         self.channel_name = tk.StringVar()
         self.minutes = tk.StringVar(value="5")
         self.priority = tk.StringVar(value="0")
         self.batch_size = tk.StringVar(value="100")
-        self.types = tk.StringVar(value="photo,video")
-        self.direction = tk.StringVar(value="newest")
+        self.direction = tk.StringVar(value="从新到旧")
         self.enabled = tk.BooleanVar(value=True)
-        fields = (
-            ("频道", self.target, 23), ("名称", self.channel_name, 14),
-            ("分钟", self.minutes, 5), ("优先级", self.priority, 5),
-            ("每轮上限", self.batch_size, 7), ("类型", self.types, 17),
-        )
-        for label, var, width in fields:
-            ttk.Label(editor, text=label).pack(side="left", padx=(3, 0))
+        self.type_photo = tk.BooleanVar(value=True)
+        self.type_video = tk.BooleanVar(value=True)
+        self.type_anim = tk.BooleanVar(value=False)
+
+        editor = ttk.Frame(monitors)
+        editor.pack(fill="x", padx=5, pady=2)
+        for label, var, width in (
+            ("扫描间隔(分钟)", self.minutes, 6),
+            ("优先级", self.priority, 5),
+            ("每轮数量", self.batch_size, 7),
+        ):
+            ttk.Label(editor, text=label).pack(side="left", padx=(5, 0))
             ttk.Entry(editor, textvariable=var, width=width).pack(side="left", padx=3)
-        ttk.Combobox(editor, textvariable=self.direction, values=("newest", "oldest"),
-                     width=7, state="readonly").pack(side="left", padx=3)
-        ttk.Checkbutton(editor, text="监控开启", variable=self.enabled).pack(side="left", padx=3)
+        ttk.Label(editor, text="方向").pack(side="left", padx=4)
+        ttk.Combobox(
+            editor, textvariable=self.direction, state="readonly", width=10,
+            values=("从新到旧", "从旧到新"),
+        ).pack(side="left", padx=4)
+
+        kinds = ttk.Frame(monitors)
+        kinds.pack(fill="x", padx=5, pady=2)
+        ttk.Label(kinds, text="监控下载类型（每个频道独立）:").pack(side="left")
+        for label, var in (
+            ("图片", self.type_photo), ("视频", self.type_video), ("GIF", self.type_anim)
+        ):
+            ttk.Checkbutton(kinds, text=label, variable=var).pack(side="left", padx=4)
+        ttk.Checkbutton(kinds, text="监控开启", variable=self.enabled).pack(side="left", padx=12)
+        manual = ttk.Frame(monitors)
+        manual.pack(fill="x", padx=5, pady=(2, 0))
+        ttk.Label(manual, text="当前频道 ID/@用户名").pack(side="left")
+        ttk.Entry(manual, textvariable=self.target, width=25).pack(side="left", padx=4)
+        ttk.Label(manual, text="名称").pack(side="left", padx=4)
+        ttk.Entry(manual, textvariable=self.channel_name, width=30).pack(side="left", padx=4)
 
         actions = ttk.Frame(monitors)
         actions.pack(fill="x", padx=6, pady=4)
-        self.add_btn = ttk.Button(actions, text="新增/更新频道", command=self._save_channel)
+        self.add_btn = ttk.Button(actions, text="添加当前频道", command=self._add_current_channel)
         self.add_btn.pack(side="left", padx=3)
+        self.update_btn = ttk.Button(actions, text="更新所选", command=self._update_selected)
+        self.update_btn.pack(side="left", padx=3)
         self.remove_btn = ttk.Button(actions, text="删除所选", command=self._remove_channel)
         self.remove_btn.pack(side="left", padx=3)
-        ttk.Button(actions, text="查看已加入的频道", command=self._list_dialogs).pack(side="left", padx=3)
+        self.toggle_btn = ttk.Button(actions, text="启用/暂停所选", command=self._toggle_selected)
+        self.toggle_btn.pack(side="left", padx=3)
         ttk.Label(
-            actions, text="两个账号都监控同一频道时，将自动领取不同文件；扫描游标互不影响。"
-        ).pack(side="left", padx=15)
+            actions, text="两个账号监控同一频道时自动领取不同文件，扫描游标独立。"
+        ).pack(side="left", padx=10)
+
 
         self._refresh_choices(DEFAULT_ACCOUNT)
         self._refresh_status()
@@ -130,7 +189,7 @@ class AccountWindow:
 
     def _refresh_choices(self, selected: str) -> None:
         accounts = self.registry.accounts()
-        self._ids = {f"{a.name}（{a.id}）": a.id for a in accounts}
+        self._ids = {f"{account_identity.label(a.id)}（{a.name}）": a.id for a in accounts}
         self.selector.configure(values=list(self._ids))
         for label, account_id in self._ids.items():
             if account_id == selected:
@@ -145,6 +204,7 @@ class AccountWindow:
         for key in self._fields:
             self._fields[key].set(env.get(key, ""))
         self._channel_rows = load_channels(self.registry.monitor_path(account_id))
+        self.tree.selection_remove(self.tree.selection())
         self._refresh_channel_tree()
         # The original account is controlled by the main window to avoid
         # stale Tk drafts overwriting live legacy settings.
@@ -152,6 +212,11 @@ class AccountWindow:
         self.save_settings_btn.configure(state=state)
         self.add_btn.configure(state=state)
         self.remove_btn.configure(state=state)
+        self.update_btn.configure(state=state)
+        self.toggle_btn.configure(state=state)
+        self.dialog_keyword.set("")
+        self._refresh_dialog_tree()
+        self._ensure_dialogs()
 
     def _add_account(self) -> None:
         name = self.app.simpledialog.askstring(
@@ -161,6 +226,7 @@ class AccountWindow:
             return
         try:
             account = self.registry.add(name)
+            account_identity.register(account.id, account.name)
             self._refresh_choices(account.id)
             self.app._log_account(account.id, "[账号管理] 已创建账号（尚未登录）\n")
         except (ValueError, OSError) as exc:
@@ -271,86 +337,203 @@ class AccountWindow:
             runtime.stop()
 
     def _refresh_channel_tree(self) -> None:
-        self.tree.delete(*self.tree.get_children())
-        for index, item in enumerate(self._channel_rows):
-            self.tree.insert("", "end", iid=str(index), values=(
-                item["target"], item.get("name", ""), item["minutes"],
-                item.get("priority", 0), item.get("batch_size", 100),
-                item.get("types", "photo,video"), item.get("direction", "newest"),
-                "开启" if item.get("enabled", True) else "暂停",
-            ))
+        # Update in place; clearing Treeview every second would reset unsaved
+        # editor values via <<TreeviewSelect>>.
+        expected = {str(i) for i in range(len(self._channel_rows))}
+        for iid in self.tree.get_children():
+            if iid not in expected:
+                self.tree.delete(iid)
+        account_id = self._selected_id()
+        runtime = self.app._extra_runtimes.get(account_id)
+        order = sorted(
+            range(len(self._channel_rows)),
+            key=lambda i: -int(self._channel_rows[i].get("priority", 0)),
+        )
+        for position, index in enumerate(order):
+            item = self._channel_rows[index]
+            next_scan = "-"
+            if runtime is not None and runtime.client is not None and item.get("enabled", True):
+                due = runtime._next_at.get(item["target"])
+                if due:
+                    import time
+                    next_scan = time.strftime("%H:%M:%S", time.localtime(due))
+            values = (
+                item.get("name") or "（待获取）",
+                item["target"], self.app._monitor_types_label(item.get("types", "photo,video")),
+                item["minutes"], item.get("priority", 0), item.get("batch_size", 100),
+                "旧→新" if item.get("direction") == "oldest" else "新→旧",
+                "启用" if item.get("enabled", True) else "暂停", next_scan,
+            )
+            iid = str(index)
+            if self.tree.exists(iid):
+                if tuple(map(str, values)) != tuple(self.tree.item(iid, "values")):
+                    self.tree.item(iid, values=values)
+                self.tree.move(iid, "", position)
+            else:
+                self.tree.insert("", position, iid=iid, values=values)
 
     def _channel_selected(self) -> None:
         selected = self.tree.selection()
         if not selected:
             return
         row = self._channel_rows[int(selected[0])]
-        for var, key in (
-            (self.target, "target"), (self.channel_name, "name"),
-            (self.minutes, "minutes"), (self.priority, "priority"),
-            (self.batch_size, "batch_size"), (self.types, "types"),
-            (self.direction, "direction"),
-        ):
-            var.set(str(row.get(key, "")))
+        self.target.set(str(row["target"]))
+        self.channel_name.set(row.get("name", ""))
+        self.minutes.set(str(row.get("minutes", 5)))
+        self.priority.set(str(row.get("priority", 0)))
+        self.batch_size.set(str(row.get("batch_size", 100)))
+        self.direction.set("从旧到新" if row.get("direction") == "oldest" else "从新到旧")
+        kinds = {item.strip() for item in row.get("types", "photo,video").split(",")}
+        self.type_photo.set("photo" in kinds)
+        self.type_video.set("video" in kinds)
+        self.type_anim.set("animation" in kinds)
         self.enabled.set(row.get("enabled", True))
 
-    def _save_channel(self) -> None:
-        account_id = self._selected_id()
-        if account_id == DEFAULT_ACCOUNT:
-            return
+    def _monitor_form(self) -> tuple[int, int, int, str]:
         try:
-            target = self.target.get().strip()
-            minutes = int(self.minutes.get())
-            priority = int(self.priority.get())
-            batch_size = int(self.batch_size.get())
-            types = ",".join(t.strip() for t in self.types.get().split(",") if t.strip())
-            if not target or not 1 <= minutes <= 1440 or not 1 <= batch_size <= 100000:
-                raise ValueError("频道不可为空，间隔为 1～1440 分钟，上限为 1～100000")
-            if any(t not in ("photo", "video", "animation") for t in types.split(",")):
-                raise ValueError("类型只能为 photo、video、animation")
-            direction = self.direction.get()
-            if direction not in ("newest", "oldest"):
-                raise ValueError("扫描方向不正确")
-            rows = [r for r in self._channel_rows if r["target"] != target]
-            rows.append({
-                "target": target, "name": self.channel_name.get().strip(),
-                "minutes": minutes, "priority": priority,
-                "batch_size": batch_size, "types": types,
-                "enabled": self.enabled.get(), "direction": direction,
-            })
-            save_channels(rows, self.registry.monitor_path(account_id))
-            self._channel_rows = load_channels(self.registry.monitor_path(account_id))
-            self._refresh_channel_tree()
-            self.app._log_account(account_id, f"[频道配置] 已更新 {target}\n")
-        except (ValueError, OSError) as exc:
-            self.app.messagebox.showwarning("频道配置无效", str(exc), parent=self.win)
+            minutes = int(self.minutes.get().strip())
+            priority = int(self.priority.get().strip())
+            batch_size = int(self.batch_size.get().strip())
+        except ValueError as exc:
+            raise ValueError("扫描间隔、优先级、每轮数量必须填写整数") from exc
+        if not 1 <= minutes <= 1440 or not 1 <= batch_size <= 100000:
+            raise ValueError("扫描间隔应为1～1440分钟，每轮数量应为1～100000")
+        types = ",".join(kind for kind, var in (
+            ("photo", self.type_photo), ("video", self.type_video),
+            ("animation", self.type_anim),
+        ) if var.get())
+        if not types:
+            raise ValueError("至少选择一种监控下载类型")
+        return minutes, priority, batch_size, types
 
-    def _remove_channel(self) -> None:
+    def _add_current_channel(self) -> None:
         account_id = self._selected_id()
         if account_id == DEFAULT_ACCOUNT:
+            self.app.messagebox.showinfo(
+                "原有账号", "请在主窗口『多频道监控』管理原账号", parent=self.win
+            )
             return
+        # Clicking the joined-channel list fills the same fields as manual
+        # input; never override a subsequently edited ID with stale selection.
+        target = self.target.get().strip()
+        name = self.channel_name.get().strip()
+        if not target:
+            self.app.messagebox.showwarning("监控", "请先在上方列表选择频道，或手动输入频道ID", parent=self.win)
+            return
+        if any(row["target"] == target for row in self._channel_rows):
+            self.app.messagebox.showinfo("监控", "此频道已在监控列表中，请选择后点击『更新所选』", parent=self.win)
+            return
+        self._upsert_channel(target, name)
+
+    def _upsert_channel(self, target: str, name: str, *, index: int | None = None) -> None:
+        try:
+            minutes, priority, batch_size, types = self._monitor_form()
+            account_id = self._selected_id()
+            row = {
+                "target": target, "name": name, "minutes": minutes,
+                "priority": priority, "batch_size": batch_size, "types": types,
+                "direction": "oldest" if self.direction.get() == "从旧到新" else "newest",
+                "enabled": self.enabled.get(),
+            }
+            if index is None:
+                self._channel_rows.append(row)
+            else:
+                original = self._channel_rows[index]
+                row["target"] = original["target"]
+                row["name"] = original.get("name") or name
+                if original.get("peer_id"):
+                    row["peer_id"] = original["peer_id"]
+                self._channel_rows[index] = row
+            save_channels(self._channel_rows, self.registry.monitor_path(account_id))
+            self._refresh_channel_tree()
+            self.app._log_account(account_id, f"[频道配置] 已保存 {row['target']}\n")
+        except (ValueError, OSError) as exc:
+            self.app.messagebox.showwarning("监控配置无效", str(exc), parent=self.win)
+
+    def _update_selected(self) -> None:
         chosen = self.tree.selection()
-        if not chosen:
+        if self._selected_id() != DEFAULT_ACCOUNT and chosen:
+            index = int(chosen[0])
+            if index < len(self._channel_rows):
+                row = self._channel_rows[index]
+                self._upsert_channel(row["target"], row.get("name", ""), index=index)
+
+    def _toggle_selected(self) -> None:
+        chosen = self.tree.selection()
+        if self._selected_id() == DEFAULT_ACCOUNT or not chosen:
             return
         row = self._channel_rows[int(chosen[0])]
-        self._channel_rows = [r for r in self._channel_rows if r["target"] != row["target"]]
-        save_channels(self._channel_rows, self.registry.monitor_path(account_id))
+        row["enabled"] = not row.get("enabled", True)
+        save_channels(self._channel_rows, self.registry.monitor_path(self._selected_id()))
         self._refresh_channel_tree()
 
-    def _list_dialogs(self) -> None:
+    def _remove_channel(self) -> None:
+        chosen = self.tree.selection()
+        if self._selected_id() == DEFAULT_ACCOUNT or not chosen:
+            return
+        self._channel_rows.pop(int(chosen[0]))
+        save_channels(self._channel_rows, self.registry.monitor_path(self._selected_id()))
+        self._refresh_channel_tree()
+
+    def _dialog_selected(self, _event=None) -> None:
+        chosen = self.dialog_tree.selection()
+        if chosen:
+            values = self.dialog_tree.item(chosen[0], "values")
+            self.target.set(str(values[0]))
+            self.channel_name.set(str(values[2]))
+
+    def _refresh_dialog_tree(self) -> None:
+        account_id = self._selected_id()
+        if account_id == DEFAULT_ACCOUNT:
+            rows = getattr(self.app, "_dialog_rows", [])
+        else:
+            rows = self._dialog_cache.get(account_id, [])
+        selected = self.dialog_tree.selection()
+        previous = str(selected[0]) if selected else None
+        self.dialog_tree.delete(*self.dialog_tree.get_children())
+        visible = filter_dialogs(rows, self.dialog_keyword.get())
+        for row in visible:
+            if hasattr(row, "entity_id"):
+                target, kind, title = str(row.entity_id), row.kind, row.title
+            else:
+                target, kind, title = str(row[0]), row[1], row[2]
+            self.dialog_tree.insert("", "end", iid=target, values=(target, kind, title))
+            if target == previous:
+                self.dialog_tree.selection_set(target)
+        self.dialog_counter.set(
+            f"{len(visible)} / {len(rows)}"
+            if account_id == DEFAULT_ACCOUNT or account_id in self._dialog_cache
+            else "账号登录后加载"
+        )
+
+    def _ensure_dialogs(self, *, force: bool = False) -> None:
+        """Fetch a connected account's joined dialogs once; switching reuses RAM."""
         from tgdl.channels import list_media_dialogs
         account_id = self._selected_id()
         if account_id == DEFAULT_ACCOUNT:
-            self.app.messagebox.showinfo(
-                "频道列表", "原有账号的频道列表在主窗口查看", parent=self.win
-            )
+            if force and self.app.client is not None:
+                self.app.on_list()
+            self._refresh_dialog_tree()
             return
+        if account_id in self._dialog_loading:
+            return
+        if not force and account_id in self._dialog_cache:
+            self._refresh_dialog_tree()
+            return
+        if not force and account_id in self._dialog_retry_at:
+            import time
+            if time.monotonic() < self._dialog_retry_at[account_id]:
+                return
         runtime = self.app._extra_runtimes.get(account_id)
-        if runtime is None or runtime.client is None:
-            self.app.messagebox.showinfo(
-                "频道列表", "请先登录并启动该账号", parent=self.win
-            )
+        if runtime is None or runtime.client is None or not runtime.status.startswith("已连接"):
+            if force:
+                self.app.messagebox.showinfo(
+                    "频道列表", "请先登录该 Telegram 账号", parent=self.win
+                )
+            self._refresh_dialog_tree()
             return
+        self._dialog_loading.add(account_id)
+        self.dialog_counter.set("正在加载...")
 
         async def fetch():
             return await list_media_dialogs(runtime.client)
@@ -360,60 +543,46 @@ class AccountWindow:
         def finished(done):
             try:
                 channels = done.result()
+                error = None
             except Exception as exc:
-                self.app.root.after(
-                    0, lambda exc=exc: self.app.messagebox.showwarning(
-                        "频道列表", str(exc), parent=self.win
+                channels, error = None, str(exc)
+
+            def apply():
+                self._dialog_loading.discard(account_id)
+                if channels is not None:
+                    self._dialog_cache[account_id] = channels
+                    self.app._log_account(
+                        account_id, f"[频道列表] 已加载 {len(channels)} 个已加入的群组/频道\n"
                     )
-                )
-                return
-            self.app.root.after(0, lambda: self._show_dialogs(channels))
+                elif error is not None:
+                    import time
+                    self._dialog_retry_at[account_id] = time.monotonic() + 60
+                    self.app._log_account(account_id, f"[频道列表] 加载失败: {error}\n")
+                if self.win.winfo_exists() and self._selected_id() == account_id:
+                    self._refresh_dialog_tree()
+            self.app.root.after(0, apply)
 
         future.add_done_callback(finished)
 
-    def _show_dialogs(self, channels) -> None:
-        win = self.tk.Toplevel(self.win)
-        win.title("该账号已加入的 Telegram 频道 / 群组")
-        win.geometry("620x460")
-        keyword = self.tk.StringVar()
-        controls = self.ttk.Frame(win)
-        controls.pack(fill="x", padx=8, pady=6)
-        self.ttk.Label(controls, text="按群组/频道名称筛选").pack(side="left")
-        self.ttk.Entry(controls, textvariable=keyword).pack(
-            side="left", fill="x", expand=True, padx=6
-        )
-        self.ttk.Button(controls, text="清空", command=lambda: keyword.set("")).pack(side="left")
-        tree = self.ttk.Treeview(win, columns=("id", "name"), show="headings")
-        tree.heading("id", text="ID")
-        tree.heading("name", text="名称")
-        tree.column("id", width=180)
-        tree.column("name", width=400)
-        tree.pack(fill="both", expand=True)
-        def refresh(*_args):
-            previous = tree.selection()
-            chosen = tree.item(previous[0], "values")[0] if previous else None
-            tree.delete(*tree.get_children())
-            for item in filter_dialogs(channels, keyword.get()):
-                iid = str(item.entity_id)
-                tree.insert("", "end", iid=iid, values=(iid, item.title))
-                if iid == chosen:
-                    tree.selection_set(iid)
-
-        keyword.trace_add("write", refresh)
-        refresh()
-
-        def select():
-            chosen = tree.selection()
-            if chosen:
-                target, name = tree.item(chosen[0], "values")
-                self.target.set(str(target))
-                self.channel_name.set(str(name))
-                win.destroy()
-        self.ttk.Button(win, text="填入频道配置", command=select).pack(pady=6)
+    def _refresh_display_names(self) -> None:
+        current_id = self._selected_id()
+        refreshed = {
+            f"{account_identity.label(a.id)}（{a.name}）": a.id
+            for a in self.registry.accounts()
+        }
+        if refreshed != self._ids:
+            self._ids = refreshed
+            self.selector.configure(values=list(refreshed))
+            for title, account_id in refreshed.items():
+                if account_id == current_id:
+                    self.choice.set(title)
+                    break
+            self.app._refresh_log_accounts()
 
     def _refresh_status(self) -> None:
         if not self.win.winfo_exists():
             return
+        self._refresh_display_names()
         account_id = self._selected_id()
         if account_id == DEFAULT_ACCOUNT:
             selected_state = "主窗口管理（" + ("监控运行中" if self.app._monitor_active else "监控未启动") + "）"
@@ -427,9 +596,11 @@ class AccountWindow:
         for account in self.registry.accounts()[1:]:
             runtime = self.app._extra_runtimes.get(account.id)
             if runtime is not None:
-                all_state.append(f"{account.name}: {runtime.active_count} 文件")
+                all_state.append(f"{account_identity.label(account.id)}: {runtime.active_count} 文件")
         self.status.set(
             f"当前：{selected_state}   |   其他账号："
             + ("；".join(all_state) if all_state else "无运行账号")
         )
+        self._ensure_dialogs()
+        self._refresh_channel_tree()
         self.win.after(1000, self._refresh_status)

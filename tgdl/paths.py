@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
+from contextlib import closing
 import sys
 from pathlib import Path
 
@@ -33,6 +35,36 @@ def data_dir() -> Path:
     return executable_dir()
 
 
+def migrate_default_session(directory: Path) -> Path:
+    """Copy legacy session into accounts/default without losing auth state.
+
+    This happens on startup *before* creating the Telethon client. Keep the
+    legacy session untouched as a rollback copy. SQLite backup incorporates
+    any valid WAL records and prevents a partially copied target.
+    """
+    legacy = directory / "tgdl_session.session"
+    target = directory / "accounts" / "default" / "tgdl_session.session"
+    if target.exists() or not legacy.is_file():
+        return target
+    target.parent.mkdir(parents=True, exist_ok=True)
+    pending = target.with_suffix(".session.migrating")
+    try:
+        if pending.exists():
+            pending.unlink()
+        # SQLite context manager commits but does not close file handles;
+        # close explicitly before rename or cleanup on Windows.
+        with closing(sqlite3.connect(f"file:{legacy.as_posix()}?mode=ro", uri=True)) as src:
+            with closing(sqlite3.connect(pending)) as dest:
+                src.backup(dest)
+                if dest.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    raise sqlite3.DatabaseError("Migrated Session failed quick_check")
+        pending.replace(target)
+    finally:
+        if pending.exists():
+            pending.unlink()
+    return target
+
+
 def prepare_data_dir() -> Path:
     """Safely import legacy data once; never overwrite existing user data."""
     destination = data_dir()
@@ -49,4 +81,5 @@ def prepare_data_dir() -> Path:
             if candidate.is_file():
                 shutil.copy2(candidate, target)
                 break
+    migrate_default_session(destination)
     return destination

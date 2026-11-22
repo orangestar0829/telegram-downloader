@@ -58,10 +58,24 @@ The GUI's automatic migration already checks this safely.
 ## New files
 
 - `data/accounts.json`: account IDs and display names, not passwords
-- `data/accounts/<id>/.env`: each additional account's private settings
-- `data/accounts/<id>/tgdl_session.session`: each account's private session
-- `data/accounts/<id>/monitored_channels.json`: independent channel monitors
-- `data/logs/runtime-YYYY-MM-DD.log`: rotating diagnostic logs (seven days)
+- `data/accounts/default/tgdl_session.session`: original account's session,
+  automatically copied from the legacy `data/tgdl_session.session` by a
+  SQLite backup and verified before first use (old file is **not deleted**).
+- `data/accounts/<id>/tgdl_session.session`: each added account's private session.
+- `data/accounts/<id>/.env`: each additional account's private settings.
+- `data/accounts/<id>/monitored_channels.json`: independent channel monitors.
+- `data/logs/runtime-YYYY-MM-DD.log`: rotating diagnostic logs (seven days).
 
-The original account still reads the existing `data/.env`,
-`data/tgdl_session.session` and `data/monitored_channels.json`.
+**Important migration rule:** close the previous program normally and back
+up the whole `data/` folder first. At startup, if the new default Session
+file already exists it will NOT be overwritten, even if the legacy file is
+newer. A temporary SQLite backup incorporates WAL state; the legacy file
+remains available for rollback. The original account keeps its existing
+`data/.env`, `data/monitored_channels.json` and global
+`data/tgdl_download_history.sqlite3` (the history is not moved).
+
+All diagnostic and download-event logs now show the actual Telegram profile
+name after login (e.g. `[账号:Alice (@alice)]`); the stable account ID
+remains internal. Before login, logs use a readable temporary account label.
+If two Telegram accounts have the same displayed name, the local account
+selector can still disambiguate them by their local account remarks.

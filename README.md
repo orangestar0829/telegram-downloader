@@ -6,6 +6,10 @@
 下载限速/并发、重试和定时扫描频道（数字优先级与每轮批次上限独立）。
 原有账号 A 的设置、Session、扫描游标及下载历史均保留；在主窗口管理账号 A，
 在多账号窗口切换管理其他账号。后台运行相互独立。
+多账号界面与主窗口采用相同的频道监控列、中文媒体类型和方向选择；
+每个账号已加入的群/频道列表直接内嵌显示，点击选择后即可添加监控，
+不再打开频道选择弹窗。已加载的频道列表按账号缓存，
+只有手动“刷新列表”才重新请求 Telegram。
 已加入的群组/频道列表支持名称关键词即时筛选（不区分大小写、支持中文及用户名），主窗口与 B 账号的群组列表均可使用。此功能只筛选已加载列表，不搜索群消息或产生额外的 Telegram 网络请求。
 B 账号如果无法收到登录验证码，可以使用 **扫码登录**：在已经登录 B 账号的 Telegram 手机 App 中打开「设置 → 设备 → 连接桌面设备」扫描程序显示的二维码。二维码到期会自动刷新，支持两步验证；不会读取 AyuGram 的 Session。
 
@@ -15,7 +19,10 @@ B 账号如果无法收到登录验证码，可以使用 **扫码登录**：在�
 
 运行日志按天写入 `data/logs/runtime-YYYY-MM-DD.log`，默认保留 7 天；
 GUI 的运行日志/下载记录支持账号筛选，避免一直累积日志导致内存上涨。
-新增账号的 Session 和配置位于 `data/accounts/<id>/`。
+全部 Telegram Session 都位于 `data/accounts/<id>/`；原账号自动复制至
+`data/accounts/default/tgdl_session.session`，原文件不删除、可回滚。
+原账号的 `.env`、监控配置及全局下载历史保持原位置。
+日志显示实际 Telegram 显示名（有用户名时带 `@username`），内部账号 ID 仅用于记录关联。
 **注意：旧版手动批量下载尚未接入跨账号租约，不要与其他账号的定时监控
 同时操作相同频道。** 这是预览版的已知限制。
 
@@ -134,7 +141,7 @@ DOWNLOAD_DIR=./downloads
 run.cmd login
 ```
 
-Telegram 会把验证码发到 App。输入后会在本目录生成 `tgdl_session.session`。这个文件 = 登录态，**不要上传、不要发给任何人**。
+登录验证方式由 Telegram 服务器选择（可能是 App 内、短信或其他方式）。成功后默认账号 Session 保存为 `accounts/default/tgdl_session.session`（便携版则在 `data/accounts/default/`）。该文件属于登录凭据，**不要上传或分享**。
 
 ### 4. 列出频道
 
@@ -278,7 +285,7 @@ telegram-media-downloader/
 账号还没加入该频道。先在 Telegram 里加入，再 `list` 复制 ID。
 
 **一直要验证码**  
-删掉目录里的 `tgdl_session.session` 后重新 `login`。不要多开好几个脚本同时登录。
+先确认账号是否已经登录及网络状态，必要时使用 B 账号扫码登录。不要在未备份的情况下删除 Session；原账号保存在 `accounts/default/tgdl_session.session`，新增账号各自在 `accounts/<id>/`。不要多开程序共用同一个 Session。
 
 **只下到一部分就停了**  
 遇到限流。看终端里的秒数，等结束再执行同一条命令（会跳过已有文件）。
@@ -321,8 +328,8 @@ telegram-media-downloader/
 
 **便携版数据目录**：Windows 便携 ZIP 内的 `portable.flag` 标记便携模式。
 启动后所有用户状态保存在 `TelegramDownloader.exe` 同级的 `data/`：
-`data/.env`、`data/tgdl_session.session` 和
-`data/tgdl_download_history.sqlite3`。从旧版升级时会尝试从旧目录和
+`data/.env`、`data/accounts/default/tgdl_session.session`、其他账号各自的
+`data/accounts/<id>/tgdl_session.session` 与 `data/tgdl_download_history.sqlite3`。从旧版升级时会尝试从旧目录和
 `%LOCALAPPDATA%\TelegramDownloader` 复制现有数据（不会覆盖 `data/` 内已有文件）。
 更新时替换程序文件，保留整个 `data/` 目录。安装版仍将数据存入用户目录，
 避免写入 Program Files 失败。
