@@ -176,9 +176,12 @@ def test_dangling_link_does_not_get_replaced(tmp_path):
         dangling.symlink_to(unresolved)
     except OSError:
         pytest.skip("Symbolic links are not available in this Windows test environment")
+    # Windows may include its extended-length prefix for an absolute link.
+    # Compare against the path as reported by the filesystem before download.
+    original_target = dangling.readlink()
     saved, stats, recorded = download_history(folder, Client())
     assert recorded and stats.saved == 1
-    assert dangling.is_symlink() and dangling.readlink() == unresolved
+    assert dangling.is_symlink() and dangling.readlink() == original_target
     assert not unresolved.exists()
     assert saved.read_bytes() == COMPLETE
 
