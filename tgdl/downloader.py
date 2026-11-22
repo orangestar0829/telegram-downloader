@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import tempfile
+import time
+import threading
 from collections.abc import AsyncIterable
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,11 +28,19 @@ from telethon.tl.types import (
 )
 from tqdm import tqdm
 
-from tgdl.chunked import chunkable_document, document_suffix, download_chunked
+from tgdl.chunked import (
+    ChunkDownloadStalled, chunkable_document, document_suffix, download_chunked,
+)
+from tgdl.monitor_flow import MonitorFlow, monitor_download_document
+from tgdl.cache_budget import optional_staging_reservation
+from tgdl.history import DownloadHistory, PendingMedia
+from tgdl.progress import ProgressCallback, TransferProgress
+from tgdl.temp_cleanup import own_temporary
 
 PHOTO_TYPES = {"photo"}
 VIDEO_TYPES = {"video", "animation"}
 ALL_TYPES = PHOTO_TYPES | VIDEO_TYPES
+_STAGED_PUBLISH_LOCK = asyncio.Lock()
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".heic", ".tif", ".tiff"}
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".webm", ".avi", ".m4v", ".ts", ".flv"}
@@ -146,6 +158,13 @@ def unique_path(path: Path) -> Path:
     raise RuntimeError(f"Cannot find a free filename for {path}")
 
 
+def same_volume(source: Path, destination_directory: Path) -> bool:
+    """Decide whether publishing can be an atomic rename."""
+    if os.name == "nt":
+        return source.anchor.casefold() == destination_directory.anchor.casefold()
+    return source.stat().st_dev == destination_directory.stat().st_dev
+
+
 async def resolve_channel(client: TelegramClient, target: str):
     target = target.strip()
     invite = INVITE_RE.search(target)
@@ -189,6 +208,129 @@ class DownloadStats:
         self.saved = 0
         self.skipped = 0
         self.failed = 0
+        self.more_pending = False
+        self.matched = 0
+        self.first_message_id = 0
+        self.last_message_id = 0
+        self.scan_upper = 0
+        self.scan_completed = 0
+        self.queued = 0
+        self.scanned_messages = 0
+
+
+async def scan_monitor_slice(
+    client: TelegramClient, *,
+    target: str,
+    types: set[str],
+    monitor_direction: str = "newest",
+    slice_size: int = 20,
+    match_limit: int = 20,
+    stop_event: threading.Event | None = None,
+    on_channel_resolved: Callable[[str, int], None] | None = None,
+) -> DownloadStats:
+    """Scan only a small Telegram message slice, without downloading files.
+
+    SQLite commits the queued media and the scan cursor together, so a crash
+    cannot skip discovered media. The 20-message slice yields to other
+    monitored channels even when this channel has a 500-media batch quota.
+    """
+    if monitor_direction not in ("newest", "oldest"):
+        raise ValueError("Invalid monitor direction")
+    if slice_size < 1 or match_limit < 1:
+        raise ValueError("Monitor slice and match limits must be positive")
+    entity = await resolve_channel(client, target)
+    title = str(getattr(entity, "title", None) or getattr(entity, "username", None) or entity.id)
+    peer_id = int(entity.id)
+    if on_channel_resolved is not None:
+        on_channel_resolved(title, peer_id)
+    stats = DownloadStats()
+    history = DownloadHistory()
+    try:
+        completed, upper, cursor, saved_direction = history.scan_state(peer_id)
+        media_types = ",".join(sorted(types))
+        previous_types = history.scan_media_types(peer_id)
+        if previous_types not in ("", media_types) or (previous_types == "" and completed):
+            completed, upper, cursor = 0, 0, 0
+        elif upper and saved_direction != monitor_direction:
+            cursor = 0
+
+        starting_cycle = not upper
+        if starting_cycle:
+            # Old failures from the pre-queue monitor also remain retryable.
+            failures = [
+                PendingMedia(peer_id, mid, target, title, "", "")
+                for mid in history.failures(peer_id, limit=20)
+            ]
+            stats.queued += history.enqueue_media(failures)
+            async for latest in client.iter_messages(entity, limit=1):
+                upper = int(latest.id)
+                break
+            if upper <= completed:
+                stats.scan_completed = completed
+                return stats
+            history.save_scan_state(peer_id, completed, upper, 0, monitor_direction, media_types)
+
+        stats.scan_upper = upper
+        stats.scan_completed = completed
+        if monitor_direction == "oldest":
+            iterator = client.iter_messages(
+                entity, reverse=True, min_id=cursor or completed,
+                max_id=upper + 1, limit=slice_size,
+            )
+        else:
+            iterator = client.iter_messages(
+                entity, min_id=completed,
+                max_id=cursor or (upper + 1), limit=slice_size,
+            )
+
+        discovered: list[PendingMedia] = []
+        last_seen = 0
+        quota_reached = False
+        interrupted = False
+        async for message in iterator:
+            if stop_event is not None and stop_event.is_set():
+                interrupted = True
+                break
+            stats.scanned_messages += 1
+            last_seen = int(message.id)
+            if not stats.first_message_id:
+                stats.first_message_id = last_seen
+            stats.last_message_id = last_seen
+            if not isinstance(message, Message) or message.date is None:
+                continue
+            kind = classify_message(message)
+            if kind not in types:
+                continue
+            stats.matched += 1
+            if history.contains(peer_id, message.id):
+                stats.skipped += 1
+            else:
+                discovered.append(PendingMedia(
+                    peer_id, int(message.id), target, title, kind,
+                    f"{message.date.strftime('%Y%m%d')}_{message.id}",
+                ))
+            if stats.matched >= match_limit:
+                quota_reached = True
+                break
+
+        if interrupted:
+            # Leave the old cursor intact; all work in this slice is replayable.
+            stats.more_pending = True
+            return stats
+        completed_window = not quota_reached and stats.scanned_messages < slice_size
+        stats.queued += history.commit_scan_batch(
+            peer_id, discovered,
+            completed=upper if completed_window else completed,
+            upper=0 if completed_window else upper,
+            cursor=0 if completed_window else (last_seen or cursor),
+            direction=monitor_direction, media_types=media_types,
+        )
+        stats.more_pending = not completed_window
+        if completed_window:
+            stats.scan_completed = upper
+        return stats
+    finally:
+        history.close()
 
 
 async def download_channel(
@@ -205,9 +347,24 @@ async def download_channel(
     concurrency: int = 3,
     retries: int = 2,
     chunk_concurrency: int = 1,
+    on_saved: Callable[[str], None] | None = None,
+    monitor_direction: str | None = None,
+    monitor_batch_size: int = 100,
+    stop_event: threading.Event | None = None,
+    on_channel_resolved: Callable[[str, int], None] | None = None,
+    temp_download_dir: Path | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> DownloadStats:
     entity = await resolve_channel(client, target)
     title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
+    if on_channel_resolved is not None:
+        on_channel_resolved(str(title), int(entity.id))
+    def saved_with_source(detail: str) -> None:
+        labeled = f"[{title}] {detail}"
+        if on_saved is not None:
+            on_saved(labeled)
+        else:
+            print(labeled)
     folder = download_dir / safe_name(str(title))
     photos_dir = folder / "photos"
     videos_dir = folder / "videos"
@@ -224,14 +381,111 @@ async def download_channel(
 
     stats = DownloadStats()
     scanned = 0
+    monitored = monitor_direction in ("newest", "oldest") and not dry_run
+    if monitored and monitor_batch_size < 1:
+        raise ValueError("monitor_batch_size must be positive")
+    history = DownloadHistory() if not dry_run else None
+    peer_id = int(entity.id)
+    scan_upper = 0
+    scan_completed = 0
+    scan_cursor = 0
+    interrupted = False
+    last_seen = 0
+    reached_batch_limit = False
+    batch_ids: list[int] = []
+
+    if monitored and history is not None:
+        media_types = ",".join(sorted(types))
+        scan_completed, scan_upper, scan_cursor, saved_direction = history.scan_state(peer_id)
+        if history.scan_media_types(peer_id) not in ("", media_types):
+            # Newly enabled media types require a safe one-time full re-scan.
+            scan_completed, scan_upper, scan_cursor = 0, 0, 0
+        elif history.scan_media_types(peer_id) == "" and scan_completed:
+            # Unknown legacy scan filter: replay history rather than skip media.
+            scan_completed, scan_upper, scan_cursor = 0, 0, 0
+        starting_cycle = not scan_upper
+        if scan_upper and saved_direction != monitor_direction:
+            # A different direction needs to replay the pending window safely.
+            scan_cursor = 0
+        if not scan_upper:
+            async for latest in client.iter_messages(entity, limit=1):
+                scan_upper = int(latest.id)
+                break
+            if scan_upper <= scan_completed:
+                scan_upper = 0
+            else:
+                history.save_scan_state(peer_id, scan_completed, scan_upper, 0, monitor_direction, media_types)
+        stats.scan_upper = scan_upper
+        stats.scan_completed = scan_completed
+        print(
+            f"[监控] {title}: 方向={'旧→新' if monitor_direction == 'oldest' else '新→旧'}"
+            f"，已完成检查点={scan_completed}，区间上限={scan_upper}"
+        )
+
+        # Retry failures once per scan window, including when nothing new
+        # arrived; do not retry the same failures on every 100-item batch.
+        for failed_id in history.failures(peer_id, limit=20) if starting_cycle else []:
+            if stop_event is not None and stop_event.is_set():
+                interrupted = True
+                break
+            try:
+                failed_message = await client.get_messages(entity, ids=failed_id)
+                if not isinstance(failed_message, Message) or failed_message.date is None:
+                    history.clear_failure(peer_id, failed_id)
+                    continue
+                failed_kind = classify_message(failed_message)
+                if failed_kind not in types:
+                    history.clear_failure(peer_id, failed_id)
+                    continue
+                failed_dir = photos_dir if failed_kind == "photo" else videos_dir
+                failed_base = f"{failed_message.date.strftime('%Y%m%d')}_{failed_id}"
+                await _download_with_retry(
+                    client, failed_message, failed_dir, failed_base, stats,
+                    skip_existing=True, retries=retries, chunk_concurrency=chunk_concurrency,
+                    history=history, peer_id=peer_id, on_saved=saved_with_source,
+                    temp_download_dir=temp_download_dir,
+                    on_progress=on_progress,
+                )
+            except Exception as exc:
+                print(f"[监控] 重试消息 {failed_id} 失败：{exc}")
+        if interrupted:
+            history.close()
+            return stats
+        if not scan_upper:
+            history.close()
+            print(f"[监控] {title}: 没有新增消息")
+            return stats
 
     async def jobs():
-        nonlocal scanned
-        async for message in client.iter_messages(entity, offset_date=until):
+        nonlocal scanned, interrupted, last_seen, reached_batch_limit
+        if monitored:
+            if monitor_direction == "oldest":
+                iterator = client.iter_messages(
+                    entity, reverse=True,
+                    min_id=scan_cursor or scan_completed, max_id=scan_upper + 1,
+                )
+            else:
+                iterator = client.iter_messages(
+                    entity, min_id=scan_completed,
+                    max_id=scan_cursor or (scan_upper + 1),
+                )
+        else:
+            iterator = client.iter_messages(entity, offset_date=until)
+        async for message in iterator:
+            if stop_event is not None and stop_event.is_set():
+                interrupted = True
+                break
+            if monitored and scanned >= monitor_batch_size:
+                reached_batch_limit = True
+                break
             if limit is not None and scanned >= limit:
                 break
             if not isinstance(message, Message) or message.date is None:
                 continue
+            last_seen = int(message.id)
+            if not stats.first_message_id:
+                stats.first_message_id = last_seen
+            stats.last_message_id = last_seen
             msg_date = message.date if message.date.tzinfo else message.date.replace(tzinfo=timezone.utc)
             if since is not None and msg_date < since:
                 break
@@ -239,6 +493,9 @@ async def download_channel(
             if kind is None or kind not in types:
                 continue
             scanned += 1
+            stats.matched += 1
+            if monitored:
+                batch_ids.append(int(message.id))
             base = f"{msg_date.strftime('%Y%m%d')}_{message.id}"
             if dry_run:
                 origin = media_origin(message)
@@ -252,14 +509,43 @@ async def download_channel(
             yield message, dest_dir, base
 
     try:
-        await download_many(
-            client, jobs(), stats=stats, concurrency=concurrency,
-            retries=retries, skip_existing=skip_existing,
-            chunk_concurrency=chunk_concurrency,
-        )
-    except FloodWaitError as exc:
-        print(f"\nRate limited. Wait {exc.seconds}s then retry this channel.")
-        raise
+        try:
+            await download_many(
+                client, jobs(), stats=stats, concurrency=concurrency,
+                retries=retries, skip_existing=skip_existing,
+                chunk_concurrency=chunk_concurrency,
+                history=history, peer_id=peer_id,
+                on_saved=saved_with_source,
+                stop_event=stop_event,
+                temp_download_dir=temp_download_dir,
+                on_progress=on_progress,
+            )
+            if monitored and history is not None:
+                # A failed download is durably queued before committing cursor.
+                for message_id in batch_ids:
+                    if not history.contains(peer_id, message_id):
+                        history.mark_failure(peer_id, message_id)
+                if last_seen and not interrupted:
+                    scan_cursor = last_seen
+                if not interrupted and not reached_batch_limit:
+                    history.save_scan_state(peer_id, scan_upper, 0, 0, monitor_direction, media_types)
+                    print(
+                        f"[监控] {title}: 本轮区间扫描完成，检查点={scan_upper}，"
+                        f"本批消息ID={stats.first_message_id or '-'}→{stats.last_message_id or '-'}"
+                    )
+                elif last_seen and not interrupted:
+                    history.save_scan_state(peer_id, scan_completed, scan_upper, scan_cursor, monitor_direction, media_types)
+                    stats.more_pending = True
+                    print(
+                        f"[监控] {title}: 批次完成，消息ID={stats.first_message_id}→{stats.last_message_id}，"
+                        f"游标={scan_cursor}，匹配媒体={scanned}，等待下一批"
+                    )
+        except FloodWaitError as exc:
+            print(f"\nRate limited. Wait {exc.seconds}s then retry this channel.")
+            raise
+    finally:
+        if history is not None:
+            history.close()
 
     print(
         f"\nDone. saved={stats.saved} skipped={stats.skipped} failed={stats.failed} matched={scanned}"
@@ -276,44 +562,220 @@ async def _download_one(
     skip_existing: bool,
     stats: DownloadStats,
     chunk_concurrency: int = 1,
+    history: DownloadHistory | None = None,
+    peer_id: int | None = None,
+    on_saved: Callable[[str], None] | None = None,
+    temp_download_dir: Path | None = None,
+    on_progress: ProgressCallback | None = None,
+    monitor_flow: MonitorFlow | None = None,
 ) -> Path | None:
-    if skip_existing and any(dest_dir.glob(f"{base}.*")):
-        stats.skipped += 1
-        return None
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    # Telethon writes using the original filename. Per-task directories avoid
-    # collisions and allow failed/cancelled partial files to be cleaned up.
-    with tempfile.TemporaryDirectory(prefix="tgdl-", dir=dest_dir) as temporary:
-        with tqdm(unit="B", unit_scale=True, desc=base, leave=False) as bar:
-            def progress(current: int, total: int) -> None:
-                bar.total = total or bar.total
-                bar.n = current
-                bar.refresh()
-
-            target = download_target(message)
-            document = chunkable_document(target, chunk_concurrency)
-            if document is not None and callable(getattr(client, "iter_download", None)):
-                saved = await download_chunked(
-                    client, document, Path(temporary) / ("data" + document_suffix(document)),
-                    parts=chunk_concurrency, on_bytes=bar.update,
-                )
-            else:
-                saved = await client.download_media(
-                    target, file=str(temporary), progress_callback=progress,
-                )
-        if not saved:
-            stats.failed += 1
-            return None
-        saved_path = Path(saved)
-        suffix = saved_path.suffix or ".bin"
-        final_path = dest_dir / f"{base}{suffix}"
-        if skip_existing and final_path.exists():
+    if skip_existing:
+        if history is not None and peer_id is not None and history.contains(peer_id, message.id):
             stats.skipped += 1
             return None
-        if final_path.exists():
-            final_path = unique_path(final_path)
-        saved_path.replace(final_path)
+        existing = next(dest_dir.glob(f"{base}.*"), None) if dest_dir.exists() else None
+        if existing is not None:
+            if history is not None and peer_id is not None and existing.is_file():
+                history.mark_saved(peer_id, message.id, dest_dir.name, existing)
+            stats.skipped += 1
+            return None
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    started = time.monotonic()
+    flood_snapshot = getattr(client, "flood_snapshot", None)
+    flood_before = flood_snapshot() if callable(flood_snapshot) else None
+    rpc_snapshot = getattr(client, "rpc_snapshot", None)
+    rpc_before = rpc_snapshot() if callable(rpc_snapshot) else None
+    mode = "普通下载"
+    chunk_timings: dict[str, float] = {}
+    publish_seconds = 0.0
+    target = download_target(message)
+    document = chunkable_document(
+        target, max(2, chunk_concurrency) if monitor_flow is not None else chunk_concurrency
+    )
+    use_chunks = document is not None and callable(getattr(client, "iter_download", None))
+    transfer = TransferProgress(
+        f"{peer_id or 0}:{message.id}:{base}",
+        f"{dest_dir.parent.name} / {base}",
+        on_progress,
+    )
+    transfer.emit("等待缓存" if use_chunks and temp_download_dir is not None else "准备下载",
+                  total=int(document.size) if document is not None else None, force=True)
+    temp_parent = dest_dir
+    if use_chunks and temp_download_dir is not None:
+        candidate = Path(temp_download_dir).expanduser()
+        candidate.mkdir(parents=True, exist_ok=True)
+        temp_parent = candidate
+    # Telethon writes using the original filename. Per-task directories avoid
+    # collisions and allow failed/cancelled partial files to be cleaned up.
+    async with optional_staging_reservation(
+        temp_parent if use_chunks and temp_download_dir is not None else None,
+        int(document.size) if use_chunks else 0,
+    ) as cache_lease:
+        transfer.emit("准备文件")
+        with tempfile.TemporaryDirectory(prefix="tgdl-", dir=temp_parent) as temporary:
+            with own_temporary(Path(temporary)):
+                if cache_lease is not None:
+                    cache_lease.track(Path(temporary))
+                media_started = time.monotonic()
+                with tqdm(unit="B", unit_scale=True, desc=base, leave=False) as bar:
+                    def progress(current: int, total: int) -> None:
+                        bar.total = total or bar.total
+                        bar.n = current
+                        bar.refresh()
+                        transfer.emit("下载中", done=current, total=total)
+
+                    last_monitored_bytes = 0
+                    async def monitored_progress(current: int, total: int) -> None:
+                        nonlocal last_monitored_bytes
+                        if monitor_flow is not None:
+                            await monitor_flow.pause.checkpoint()
+                            await monitor_flow.limiter.consume(
+                                max(0, current - last_monitored_bytes),
+                                pause=monitor_flow.pause,
+                            )
+                        last_monitored_bytes = current
+                        progress(current, total)
+
+                    async def monitored_direct_download(file: str) -> Path | str | None:
+                        if monitor_flow is not None:
+                            monitor_flow.pause.register()
+                        try:
+                            if monitor_flow is not None:
+                                await monitor_flow.pause.checkpoint()
+                            return await client.download_media(
+                                target, file=file,
+                                progress_callback=monitored_progress if monitor_flow is not None else progress,
+                            )
+                        finally:
+                            if monitor_flow is not None:
+                                monitor_flow.pause.unregister()
+
+                    if use_chunks and monitor_flow is not None:
+                        chunk_output = Path(temporary) / ("data" + document_suffix(document))
+                        try:
+                            saved = await monitor_download_document(
+                                client, document, chunk_output, monitor_flow,
+                                on_bytes=lambda n: (bar.update(n), transfer.advance(n)),
+                            )
+                            mode = "监控动态分块"
+                        except ChunkDownloadStalled as exc:
+                            # Preserve the existing fallback if Telegram never
+                            # completes a window despite bounded retries.
+                            print(f"[监控分块] {base} 请求停顿：{exc}；回退普通下载")
+                            chunk_output.unlink(missing_ok=True)
+                            saved = await monitored_direct_download(
+                                str(Path(temporary) / ("normal" + document_suffix(document)))
+                            )
+                            mode = "监控普通回退"
+                    elif use_chunks:
+                        chunk_output = Path(temporary) / ("data" + document_suffix(document))
+                        try:
+                            saved = await download_chunked(
+                                client, document, chunk_output,
+                                parts=chunk_concurrency, on_bytes=lambda n: (
+                                    bar.update(n), transfer.advance(n)
+                                ),
+                                timings=chunk_timings,
+                                diagnostic_label=f"{dest_dir.parent.name}/{base}",
+                            )
+                        except ChunkDownloadStalled as exc:
+                            chunk_timings.clear()
+                            transfer.emit("普通下载回退", done=0, force=True)
+                            print(f"[分块] {base} 超时/失败: {exc}; 自动退回普通下载")
+                            # The chunked file is preallocated at full size.
+                            # Delete it BEFORE normal fallback, so SSD staging
+                            # never needs space for two full copies of one media.
+                            chunk_output.unlink(missing_ok=True)
+                            saved = await monitored_direct_download(
+                                str(Path(temporary) / ("normal" + document_suffix(document)))
+                            )
+                        else:
+                            mode = f"分块{chunk_concurrency}路"
+                    else:
+                        saved = await monitored_direct_download(str(temporary))
+                media_elapsed = max(time.monotonic() - media_started, 0.001)
+                if not saved:
+                    stats.failed += 1
+                    transfer.emit("失败", force=True)
+                    return None
+                saved_path = Path(saved)
+                suffix = saved_path.suffix or ".bin"
+                final_path = dest_dir / f"{base}{suffix}"
+                if skip_existing and final_path.exists():
+                    stats.skipped += 1
+                    return None
+                if final_path.exists():
+                    final_path = unique_path(final_path)
+                publish_started = time.monotonic()
+                transfer.emit("正在保存", force=True)
+                # Moving within a volume is a rename, not a full media copy.
+                if not same_volume(saved_path, dest_dir):
+                    # On cross-volume moves, first copy sequentially to a hidden
+                    # incomplete destination, and publish only after full verification.
+                    # Never interleave large file copies on a mechanical disk:
+                    # one sequential publishing pass at a time.
+                    async with _STAGED_PUBLISH_LOCK:
+                        with tempfile.TemporaryDirectory(prefix="tgdl-publish-", dir=dest_dir) as publishing:
+                            with own_temporary(Path(publishing)):
+                                partial = Path(publishing) / f"data{suffix}"
+                                with saved_path.open("rb") as source, partial.open("xb") as sink:
+                                    while True:
+                                        data = source.read(4 * 1024 * 1024)
+                                        if not data:
+                                            break
+                                        sink.write(data)
+                                        await asyncio.sleep(0)
+                                if partial.stat().st_size != saved_path.stat().st_size:
+                                    raise IOError("Staged media copy size mismatch")
+                                partial.replace(final_path)
+                else:
+                    saved_path.replace(final_path)
+                publish_seconds = time.monotonic() - publish_started
+                if history is not None and peer_id is not None:
+                    history.mark_saved(peer_id, message.id, dest_dir.name, final_path)
     stats.saved += 1
+    transfer.emit("完成", force=True)
+    elapsed = max(time.monotonic() - started, 0.001)
+    size_mib = final_path.stat().st_size / 1048576
+    detail = (f"[下载完成] {final_path.name} | {size_mib:.1f} MiB | "
+              f"{elapsed:.1f}秒 | 全程均速{size_mib / elapsed:.2f} MiB/s | {mode}"
+              f" | 传输阶段{media_elapsed:.1f}秒，均速{size_mib / media_elapsed:.2f} MiB/s")
+    if flood_before is not None and callable(flood_snapshot):
+        flood_after = flood_snapshot()
+        changes = []
+        for kind in ("FLOOD_WAIT", "FLOOD_PREMIUM_WAIT"):
+            prev = flood_before.get(kind, (0, 0))
+            new = flood_after.get(kind, (0, 0))
+            count, seconds = new[0] - prev[0], new[1] - prev[1]
+            if count:
+                changes.append(f"{kind}={count}次/{seconds}s")
+        if changes:
+            detail += " | 同期全局限流响应：" + "，".join(changes) + "（并发任务可能重叠，非实际总停顿）"
+    if rpc_before is not None and callable(rpc_snapshot):
+        rpc_after = rpc_snapshot()
+        changes = {
+            kind: count - rpc_before.get(kind, 0)
+            for kind, count in rpc_after.items()
+            if count > rpc_before.get(kind, 0)
+        }
+        if changes:
+            total = sum(changes.values())
+            classes = "，".join(f"{kind}={count}" for kind, count in sorted(changes.items()))
+            detail += (
+                f" | 同期全局GetFile RPC异常{total}次（{classes}），"
+                f"名义重试等待约{total * 2}s"
+                "（并发或内部重试可重叠，非实际阻塞时间）"
+            )
+    if chunk_timings:
+        detail += (
+            f" | 文件准备{chunk_timings.get('prepare_s', 0):.2f}秒"
+            f" / 分块传输{chunk_timings.get('transfer_s', 0):.2f}秒"
+            f" / 最终保存{publish_seconds:.2f}秒"
+        )
+    if on_saved is not None:
+        on_saved(detail)
+    else:
+        print(detail)
     return final_path
 
 
@@ -327,6 +789,12 @@ async def _download_with_retry(
     skip_existing: bool,
     retries: int,
     chunk_concurrency: int = 1,
+    history: DownloadHistory | None = None,
+    peer_id: int | None = None,
+    on_saved: Callable[[str], None] | None = None,
+    temp_download_dir: Path | None = None,
+    on_progress: ProgressCallback | None = None,
+    monitor_flow: MonitorFlow | None = None,
 ) -> Path | None:
     for attempt in range(retries + 1):
         try:
@@ -334,15 +802,34 @@ async def _download_with_retry(
                 client, message, dest_dir, base,
                 skip_existing=skip_existing, stats=stats,
                 chunk_concurrency=chunk_concurrency,
+                history=history, peer_id=peer_id,
+                on_saved=on_saved,
+                temp_download_dir=temp_download_dir,
+                on_progress=on_progress,
+                monitor_flow=monitor_flow,
             )
+        except asyncio.CancelledError:
+            if on_progress is not None:
+                on_progress(f"{peer_id or 0}:{message.id}:{base}",
+                            f"{dest_dir.parent.name} / {base}", 0, 0, "已取消")
+            raise
         except FloodWaitError:
+            if on_progress is not None:
+                on_progress(f"{peer_id or 0}:{message.id}:{base}",
+                            f"{dest_dir.parent.name} / {base}", 0, 0, "限流等待")
             raise
         except Exception as exc:
             if attempt >= retries:
                 stats.failed += 1
+                if on_progress is not None:
+                    on_progress(f"{peer_id or 0}:{message.id}:{base}",
+                                f"{dest_dir.parent.name} / {base}", 0, 0, "失败")
                 print(f"Failed message {getattr(message, 'id', '?')}: {exc}")
                 return None
             delay = min(2 ** attempt, 8)
+            if on_progress is not None:
+                on_progress(f"{peer_id or 0}:{message.id}:{base}",
+                            f"{dest_dir.parent.name} / {base}", 0, 0, "重试等待")
             print(f"Retry message {getattr(message, 'id', '?')} "
                   f"({attempt + 1}/{retries}) in {delay}s: {exc}")
             await asyncio.sleep(delay)
@@ -358,6 +845,12 @@ async def download_many(
     retries: int = 2,
     skip_existing: bool = True,
     chunk_concurrency: int = 1,
+    history: DownloadHistory | None = None,
+    peer_id: int | None = None,
+    on_saved: Callable[[str], None] | None = None,
+    stop_event: threading.Event | None = None,
+    temp_download_dir: Path | None = None,
+    on_progress: ProgressCallback | None = None,
 ) -> list[Path]:
     """Bounded multi-file concurrency (not parallel chunks of one video)."""
     if not 1 <= concurrency <= 8:
@@ -383,12 +876,18 @@ async def download_many(
         async for message, dest_dir, base in jobs:
             while len(pending) >= concurrency:
                 await collect_one()
+            if stop_event is not None and stop_event.is_set():
+                break
             pending.add(
                 asyncio.create_task(
                     _download_with_retry(
                         client, message, dest_dir, base, stats,
                         skip_existing=skip_existing, retries=retries,
                         chunk_concurrency=chunk_concurrency,
+                        history=history, peer_id=peer_id,
+                        on_saved=on_saved,
+                        temp_download_dir=temp_download_dir,
+                        on_progress=on_progress,
                     )
                 )
             )

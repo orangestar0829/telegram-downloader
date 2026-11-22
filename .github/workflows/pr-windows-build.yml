@@ -1,0 +1,70 @@
+name: Build Windows preview for PR
+
+on:
+  push:
+    branches: [fix/chunk-stall-progress-pr-build]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-preview-release
+  cancel-in-progress: false
+
+jobs:
+  windows-preview:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller pytest
+      - name: Run offline tests
+        run: python -m pytest -q
+      - name: Check cryptg and SOCKS5
+        run: python -c "import cryptg, python_socks, telethon; print('Telethon', telethon.__version__)"
+      - name: Build Windows executable
+        run: pyinstaller --noconfirm packaging/tgdl.spec
+      - name: Install NSIS
+        run: choco install nsis -y --no-progress
+      - name: Package Windows installer and portable ZIP
+        shell: pwsh
+        run: |
+          $version = "pr-3-${{ github.run_number }}"
+          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if (-not (Test-Path $makensis)) { $makensis = "makensis" }
+          & $makensis "/DVERSION=$version" packaging/installer.nsi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType File -Path dist/TelegramDownloader/portable.flag -Force | Out-Null
+          New-Item -ItemType Directory -Path dist/TelegramDownloader/data -Force | Out-Null
+          Set-Content -Path dist/TelegramDownloader/data/README.txt -Value "Portable user data: .env, tgdl_session.session, tgdl_download_history.sqlite3. Keep this folder when upgrading."
+          Compress-Archive -Path dist/TelegramDownloader -DestinationPath "TelegramDownloader-$version-portable-win64.zip" -Force
+      - name: Publish preview prerelease (no Actions artifacts)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "preview-pr-3"
+          $sha = "${{ github.sha }}"
+          $installer = Get-ChildItem "TelegramDownloader-Setup-pr-*.exe" | Select-Object -First 1
+          $portable = Get-ChildItem "TelegramDownloader-pr-*-portable-win64.zip" | Select-Object -First 1
+          if (-not $installer -or -not $portable) { throw "Missing Windows build output" }
+          Copy-Item $installer.FullName "TelegramDownloader-PR3-Setup.exe"
+          Copy-Item $portable.FullName "TelegramDownloader-PR3-portable-win64.zip"
+          # Create the prerelease if necessary. Keep the same tag/URL across builds.
+          gh release view $tag --json tagName *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --target $sha --title "PR #3 Windows preview" --notes "Unmerged preview build from PR #3. Not a stable release." --prerelease
+            if ($LASTEXITCODE -ne 0) { throw "Could not create prerelease" }
+          }
+          # Replace assets only after both builds have succeeded.
+          gh release upload $tag "TelegramDownloader-PR3-Setup.exe" "TelegramDownloader-PR3-portable-win64.zip" --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not upload prerelease assets" }
+          gh release edit $tag --target $sha --prerelease --title "PR #3 Windows preview" --notes "Unmerged preview from commit $sha. Build run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if ($LASTEXITCODE -ne 0) { throw "Could not update prerelease" }

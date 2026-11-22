@@ -5,16 +5,19 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
+from tgdl.paths import prepare_data_dir
 
 ROOT = Path(__file__).resolve().parent.parent
-SESSION_PATH = ROOT / "tgdl_session"
-ENV_PATH = ROOT / ".env"
+DATA_DIR = prepare_data_dir()
+SESSION_PATH = DATA_DIR / "tgdl_session"
+ENV_PATH = DATA_DIR / ".env"
 
 _ENV_KEYS = {
     "TELEGRAM_API_ID": "api_id",
     "TELEGRAM_API_HASH": "api_hash",
     "TELEGRAM_PHONE": "phone",
     "DOWNLOAD_DIR": "download_dir",
+    "TEMP_DOWNLOAD_DIR": "temp_download_dir",
     "SOCKS5_HOST": "proxy_host",
     "SOCKS5_PORT": "proxy_port",
     "SOCKS5_USERNAME": "proxy_username",
@@ -22,6 +25,7 @@ _ENV_KEYS = {
     "MEDIA_CONCURRENCY": "media_concurrency",
     "MEDIA_RETRIES": "media_retries",
     "CHUNK_CONCURRENCY": "chunk_concurrency",
+    "MEDIA_SPEED_KIB": "media_speed_kib",
 }
 
 
@@ -38,6 +42,8 @@ class Settings:
     media_concurrency: int = 3
     media_retries: int = 2
     chunk_concurrency: int = 1
+    media_speed_kib: int = 0
+    temp_download_dir: Path | None = None
 
 
 def default_download_dir() -> Path:
@@ -88,10 +94,11 @@ def read_env_values() -> dict[str, str]:
     values = {
         "api_id": "", "api_hash": "", "phone": "",
         "download_dir": str(default_download_dir()),
+        "temp_download_dir": "",
         "proxy_host": "", "proxy_port": "",
         "proxy_username": "", "proxy_password": "",
         "media_concurrency": "3", "media_retries": "2",
-        "chunk_concurrency": "1",
+        "chunk_concurrency": "1", "media_speed_kib": "0",
     }
     if ENV_PATH.exists():
         for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
@@ -123,6 +130,8 @@ def update_env(values: dict[str, str]) -> Path:
         ("MEDIA_CONCURRENCY", "media_concurrency"),
         ("MEDIA_RETRIES", "media_retries"),
         ("CHUNK_CONCURRENCY", "chunk_concurrency"),
+        ("MEDIA_SPEED_KIB", "media_speed_kib"),
+        ("TEMP_DOWNLOAD_DIR", "temp_download_dir"),
     ):
         if name in values:
             desired[key] = values[name]
@@ -149,7 +158,11 @@ def load_settings() -> Settings:
     dd_raw = os.getenv("DOWNLOAD_DIR", "").strip()
     download_dir = Path(dd_raw).expanduser() if dd_raw else default_download_dir()
     if not download_dir.is_absolute():
-        download_dir = ROOT / download_dir
+        download_dir = DATA_DIR / download_dir
+    staging_raw = os.getenv("TEMP_DOWNLOAD_DIR", "").strip()
+    staging_dir = Path(staging_raw).expanduser() if staging_raw else None
+    if staging_dir is not None and not staging_dir.is_absolute():
+        staging_dir = DATA_DIR / staging_dir
 
     if creds is None:
         raise SystemExit(
@@ -187,6 +200,10 @@ def load_settings() -> Settings:
         chunk_concurrency=_bounded_int(
             os.getenv("CHUNK_CONCURRENCY", "1"), "CHUNK_CONCURRENCY", 1, 8
         ),
+        media_speed_kib=_bounded_int(
+            os.getenv("MEDIA_SPEED_KIB", "0"), "MEDIA_SPEED_KIB", 0, 1048576
+        ),
+        temp_download_dir=staging_dir,
     )
 
 

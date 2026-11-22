@@ -12,11 +12,13 @@ to it and receives log output through a thread-safe queue.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import os
 import queue
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from tgdl.browser import list_media, save_items
@@ -30,7 +32,19 @@ from tgdl.config import (
     read_env_values,
     update_env,
 )
-from tgdl.downloader import download_channel, resolve_channel
+from tgdl.downloader import download_channel, resolve_channel, scan_monitor_slice
+from tgdl.history import DownloadHistory
+from tgdl.log_format import TimestampedLines
+from tgdl.monitor import (
+    MonitorDispatchSummary, choose_monitor_download, load_channels, next_due_channel,
+    save_channels,
+)
+
+from tgdl.paths import data_dir
+from tgdl.single_instance import AlreadyRunning, gui_instance_guard
+from tgdl.temp_cleanup import inspect_cleanup
+from tgdl.telethon_diagnostics import install_telethon_diagnostics
+from tgdl.window_state import load_window_geometry, save_window_geometry
 
 from tgdl import downloader as _downloader
 from tgdl import http_fetch as _http_fetch
@@ -104,12 +118,13 @@ class AsyncLoop:
 
 
 class _QueueWriter:
-    def __init__(self, sink: "queue.Queue[str]") -> None:
+    def __init__(self, sink: "queue.Queue[str]", formatter: TimestampedLines | None = None) -> None:
         self._sink = sink
+        self._formatter = formatter or TimestampedLines()
 
     def write(self, text: str) -> int:
         if text:
-            self._sink.put(text)
+            self._sink.put(self._formatter.format(text))
         return len(text)
 
     def flush(self) -> None:
@@ -129,7 +144,12 @@ def run_gui() -> None:
         raise SystemExit(1)
 
     _silence_progress_bars()
-    _App().run()
+    try:
+        with gui_instance_guard(data_dir()):
+            _App().run()
+    except AlreadyRunning as exc:
+        from tkinter import messagebox
+        messagebox.showinfo("已在运行", str(exc))
 
 
 class _App:
@@ -147,11 +167,21 @@ class _App:
         self.client = None
         self.settings: Settings | None = None
         self.log_queue: "queue.Queue[str]" = queue.Queue()
+        self.download_queue: "queue.Queue[str]" = queue.Queue()
+        self.progress_queue: "queue.Queue[tuple[str, str, int, int, str]]" = queue.Queue()
+        self._progress_entries: dict[str, dict] = {}
+        self._monitor_progress_states: dict[str, str] = {}
+        self._log_popup = None
+        self._log_popup_text = None
+        self._download_popup = None
+        self._download_popup_text = None
 
         self.root = tk.Tk()
         self.root.title("Telegram 下载器")
-        self.root.geometry("820x680")
-        self.root.minsize(720, 560)
+        self.root.geometry(load_window_geometry(
+            self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        ))
+        self.root.minsize(790, 620)
         self._app_icon = None
         try:
             icon = _icon_path()
@@ -167,6 +197,16 @@ class _App:
         self.api_hash_var = tk.StringVar(value=env["api_hash"])
         self.phone_var = tk.StringVar(value=env["phone"])
         self.download_dir_var = tk.StringVar(value=env["download_dir"] or str(default_download_dir()))
+        self.temp_download_dir_var = tk.StringVar(value=env["temp_download_dir"])
+        # The GUI lock is acquired before initialization; no other GUI
+        # process can race our startup orphan cleanup.
+        startup_cache = inspect_cleanup(
+            self._cleanup_path(env["temp_download_dir"]),
+            self._cleanup_path(env["download_dir"]),
+        )
+        self.log_queue.put(startup_cache.summary() + "\n")
+        for error in startup_cache.failed:
+            self.log_queue.put(f"[缓存清理] {error}\n")
         self.proxy_host_var = tk.StringVar(value=env["proxy_host"])
         self.proxy_port_var = tk.StringVar(value=env["proxy_port"])
         self.proxy_username_var = tk.StringVar(value=env["proxy_username"])
@@ -174,6 +214,15 @@ class _App:
         self.media_concurrency_var = tk.StringVar(value=env["media_concurrency"])
         self.media_retries_var = tk.StringVar(value=env["media_retries"])
         self.chunk_concurrency_var = tk.StringVar(value=env["chunk_concurrency"])
+        self.media_speed_kib_var = tk.StringVar(value=env.get("media_speed_kib", "0"))
+        # Editable form values are drafts. Only the Apply button publishes a
+        # validated snapshot to the running monitor download worker.
+        self._applied_media_settings = (
+            int(env["media_concurrency"]),
+            int(env["media_retries"]),
+            int(env["chunk_concurrency"]),
+            int(env.get("media_speed_kib", "0")),
+        )
         self.status_var = tk.StringVar(value="未登录")
         self.manual_var = tk.StringVar()
 
@@ -181,6 +230,39 @@ class _App:
         self.type_video = tk.BooleanVar(value=True)
         self.type_anim = tk.BooleanVar(value=False)
         self.dl_limit = tk.StringVar()
+        self.auto_minutes_var = tk.StringVar(value="30")
+        self.auto_status_var = tk.StringVar(value="定时下载：未启动")
+        self._auto_job_id = None
+        self._auto_config = None
+        self._download_future = None
+        self._download_task = None
+        self._stop_download = threading.Event()
+        self._closing = False
+        self._monitor_cursor = 0
+        try:
+            self._monitored = load_channels()
+        except (ValueError, OSError) as exc:
+            self._monitored = []
+            self.log_queue.put(f"[监控] 配置读取失败：{exc}\n")
+        self._monitor_next: dict[str, float] = {}
+        self._monitor_totals: dict[str, dict[str, int]] = {}
+        self._monitor_scan_future = None
+        self._monitor_download_future = None
+        self._monitor_worker_task = None
+        self._monitor_scan_stop = threading.Event()
+        self._monitor_download_stop = threading.Event()
+        self._monitor_slice_cursor = 0
+        self._monitor_batch_used: dict[str, int] = {}
+        self._monitor_scan_inflight = False
+        self._monitor_active_transfers = 0
+        self._monitor_total_transfers = 0
+        self._monitor_live_concurrency = self._applied_media_settings[0]
+        self._monitor_live_retries = self._applied_media_settings[1]
+        self._monitor_live_chunks = self._applied_media_settings[2]
+        self._monitor_live_speed_kib = self._applied_media_settings[3]
+        self._monitor_worker_retry_at = 0.0
+        self._monitor_job = None
+        self._monitor_active = False
 
         # gallery state
         self.g_limit = tk.StringVar(value="60")
@@ -196,11 +278,17 @@ class _App:
         self.p_limit = tk.StringVar()
 
         self._build_ui()
+        # No trace_add on numeric inputs: intermediate text (e.g. 3 -> 30 ->
+        # 3096) must never cause a live bandwidth change.
 
         self._stdout, self._stderr = sys.stdout, sys.stderr
-        writer = _QueueWriter(self.log_queue)
+        self._timestamp_formatter = TimestampedLines()
+        self._download_timestamp_formatter = TimestampedLines()
+        writer = _QueueWriter(self.log_queue, self._timestamp_formatter)
         sys.stdout = writer
         sys.stderr = writer
+        self._telethon_diag_uninstall = install_telethon_diagnostics(self._log)
+        self._log("[网络诊断] 已启用 Telethon FloodWait、连接恢复和分块停顿诊断\n")
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._drain_log)
@@ -241,11 +329,20 @@ class _App:
         ttk.Label(login, text="状态:").grid(row=0, column=4, sticky="e", **pad)
         ttk.Label(login, textvariable=self.status_var, foreground="#0a6").grid(row=0, column=5, sticky="w", **pad)
 
+        # Let the user give the log panel more room without enlarging
+        # the entire window. Pack the outer login row above the splitter.
+        self.main_split = ttk.Panedwindow(self.root, orient="vertical")
+        self.main_split.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        main_panel = ttk.Frame(self.main_split)
+        log_panel = ttk.Frame(self.main_split)
+        self.main_split.add(main_panel, weight=1)
+        self.main_split.add(log_panel, weight=1)
+
         # Your chats.
-        chats = ttk.LabelFrame(self.root, text="我的群组 / 频道(登录后自动加载)")
+        chats = ttk.LabelFrame(main_panel, text="我的群组 / 频道(登录后自动加载)")
         chats.pack(fill="both", expand=True, **pad)
         cols = ("id", "kind", "name")
-        self.tree = ttk.Treeview(chats, columns=cols, show="headings", height=9, selectmode="browse")
+        self.tree = ttk.Treeview(chats, columns=cols, show="headings", height=5, selectmode="browse")
         self.tree.heading("id", text="ID")
         self.tree.heading("kind", text="类型")
         self.tree.heading("name", text="名称")
@@ -265,24 +362,783 @@ class _App:
         ttk.Entry(side, textvariable=self.manual_var, width=22).pack(fill="x", pady=2)
 
         # Download / advanced tabs.
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill="x", **pad)
+        tabs_row = ttk.Frame(main_panel)
+        tabs_row.pack(fill="x", **pad)
+        nb = ttk.Notebook(tabs_row)
+        nb.pack(side="left", fill="x", expand=True)
         nb.add(self._build_gallery_tab(), text="浏览媒体(选图/视频)")
         nb.add(self._build_download_tab(), text="批量下载")
+        nb.add(self._build_monitor_tab(), text="多频道监控")
         nb.add(self._build_parse_tab(), text="解析链接(高级)")
 
         # Download folder row.
-        folder = ttk.Frame(self.root)
+        folder = ttk.Frame(main_panel)
         folder.pack(fill="x", **pad)
         ttk.Label(folder, text="下载到:").pack(side="left")
         ttk.Label(folder, textvariable=self.download_dir_var, foreground="#333").pack(side="left", padx=6)
         ttk.Button(folder, text="更改", command=self._change_dir).pack(side="left")
         ttk.Button(folder, text="打开下载文件夹", command=self._open_folder).pack(side="left", padx=6)
 
-        logframe = ttk.LabelFrame(self.root, text="日志")
+        logframe = ttk.LabelFrame(log_panel, text="日志和实时进度（拖动上方分隔线调整高度）")
         logframe.pack(fill="both", expand=True, **pad)
-        self.log = self.scrolledtext.ScrolledText(logframe, height=8, wrap="word", state="disabled")
-        self.log.pack(fill="both", expand=True, padx=4, pady=4)
+        progress_frame = ttk.LabelFrame(logframe, text="当前下载进度（实时）")
+        progress_frame.pack(fill="x", padx=4, pady=(4, 2))
+        self.progress_summary = tk.StringVar(value="当前没有正在下载的文件")
+        ttk.Label(progress_frame, textvariable=self.progress_summary).pack(anchor="w", padx=5, pady=(2, 0))
+        progress_cols = ("file", "progress", "speed", "status")
+        self.progress_tree = ttk.Treeview(
+            progress_frame, columns=progress_cols, show="headings", height=3,
+            selectmode="none",
+        )
+        for column, title, width in (
+            ("file", "群组 / 文件", 270),
+            ("progress", "下载进度", 240),
+            ("speed", "速度", 100),
+            ("status", "状态", 100),
+        ):
+            self.progress_tree.heading(column, text=title)
+            self.progress_tree.column(column, width=width, stretch=(column == "file"))
+        self.progress_tree.pack(fill="x", padx=5, pady=(1, 4))
+        toolbar = ttk.Frame(logframe)
+        toolbar.pack(fill="x", padx=4, pady=(4, 0))
+        self.log_tabs = ttk.Notebook(logframe)
+        self.log_tabs.pack(fill="both", expand=True, padx=4, pady=(2, 4))
+        runtime_tab = ttk.Frame(self.log_tabs)
+        downloads_tab = ttk.Frame(self.log_tabs)
+        self.log_tabs.add(runtime_tab, text="运行日志")
+        self.log_tabs.add(downloads_tab, text="下载记录")
+        self.log = self.scrolledtext.ScrolledText(runtime_tab, height=8, wrap="word", state="disabled", font=("Consolas", 10))
+        self.log.pack(fill="both", expand=True)
+        self.download_log = self.scrolledtext.ScrolledText(downloads_tab, height=8, wrap="word", state="disabled", font=("Consolas", 10))
+        self.download_log.pack(fill="both", expand=True)
+        ttk.Button(toolbar, text="跳转最新", command=self._jump_to_latest_log).pack(side="right", padx=3)
+        ttk.Button(toolbar, text="放大查看", command=self._open_active_log_window).pack(side="right", padx=3)
+        self.root.after_idle(self._set_initial_log_split)
+
+    @staticmethod
+    def _initial_split_position(height: int) -> int:
+        """Give logs roughly half the window; keep both panes usable."""
+        return max(180, min(int(height * 0.52), height - 220))
+
+    def _set_initial_log_split(self) -> None:
+        """Set the sash once; later user adjustments remain untouched."""
+        if not self.main_split.winfo_exists():
+            return
+        height = self.main_split.winfo_height()
+        if height <= 1:
+            self.root.after(100, self._set_initial_log_split)
+            return
+        self.main_split.sashpos(0, self._initial_split_position(height))
+
+    def _active_log_widget(self):
+        return self.download_log if self.log_tabs.index("current") == 1 else self.log
+
+    def _jump_to_latest_log(self):
+        self._active_log_widget().see("end")
+
+    def _open_active_log_window(self):
+        if self.log_tabs.index("current") == 1:
+            self._open_download_window()
+        else:
+            self._open_log_window()
+
+    def _build_monitor_tab(self):
+        tk, ttk = self.tk, self.ttk
+        frame = ttk.Frame(self.root)
+        controls = ttk.Frame(frame)
+        controls.pack(fill="x", padx=6, pady=4)
+        ttk.Label(controls, text="扫描间隔(分钟)").pack(side="left")
+        self.monitor_minutes_var = tk.StringVar(value="15")
+        ttk.Entry(controls, textvariable=self.monitor_minutes_var, width=6).pack(side="left", padx=5)
+        ttk.Label(controls, text="优先级").pack(side="left", padx=4)
+        self.monitor_priority_var = tk.StringVar(value="0")
+        ttk.Entry(controls, textvariable=self.monitor_priority_var, width=5).pack(side="left")
+        ttk.Label(controls, text="每轮数量").pack(side="left", padx=4)
+        self.monitor_batch_var = tk.StringVar(value="100")
+        ttk.Entry(controls, textvariable=self.monitor_batch_var, width=7).pack(side="left")
+        ttk.Label(controls, text="方向").pack(side="left", padx=4)
+        self.monitor_direction_var = tk.StringVar(value="从新到旧")
+        ttk.Combobox(
+            controls, textvariable=self.monitor_direction_var, state="readonly", width=10,
+            values=("从新到旧", "从旧到新"),
+        ).pack(side="left", padx=4)
+        monitor_types = ttk.Frame(frame)
+        monitor_types.pack(fill="x", padx=6, pady=(0, 3))
+        ttk.Label(monitor_types, text="监控下载类型（每个频道独立）:").pack(side="left")
+        self.monitor_type_photo = tk.BooleanVar(value=True)
+        self.monitor_type_video = tk.BooleanVar(value=True)
+        self.monitor_type_anim = tk.BooleanVar(value=False)
+        ttk.Checkbutton(monitor_types, text="图片", variable=self.monitor_type_photo).pack(side="left", padx=4)
+        ttk.Checkbutton(monitor_types, text="视频", variable=self.monitor_type_video).pack(side="left", padx=4)
+        ttk.Checkbutton(monitor_types, text="GIF", variable=self.monitor_type_anim).pack(side="left", padx=4)
+        edit_actions = ttk.Frame(frame)
+        edit_actions.pack(fill="x", padx=6, pady=2)
+        ttk.Button(edit_actions, text="添加当前频道", command=self._monitor_add).pack(side="left")
+        ttk.Button(edit_actions, text="更新所选", command=self._monitor_update).pack(side="left", padx=4)
+        ttk.Button(edit_actions, text="删除所选", command=self._monitor_remove).pack(side="left", padx=5)
+        ttk.Button(edit_actions, text="启用/暂停所选", command=self._monitor_toggle).pack(side="left")
+        columns = ("name", "target", "types", "minutes", "priority", "batch_size", "direction", "enabled", "next")
+        self.monitor_tree = ttk.Treeview(frame, columns=columns, show="headings", height=4)
+        for column, label, width in (
+            ("name", "群组 / 频道名称", 180),
+            ("target", "频道 ID / 用户名", 155),
+            ("types", "下载类型", 125),
+            ("minutes", "间隔(分钟)", 85),
+            ("priority", "优先级", 70),
+            ("batch_size", "每轮数量", 80),
+            ("direction", "扫描方向", 85),
+            ("enabled", "状态", 65),
+            ("next", "下次扫描", 135),
+        ):
+            self.monitor_tree.heading(column, text=label)
+            self.monitor_tree.column(column, width=width)
+        self.monitor_tree.pack(fill="both", expand=True, padx=6)
+        self.monitor_tree.bind("<<TreeviewSelect>>", self._monitor_selection_changed)
+        actions = ttk.Frame(frame)
+        actions.pack(fill="x", padx=6, pady=4)
+        self.monitor_button = ttk.Button(actions, text="启动全部监控", command=self._monitor_start_stop)
+        self.monitor_button.pack(side="left")
+        ttk.Button(actions, text="取消当前下载", command=self._cancel_current_download).pack(side="left", padx=6)
+        ttk.Label(actions, text="重启后保留频道配置；需手动启动监控", foreground="#555").pack(side="left", padx=10)
+        self._monitor_refresh()
+        return frame
+
+    def _monitor_refresh(self):
+        expected = {str(i) for i in range(len(self._monitored))}
+        for iid in self.monitor_tree.get_children():
+            if iid not in expected:
+                self.monitor_tree.delete(iid)
+        for index, item in enumerate(self._monitored):
+            due = self._monitor_next.get(item["target"])
+            next_time = time.strftime("%H:%M:%S", time.localtime(due)) if due and item["enabled"] and self._monitor_active else "-"
+            values = (
+                item.get("name") or "（待获取）", item["target"],
+                self._monitor_types_label(item.get("types", "photo,video")), item["minutes"],
+                item.get("priority", 0), item.get("batch_size", 100),
+                "旧→新" if item.get("direction") == "oldest" else "新→旧",
+                "启用" if item["enabled"] else "暂停", next_time,
+            )
+            iid = str(index)
+            if self.monitor_tree.exists(iid):
+                if tuple(map(str, values)) != tuple(self.monitor_tree.item(iid, "values")):
+                    self.monitor_tree.item(iid, values=values)
+            else:
+                self.monitor_tree.insert("", "end", iid=iid, values=values)
+        for rank, index in enumerate(sorted(
+            range(len(self._monitored)),
+            key=lambda i: -int(self._monitored[i].get("priority", 0)),
+        )):
+            self.monitor_tree.move(str(index), "", rank)
+
+    def _monitor_set_name(self, target: str, title: str) -> None:
+        """Called only on Tk's main thread, never directly from Telethon."""
+        for item in self._monitored:
+            if item["target"] == target and title and title != item.get("name"):
+                item["name"] = title
+                save_channels(self._monitored)
+                self._monitor_refresh()
+                break
+
+    def _monitor_add(self):
+        target = self._selected_target()
+        if not target:
+            self.messagebox.showwarning("监控", "请先选择或输入频道")
+            return
+        try:
+            minutes, priority, batch_size = self._monitor_form_values()
+        except ValueError as exc:
+            self.messagebox.showwarning("监控", str(exc))
+            return
+        types = self._monitor_types_string()
+        if not types:
+            self.messagebox.showwarning("监控", "至少选择一种下载类型")
+            return
+        existing_name = next(
+            (item.get("name", "") for item in self._monitored if item["target"] == target),
+            "",
+        )
+        if not existing_name:
+            selected = self.tree.selection()
+            if selected:
+                values = self.tree.item(selected[0], "values")
+                if values and str(values[0]) == target and len(values) > 2:
+                    existing_name = str(values[2])
+        self.monitor_tree.selection_remove(self.monitor_tree.selection())
+        self._monitored = [item for item in self._monitored if item["target"] != target]
+        self._monitored.append({
+            "target": target, "minutes": minutes, "types": types, "enabled": True,
+            "direction": "oldest" if self.monitor_direction_var.get() == "从旧到新" else "newest",
+            "name": existing_name, "priority": priority, "batch_size": batch_size,
+        })
+        self._monitor_next[target] = time.time()
+        save_channels(self._monitored)
+        self._monitor_refresh()
+
+    def _monitor_selected_index(self):
+        selected = self.monitor_tree.selection()
+        return int(selected[0]) if selected else None
+
+    def _monitor_selection_changed(self, _event=None):
+        index = self._monitor_selected_index()
+        if index is not None and index < len(self._monitored):
+            item = self._monitored[index]
+            self.monitor_minutes_var.set(str(item["minutes"]))
+            self.monitor_priority_var.set(str(item.get("priority", 0)))
+            self.monitor_batch_var.set(str(item.get("batch_size", 100)))
+            self.monitor_direction_var.set(
+                "从旧到新" if item.get("direction") == "oldest" else "从新到旧"
+            )
+            self._monitor_set_types(item.get("types", "photo,video"))
+
+    def _monitor_update(self):
+        index = self._monitor_selected_index()
+        if index is None:
+            self.messagebox.showwarning("监控", "请先在监控列表中选一个频道")
+            return
+        try:
+            minutes, priority, batch_size = self._monitor_form_values()
+        except ValueError as exc:
+            self.messagebox.showwarning("监控", str(exc))
+            return
+        types = self._monitor_types_string()
+        if not types:
+            self.messagebox.showwarning("监控", "至少选择一种监控下载类型")
+            return
+        item = self._monitored[index]
+        item["minutes"] = minutes
+        item["priority"] = priority
+        item["batch_size"] = batch_size
+        item["direction"] = "oldest" if self.monitor_direction_var.get() == "从旧到新" else "newest"
+        item["types"] = types
+        self._monitor_batch_used.pop(item["target"], None)
+        self._monitor_totals.pop(item["target"], None)
+        self._monitor_next[item["target"]] = time.time()
+        save_channels(self._monitored)
+        self._monitor_refresh()
+
+    @staticmethod
+    def _monitor_types_label(raw: str) -> str:
+        try:
+            selected = parse_types(str(raw))
+        except SystemExit:
+            return "未知类型"
+        return "、".join(
+            label for kind, label in (
+                ("photo", "图片"), ("video", "视频"), ("animation", "GIF")
+            ) if kind in selected
+        )
+
+    def _monitor_set_types(self, raw: str) -> None:
+        try:
+            selected = parse_types(str(raw))
+        except SystemExit:
+            selected = set()
+        self.monitor_type_photo.set("photo" in selected)
+        self.monitor_type_video.set("video" in selected)
+        self.monitor_type_anim.set("animation" in selected)
+
+    def _monitor_types_string(self) -> str:
+        return ",".join(
+            name for name, variable in (
+                ("photo", self.monitor_type_photo),
+                ("video", self.monitor_type_video),
+                ("animation", self.monitor_type_anim),
+            ) if variable.get()
+        )
+
+    def _monitor_form_values(self) -> tuple[int, int, int]:
+        try:
+            minutes = int(self.monitor_minutes_var.get().strip())
+            priority = int(self.monitor_priority_var.get().strip())
+            batch_size = int(self.monitor_batch_var.get().strip())
+        except ValueError as exc:
+            raise ValueError("间隔、优先级及每轮数量必须填写整数") from exc
+        if not 1 <= minutes <= 1440:
+            raise ValueError("扫描间隔应为 1～1440 分钟")
+        if not 1 <= batch_size <= 100_000:
+            raise ValueError("每轮数量应为 1～100000")
+        return minutes, priority, batch_size
+
+    def _monitor_remove(self):
+        index = self._monitor_selected_index()
+        if index is not None:
+            self.monitor_tree.selection_remove(self.monitor_tree.selection())
+            item = self._monitored.pop(index)
+            self._monitor_next.pop(item["target"], None)
+            self._monitor_batch_used.pop(item["target"], None)
+            self._monitor_totals.pop(item["target"], None)
+            save_channels(self._monitored)
+            self._monitor_refresh()
+
+    def _monitor_toggle(self):
+        index = self._monitor_selected_index()
+        if index is not None:
+            item = self._monitored[index]
+            item["enabled"] = not item["enabled"]
+            self._monitor_batch_used.pop(item["target"], None)
+            self._monitor_totals.pop(item["target"], None)
+            self._monitor_next[item["target"]] = time.time()
+            save_channels(self._monitored)
+            self._monitor_refresh()
+
+    def _monitor_start_stop(self):
+        self._monitor_active = not self._monitor_active
+        if self._monitor_active:
+            self._stop_auto() if self._auto_config is not None else None
+            self._monitor_scan_stop.clear()
+            self._monitor_download_stop.clear()
+            self._monitor_batch_used.clear()
+            self._monitor_totals.clear()
+            self._monitor_next = {item["target"]: time.time() for item in self._monitored}
+            self.monitor_button.config(text="停止全部监控")
+            self._log("[监控] 多频道监控已启动\n")
+            self._monitor_tick()
+        else:
+            self._monitor_scan_stop.set()
+            self._monitor_download_stop.set()
+            if self._monitor_job is not None:
+                self.root.after_cancel(self._monitor_job)
+                self._monitor_job = None
+            self.monitor_button.config(text="启动全部监控")
+            self._log("[监控] 已停止调度，正在下载的任务不受影响\n")
+            self._monitor_refresh()
+
+    def _apply_media_settings(self) -> None:
+        """Atomically validate, save, and apply all numeric download settings."""
+        try:
+            raw = (
+                self.media_concurrency_var.get(),
+                self.media_retries_var.get(),
+                self.chunk_concurrency_var.get(),
+                self.media_speed_kib_var.get(),
+            )
+            settings = tuple(int(value.strip()) for value in raw)
+        except (ValueError, TypeError, AttributeError):
+            self.messagebox.showwarning("下载设置", "请填写完整的整数参数，未应用任何更改")
+            return
+        workers, retries, chunks, speed = settings
+        if not (1 <= workers <= 8 and 0 <= retries <= 5
+                and 1 <= chunks <= 8 and 0 <= speed <= 1048576):
+            self.messagebox.showwarning(
+                "下载设置", "并发/分块范围 1-8，失败重试范围 0-5，总限速范围 0-1048576 KiB/s"
+            )
+            return
+        previous = getattr(self, "_applied_media_settings", None)
+        try:
+            values = read_env_values()
+            values.update(
+                media_concurrency=str(workers), media_retries=str(retries),
+                chunk_concurrency=str(chunks), media_speed_kib=str(speed),
+            )
+            update_env(values)
+        except OSError as exc:
+            self.messagebox.showwarning("下载设置", f"保存失败，设置未生效：{exc}")
+            return
+        self._applied_media_settings = settings
+        self._monitor_live_concurrency = workers
+        self._monitor_live_retries = retries
+        self._monitor_live_chunks = chunks
+        self._monitor_live_speed_kib = speed
+        if previous is None or previous != settings:
+            self._log(
+                f"[下载设置] 已应用｜文件并发{workers}｜重试{retries}｜"
+                f"分块并发{chunks}｜监控总限速{speed} KiB/s"
+                "（0=不限速；运行中的监控下载逐步生效）\n"
+            )
+
+    def _monitor_tick(self):
+        self._monitor_job = None
+        if not self._monitor_active:
+            return
+        now = time.time()
+        scan_busy = self._monitor_scan_inflight
+        if not scan_busy:
+            # Rotate a 20-message slice per channel, not a complete 500-media
+            # batch. Sort by numeric priority, with cyclic fairness among
+            # channels eligible in this tick.
+            item = next_due_channel(
+                self._monitored, self._monitor_next, now, self._monitor_slice_cursor
+            )
+            if item is not None:
+                self._monitor_slice_cursor += 1
+                target = item["target"]
+                quota = int(item.get("batch_size", 100))
+                used = self._monitor_batch_used.get(target, 0)
+                remaining = max(1, quota - used)
+                if target not in self._monitor_totals:
+                    display = item.get("name") or target
+                    self._log(
+                        f"[扫描] {display}：开始｜间隔{item['minutes']}分钟｜"
+                        f"本轮上限{quota}\n"
+                    )
+                def resolved(title, peer_id):
+                    self.root.after(0, lambda: self._monitor_set_name(target, title))
+                async def scan():
+                    await self._ensure_client()
+                    return await scan_monitor_slice(
+                        self.client, target=target, types=parse_types(item["types"]),
+                        monitor_direction=item.get("direction", "newest"),
+                        slice_size=20, match_limit=min(20, remaining),
+                        stop_event=self._monitor_scan_stop,
+                        on_channel_resolved=resolved,
+                    )
+                # Reserve a slice for this channel without blocking Tk or
+                # waiting for the media file downloads to finish.
+                future = self.loop.submit(scan())
+                self._monitor_scan_future = future
+                self._monitor_scan_inflight = True
+                def scanned(done):
+                    try:
+                        result = done.result()
+                    except concurrent.futures.CancelledError:
+                        return
+                    except Exception as exc:
+                        self.root.after(0, lambda exc=exc: self._monitor_scan_error(target, exc))
+                        return
+                    self.root.after(0, lambda: self._monitor_slice_done(target, result))
+                future.add_done_callback(scanned)
+        if self._monitor_download_future is not None and self._monitor_download_future.done():
+            try:
+                self._monitor_download_future.result()
+            except concurrent.futures.CancelledError:
+                pass
+            except Exception as exc:
+                self._monitor_worker_retry_at = now + 30
+                self._log(f"[监控下载错误] {exc}；30 秒后尝试恢复\n")
+            self._monitor_download_future = None
+        worker = self._monitor_worker_task
+        download_busy = (
+            self._monitor_download_future is not None
+            and not self._monitor_download_future.done()
+        ) or (worker is not None and not worker.done())
+        if (not download_busy and not self._monitor_download_stop.is_set()
+                and now >= self._monitor_worker_retry_at):
+            try:
+                concurrency, retries, chunks = self._media_options()
+            except ValueError as exc:
+                self._log(f"[监控] 下载设置错误：{exc}\n")
+            else:
+                self._monitor_download_future = self.loop.submit(
+                    self._monitor_download_worker(concurrency, retries, chunks)
+                )
+        self._monitor_refresh()
+        self._monitor_job = self.root.after(1000, self._monitor_tick)
+
+    def _monitor_scan_error(self, target: str, exc: Exception) -> None:
+        self._monitor_scan_inflight = False
+        if not self._monitor_active:
+            return
+        self._monitor_totals.pop(target, None)
+        self._monitor_next[target] = time.time() + 60
+        item = next((x for x in self._monitored if x["target"] == target), None)
+        name = (item.get("name") or target) if item else target
+        self._log(f"[扫描异常] {name}：失败｜60秒后重试｜{exc}\n")
+
+    def _monitor_slice_done(self, target: str, result) -> None:
+        self._monitor_scan_inflight = False
+        if not self._monitor_active:
+            return
+        item = next((x for x in self._monitored if x["target"] == target), None)
+        if item is None:
+            return
+        self._monitor_batch_used[target] = self._monitor_batch_used.get(target, 0) + result.matched
+        quota_reached = self._monitor_batch_used[target] >= int(item.get("batch_size", 100))
+        self._monitor_log_progress(target, result, quota_reached=quota_reached)
+        if not result.more_pending or quota_reached:
+            self._monitor_batch_used[target] = 0
+            self._monitor_next[target] = time.time() + item["minutes"] * 60
+        else:
+            self._monitor_next[target] = time.time()
+
+    async def _monitor_download_worker(self, concurrency: int, retries: int, chunks: int):
+        """Consume durable media jobs independently from the channel scanner."""
+        from tgdl.downloader import DownloadStats, _download_with_retry, safe_name
+        from tgdl.monitor_flow import MonitorFlow, MonitorPause, SharedSpeedLimiter
+        self._monitor_worker_task = asyncio.current_task()
+        history = DownloadHistory()
+        active = {}
+        active_jobs = {}
+        pauses = {}
+        active_target: dict[tuple[int, int], str] = {}
+        active_started: dict[tuple[int, int], float] = {}
+        occupied_seconds: dict[str, float] = {}
+        suspended_accounted: set[tuple[int, int]] = set()
+        dispatch_log = MonitorDispatchSummary()
+        priority_logged = False
+        pause_requested_at: dict[tuple[int, int], float] = {}
+        pause_delay_reported: set[tuple[int, int]] = set()
+        paused_since: dict[tuple[int, int], float] = {}
+        limiter = SharedSpeedLimiter(getattr(self, "_monitor_live_speed_kib", 0) * 1024)
+        cancelled = False
+        try:
+            await self._ensure_client()
+            while not self._monitor_download_stop.is_set():
+                for line in dispatch_log.drain():
+                    print(line)
+                limiter.bytes_per_second = getattr(self, "_monitor_live_speed_kib", 0) * 1024
+                finished = [key for key, task in active.items() if task.done()]
+                for key in finished:
+                    task = active.pop(key)
+                    active_jobs.pop(key)
+                    pauses.pop(key)
+                    self._monitor_progress_state(key[0], key[1], "结束")
+                    pause_requested_at.pop(key, None)
+                    pause_delay_reported.discard(key)
+                    paused_since.pop(key, None)
+                    target = active_target.pop(key)
+                    started_at = active_started.pop(key)
+                    if key not in suspended_accounted:
+                        occupied_seconds[target] = (
+                            occupied_seconds.get(target, 0.0)
+                            + max(0.0, time.monotonic() - started_at)
+                        )
+                    suspended_accounted.discard(key)
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        print(f"[监控] 下载任务 {key} 异常：{exc}")
+                # Paused wall time must not count as occupied transfer time.
+                for key, ctl in pauses.items():
+                    if ctl.suspended and key not in suspended_accounted:
+                        paused_since[key] = time.monotonic()
+                        pause_requested_at.pop(key, None)
+                        pause_delay_reported.discard(key)
+                        self._monitor_progress_state(key[0], key[1], "已暂停")
+                        target = active_target[key]
+                        occupied_seconds[target] = (
+                            occupied_seconds.get(target, 0.0)
+                            + max(0.0, time.monotonic() - active_started[key])
+                        )
+                        suspended_accounted.add(key)
+                        channel = next(
+                            (item for item in self._monitored if item["target"] == target),
+                            None,
+                        )
+                        dispatch_log.add(
+                            "paused", (channel.get("name") or target) if channel else target
+                        )
+                # A server-side GetFileRequest may still be waiting on Telegram
+                # when a pause is requested. Explain a delayed handoff once,
+                # instead of silently appearing to ignore priority.
+                for key, requested_at in list(pause_requested_at.items()):
+                    ctl = pauses.get(key)
+                    if ctl is None or ctl.suspended:
+                        pause_requested_at.pop(key, None)
+                        continue
+                    if (time.monotonic() - requested_at >= 5.0
+                            and key not in pause_delay_reported):
+                        pause_delay_reported.add(key)
+                        print(
+                            f"[调度] 等待暂停 {active_target[key]} 的下载任务｜"
+                            "当前网络请求尚未到安全暂停点，优先任务暂时等待"
+                        )
+                running_keys = [key for key, ctl in pauses.items() if not ctl.suspended]
+                if not any(ctl.suspended or ctl.requested for ctl in pauses.values()):
+                    priority_logged = False
+                self._monitor_active_transfers = len(running_keys)
+                self._monitor_total_transfers = len(active)
+                # Preserve the existing manual download behaviour: don't
+                # launch new monitor transfers while a manual job is running.
+                manual_busy = self._download_future is not None and not self._download_future.done()
+                # Only the live monitor limit changes. In-flight files are
+                # never preempted when the user reduces the limit.
+                effective_concurrency = getattr(self, "_monitor_live_concurrency", None) or concurrency
+                if not manual_busy:
+                    candidates = sorted(
+                        (
+                            item for item in self._monitored
+                            if item["enabled"] or any(
+                                ctl.suspended and active_target[key] == item["target"]
+                                for key, ctl in pauses.items()
+                            )
+                        ),
+                        key=lambda item: -int(item.get("priority", 0)),
+                    )
+                    pending = []
+                    for item in candidates:
+                        suspended_jobs = [
+                            active_jobs[key] for key, ctl in pauses.items()
+                            if ctl.suspended and active_target[key] == item["target"]
+                        ]
+                        pending.extend((item, suspended) for suspended in suspended_jobs)
+                        if suspended_jobs:
+                            continue  # Resume all paused files before new ones at this priority.
+                        if not item["enabled"]:
+                            continue  # Only finish an already-started disabled channel.
+                        for job in history.pending_for_target(item["target"], limit=16):
+                            if (job.peer_id, job.message_id) not in active:
+                                pending.append((item, job))
+                                break
+                    # A newly scanned high-priority channel can cooperatively
+                    # pause a lower-priority active transfer at a chunk boundary.
+                    if pending and len(running_keys) >= effective_concurrency:
+                        high_priority = max(int(item.get("priority", 0)) for item, _ in pending)
+                        priority_by_target = {
+                            item["target"]: int(item.get("priority", 0))
+                            for item in candidates
+                        }
+                        transitioning = any(
+                            ctl.requested and not ctl.suspended
+                            for ctl in pauses.values()
+                        )
+                        victims = [
+                            key for key in running_keys
+                            if not pauses[key].requested
+                            and priority_by_target.get(active_target[key], 0) < high_priority
+                        ]
+                        if victims and not transitioning:
+                            victim = min(
+                                victims,
+                                key=lambda key: (
+                                    priority_by_target.get(active_target[key], 0),
+                                    active_started[key],
+                                ),
+                            )
+                            pauses[victim].pause()
+                            pause_requested_at[victim] = time.monotonic()
+                            await asyncio.sleep(0.1)
+                            continue
+                    if len(running_keys) >= effective_concurrency:
+                        await asyncio.sleep(0.25)
+                        continue
+                    active_counts: dict[str, int] = {}
+                    current_occupied = dict(occupied_seconds)
+                    now = time.monotonic()
+                    for key, target in active_target.items():
+                        if pauses[key].suspended:
+                            continue
+                        active_counts[target] = active_counts.get(target, 0) + 1
+                        current_occupied[target] = (
+                            current_occupied.get(target, 0.0)
+                            + max(0.0, now - active_started[key])
+                        )
+                    selected = None
+                    if pending:
+                        # Strict priority: never resume or start a lower-rank
+                        # job while any higher-rank file is still running or
+                        # queued. At the winning rank, paused jobs get the
+                        # first slot, before new media from the same rank.
+                        highest = max(int(item.get("priority", 0)) for item, _ in pending)
+                        highest_running = max(
+                            (
+                                int(next(
+                                    (item.get("priority", 0) for item in candidates
+                                     if item["target"] == active_target[key]), 0
+                                ))
+                                for key in running_keys
+                            ),
+                            default=None,
+                        )
+                        if highest_running is not None and highest_running > highest:
+                            await asyncio.sleep(0.25)
+                            continue  # Higher-priority transfer has not finished yet.
+                        matching = [
+                            pair for pair in pending
+                            if int(pair[0].get("priority", 0)) == highest
+                        ]
+                        suspended_first = [
+                            pair for pair in matching
+                            if (pair[1].peer_id, pair[1].message_id) in paused_since
+                        ]
+                        if suspended_first:
+                            selected = min(
+                                suspended_first,
+                                key=lambda pair: paused_since[
+                                    (pair[1].peer_id, pair[1].message_id)
+                                ],
+                            )
+                        else:
+                            selected = choose_monitor_download(matching, active_counts, current_occupied)
+                    if selected is not None:
+                        item, job = selected
+                        key = (job.peer_id, job.message_id)
+                        if key in active:
+                            paused_since.pop(key, None)
+                            suspended_accounted.discard(key)
+                            active_started[key] = time.monotonic()
+                            pauses[key].resume()
+                            self._monitor_progress_state(key[0], key[1], "恢复中")
+                            dispatch_log.add("resumed", item.get("name") or item["target"])
+                            continue
+                        pause = MonitorPause()
+                        preempted = any(ctl.suspended for ctl in pauses.values())
+                        flow = MonitorFlow(
+                            pause=pause,
+                            limiter=limiter,
+                            chunks=lambda: getattr(self, "_monitor_live_chunks", None) or chunks,
+                        )
+                        async def transfer(job=job, flow=flow):
+                            try:
+                                entity = await resolve_channel(self.client, job.target)
+                                message = await self.client.get_messages(entity, ids=job.message_id)
+                                if message is None or message.date is None:
+                                    history.remove_pending(job.peer_id, job.message_id)
+                                    history.clear_failure(job.peer_id, job.message_id)
+                                    return
+                                kind = job.kind or _downloader.classify_message(message)
+                                if kind is None:
+                                    history.remove_pending(job.peer_id, job.message_id)
+                                    history.clear_failure(job.peer_id, job.message_id)
+                                    return
+                                folder = self.settings.download_dir / safe_name(
+                                    getattr(entity, "title", None) or job.title
+                                ) / ("photos" if kind == "photo" else "videos")
+                                stats = DownloadStats()
+                                path = await _download_with_retry(
+                                    self.client, message, folder,
+                                    job.base or f"{message.date.strftime('%Y%m%d')}_{message.id}",
+                                    stats, skip_existing=True,
+                                    retries=getattr(self, "_monitor_live_retries", retries),
+                                    chunk_concurrency=chunks, history=history,
+                                    peer_id=job.peer_id,
+                                    on_saved=lambda detail: self._log_download(f"[监控下载] [{job.title}] {detail}"),
+                                    temp_download_dir=self.settings.temp_download_dir,
+                                    on_progress=self._update_download_progress,
+                                    monitor_flow=flow,
+                                )
+                                if stats.failed:
+                                    history.mark_failure(job.peer_id, job.message_id)
+                                elif path is None:
+                                    history.remove_pending(job.peer_id, job.message_id)
+                                    history.clear_failure(job.peer_id, job.message_id)
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as exc:
+                                print(f"[监控] 下载 {job.title}/{job.message_id} 失败：{exc}")
+                                history.mark_failure(job.peer_id, job.message_id)
+                        active[key] = asyncio.create_task(transfer())
+                        active_jobs[key] = job
+                        pauses[key] = pause
+                        active_target[key] = item["target"]
+                        active_started[key] = time.monotonic()
+                        self._monitor_active_transfers = len(running_keys) + 1
+                        if preempted and not priority_logged:
+                            high_name = item.get("name") or item["target"]
+                            print(f"[调度] {high_name}：已插队开始下载｜低优先级任务稍后恢复")
+                            priority_logged = True
+                        continue
+                await asyncio.sleep(0.25 if active else 1)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            for line in dispatch_log.drain(force=True):
+                print(line)
+            for ctl in pauses.values():
+                ctl.resume()
+            if cancelled:
+                for task in active.values():
+                    task.cancel()
+            if active:
+                await asyncio.gather(*active.values(), return_exceptions=True)
+            for key in active:
+                self._monitor_progress_state(key[0], key[1], "结束")
+            self._monitor_active_transfers = 0
+            self._monitor_total_transfers = 0
+            history.close()
+            self._monitor_worker_task = None
 
     def _build_gallery_tab(self):
         tk, ttk = self.tk, self.ttk
@@ -387,6 +1243,9 @@ class _App:
         self._run_task(coro(), self.load_gallery_btn)
 
     def on_save_selected(self) -> None:
+        if self._download_future is not None and not self._download_future.done():
+            self._log("[下载] 已有下载任务在执行，请先完成或取消当前任务。\n")
+            return
         selected = [item for var, item in self.gallery_cells if var.get()]
         if not selected:
             self.messagebox.showwarning("未选择", "请先勾选要保存的图片/视频。")
@@ -397,20 +1256,46 @@ class _App:
             self.messagebox.showwarning("设置错误", str(exc))
             return
 
-        async def coro():
-            await self._ensure_client()
-            await save_items(
-                self.client,
-                selected,
-                download_dir=self.settings.download_dir,
-                title=self._gallery_title or "gallery",
-                concurrency=concurrency,
-                retries=retries,
-                chunk_concurrency=chunk_concurrency,
-            )
-            print("保存完成。点『打开下载文件夹』查看。\n")
+        self._stop_download.clear()
 
-        self._run_task(coro(), self.save_sel_btn)
+        async def coro():
+            self._download_task = asyncio.current_task()
+            try:
+                await self._ensure_client()
+                await save_items(
+                    self.client,
+                    selected,
+                    download_dir=self.settings.download_dir,
+                    title=self._gallery_title or "gallery",
+                    concurrency=concurrency,
+                    retries=retries,
+                    chunk_concurrency=chunk_concurrency,
+                    temp_download_dir=self.settings.temp_download_dir,
+                    on_progress=self._update_download_progress,
+                )
+                print("保存完成。点『打开下载文件夹』查看。\n")
+            finally:
+                self._download_task = None
+
+        self.save_sel_btn.config(state="disabled")
+        future = self.loop.submit(coro())
+        self._download_future = future
+
+        def finished(fut: concurrent.futures.Future) -> None:
+            try:
+                fut.result()
+            except concurrent.futures.CancelledError:
+                self._log("[下载] 已取消浏览媒体中选定的下载任务\n")
+            except Exception as exc:
+                self._log(f"[下载错误] 保存所选失败：{exc}\n")
+            finally:
+                def on_ui() -> None:
+                    self.save_sel_btn.config(state="normal")
+                    if self._closing:
+                        self._finish_close()
+                self.root.after(0, on_ui)
+
+        future.add_done_callback(finished)
 
     def _build_download_tab(self):
         ttk = self.ttk
@@ -426,6 +1311,15 @@ class _App:
         ttk.Entry(frame, textvariable=self.dl_limit, width=10).grid(row=1, column=1, sticky="w", **pad)
         self.download_btn = ttk.Button(frame, text="下载所选", command=self.on_download)
         self.download_btn.grid(row=1, column=3, sticky="e", **pad)
+        ttk.Label(frame, text="自动下载间隔(分钟)").grid(row=4, column=0, sticky="w", **pad)
+        ttk.Entry(frame, textvariable=self.auto_minutes_var, width=8).grid(
+            row=4, column=1, sticky="w", **pad
+        )
+        self.auto_btn = ttk.Button(frame, text="启动定时", command=self.on_toggle_auto)
+        self.auto_btn.grid(row=4, column=2, sticky="w", **pad)
+        ttk.Label(frame, textvariable=self.auto_status_var).grid(
+            row=5, column=0, columnspan=4, sticky="w", **pad
+        )
         ttk.Label(frame, text="并发数 (1-8)").grid(row=2, column=0, sticky="w", **pad)
         ttk.Entry(frame, textvariable=self.media_concurrency_var, width=8).grid(
             row=2, column=1, sticky="w", **pad
@@ -438,6 +1332,17 @@ class _App:
         ttk.Entry(frame, textvariable=self.chunk_concurrency_var, width=8).grid(
             row=3, column=1, sticky="w", **pad
         )
+        ttk.Label(frame, text="监控总限速 (KiB/s，0=不限)").grid(row=6, column=0, sticky="w", **pad)
+        ttk.Entry(frame, textvariable=self.media_speed_kib_var, width=10).grid(
+            row=6, column=1, sticky="w", **pad
+        )
+        ttk.Button(
+            frame, text="应用并保存下载设置", command=self._apply_media_settings
+        ).grid(row=6, column=2, columnspan=2, sticky="e", **pad)
+        ttk.Label(
+            frame, text="编辑数值时不生效；点击应用后监控下载立即使用新设置",
+            foreground="#555",
+        ).grid(row=7, column=0, columnspan=4, sticky="w", **pad)
         frame.columnconfigure(2, weight=1)
         return frame
 
@@ -461,19 +1366,175 @@ class _App:
 
     # ---------- helpers ----------
     def _log(self, text: str) -> None:
-        self.log_queue.put(text)
+        self.log_queue.put(self._timestamp_formatter.format(text))
+
+    def _log_download(self, text: str) -> None:
+        self.download_queue.put(self._download_timestamp_formatter.format(text + "\n"))
+
+    def _update_download_progress(self, key: str, label: str, done: int, total: int, status: str) -> None:
+        """Called from background downloads; only enqueue, never touch Tk."""
+        self.progress_queue.put((key, label, done, total, status))
+
+    def _monitor_progress_state(self, peer_id: int, message_id: int, status: str) -> None:
+        """Publish a worker pause/resume state to Tk without resetting bytes."""
+        self._update_download_progress(
+            f"__monitor_state__:{peer_id}:{message_id}", "", 0, 0, status
+        )
+
+    def _drain_progress(self) -> None:
+        now = time.monotonic()
+        latest = {}
+        states = getattr(self, "_monitor_progress_states", None)
+        if states is None:
+            states = {}
+            self._monitor_progress_states = states
+        try:
+            while True:
+                event = self.progress_queue.get_nowait()
+                if event[0].startswith("__monitor_state__:"):
+                    prefix = event[0][len("__monitor_state__:"):] + ":"
+                    if event[4] == "结束":
+                        states.pop(prefix, None)
+                    else:
+                        states[prefix] = event[4]
+                    continue
+                if event[4] == "下载中":
+                    prefix = ":".join(event[0].split(":", 2)[:2]) + ":"
+                    if states.get(prefix) == "恢复中":
+                        states.pop(prefix, None)
+                latest[event[0]] = event
+        except queue.Empty:
+            pass
+        for key, label, done, total, status in latest.values():
+            old = self._progress_entries.get(key)
+            if old is None:
+                old = {"last_bytes": 0, "last_time": now, "speed": 0.0}
+                self._progress_entries[key] = old
+            interval = max(now - old["last_time"], 0.001)
+            if status == "下载中" and done >= old["last_bytes"]:
+                measured = (done - old["last_bytes"]) / interval
+                old["speed"] = measured if old["speed"] == 0 else old["speed"] * 0.5 + measured * 0.5
+            elif status in ("普通下载回退", "重试等待", "等待缓存", "准备文件"):
+                old["speed"] = 0.0
+            old.update(label=label, done=done, total=total, status=status,
+                       last_bytes=done, last_time=now)
+            if status in ("完成", "失败", "限流等待", "已取消"):
+                old["expires"] = now + 5
+            else:
+                old.pop("expires", None)
+        running, paused = [], []
+        for key, entry in list(self._progress_entries.items()):
+            if entry.get("expires", float("inf")) <= now:
+                self._progress_entries.pop(key)
+                if self.progress_tree.exists(key):
+                    self.progress_tree.delete(key)
+                continue
+            display_status = next(
+                (status for prefix, status in states.items() if key.startswith(prefix)),
+                entry["status"],
+            )
+            total = entry["total"]
+            done = entry["done"]
+            ratio = min(1.0, done / total) if total else 0
+            cells = int(ratio * 10)
+            bar = "━" * cells + "─" * (10 - cells)
+            portion = f"{done / 1048576:.1f}/{total / 1048576:.1f} MiB  {ratio:.0%}" if total else f"{done / 1048576:.1f} MiB"
+            speed = (
+                f"{entry['speed'] / 1048576:.2f} MiB/s"
+                if display_status == "下载中" and now - entry["last_time"] < 3
+                else "—"
+            )
+            values = (entry["label"], f"{bar} {portion}", speed, display_status)
+            if self.progress_tree.exists(key):
+                self.progress_tree.item(key, values=values)
+            else:
+                self.progress_tree.insert("", "end", iid=key, values=values)
+            if display_status == "已暂停":
+                paused.append(entry)
+            elif display_status not in ("完成", "失败", "限流等待", "已取消"):
+                running.append(entry)
+        self.progress_summary.set(
+            f"正在下载 {len(running)} 个文件"
+            + (f"，已暂停 {len(paused)} 个" if paused else "")
+            + f"，合计速度 {sum(v['speed'] for v in running if v['status'] == '下载中' and now - v['last_time'] < 3) / 1048576:.2f} MiB/s"
+            if running or paused else "当前没有正在下载的文件"
+        )
 
     def _drain_log(self) -> None:
+        self._drain_progress()
         try:
             while True:
                 chunk = self.log_queue.get_nowait()
-                self.log.configure(state="normal")
-                self.log.insert("end", chunk)
-                self.log.see("end")
-                self.log.configure(state="disabled")
+                self._append_to_log(self.log, chunk)
+                if self._log_popup_text is not None:
+                    self._append_to_log(self._log_popup_text, chunk)
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                chunk = self.download_queue.get_nowait()
+                self._append_to_log(self.download_log, chunk)
+                if self._download_popup_text is not None:
+                    self._append_to_log(self._download_popup_text, chunk)
         except queue.Empty:
             pass
         self.root.after(100, self._drain_log)
+
+    @staticmethod
+    def _append_to_log(widget, chunk: str) -> None:
+        follow = widget.yview()[1] >= 0.999
+        widget.configure(state="normal")
+        widget.insert("end", chunk)
+        if follow:
+            widget.see("end")
+        widget.configure(state="disabled")
+
+    def _open_log_window(self) -> None:
+        """Show complete live log even if the main window is short."""
+        if self._log_popup is not None and self._log_popup.winfo_exists():
+            self._log_popup.lift()
+            return
+        win = self.tk.Toplevel(self.root)
+        win.title("Telegram 下载器 - 实时日志")
+        win.geometry("850x480")
+        view = self.scrolledtext.ScrolledText(win, wrap="word", state="normal")
+        view.pack(fill="both", expand=True, padx=8, pady=8)
+        self.ttk.Button(win, text="跳转最新", command=lambda: view.see("end")).pack(anchor="e", padx=8, pady=4)
+        view.insert("1.0", self.log.get("1.0", "end-1c"))
+        view.see("end")
+        view.configure(state="disabled")
+        self._log_popup = win
+        self._log_popup_text = view
+
+        def on_close() -> None:
+            self._log_popup_text = None
+            self._log_popup = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+
+    def _open_download_window(self) -> None:
+        if self._download_popup is not None and self._download_popup.winfo_exists():
+            self._download_popup.lift()
+            return
+        win = self.tk.Toplevel(self.root)
+        win.title("Telegram 下载器 - 下载记录")
+        win.geometry("850x480")
+        view = self.scrolledtext.ScrolledText(win, wrap="word", state="normal")
+        view.pack(fill="both", expand=True, padx=8, pady=8)
+        self.ttk.Button(win, text="跳转最新", command=lambda: view.see("end")).pack(anchor="e", padx=8, pady=4)
+        view.insert("1.0", self.download_log.get("1.0", "end-1c"))
+        view.see("end")
+        view.configure(state="disabled")
+        self._download_popup = win
+        self._download_popup_text = view
+
+        def on_close() -> None:
+            self._download_popup_text = None
+            self._download_popup = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
 
     def _set_status(self, text: str) -> None:
         self.root.after(0, lambda: self.status_var.set(text))
@@ -483,18 +1544,9 @@ class _App:
         return Path(raw).expanduser() if raw else default_download_dir()
 
     def _media_options(self) -> tuple[int, int, int]:
-        try:
-            workers = int(self.media_concurrency_var.get().strip())
-            retries = int(self.media_retries_var.get().strip())
-            chunks = int(self.chunk_concurrency_var.get().strip())
-            if not 1 <= workers <= 8 or not 0 <= retries <= 5 or not 1 <= chunks <= 8:
-                raise ValueError
-        except ValueError as exc:
-            raise ValueError("文件/分块并发数必须为 1-8，失败重试必须为 0-5") from exc
-        values = read_env_values()
-        values.update(media_concurrency=str(workers), media_retries=str(retries),
-                      chunk_concurrency=str(chunks))
-        update_env(values)
+        # Pending edits must not affect a scheduled/manual download until
+        # the user explicitly commits all fields with the Apply button.
+        workers, retries, chunks, _rate = self._applied_media_settings
         return workers, retries, chunks
 
     def _selected_target(self) -> str | None:
@@ -624,6 +1676,16 @@ class _App:
             self.tree.delete(*self.tree.get_children())
             for row in rows:
                 self.tree.insert("", "end", values=row)
+            names = {str(row[0]): str(row[2]) for row in rows if row[2]}
+            changed = False
+            for item in self._monitored:
+                title = names.get(str(item["target"]))
+                if title and title != item.get("name"):
+                    item["name"] = title
+                    changed = True
+            if changed:
+                save_channels(self._monitored)
+                self._monitor_refresh()
 
         self.root.after(0, apply)
         print(f"已加载 {len(rows)} 个群组/频道。点选一个,然后『下载所选』。")
@@ -640,6 +1702,9 @@ class _App:
         )
 
     def on_download(self) -> None:
+        if self._download_future is not None and not self._download_future.done():
+            self._log("[下载] 已有批量任务在执行，本次跳过。\n")
+            return
         target = self._selected_target()
         if not target:
             self.messagebox.showwarning("未选择", "请先在列表里选一个群组/频道,或手动输入。")
@@ -655,25 +1720,151 @@ class _App:
             self.messagebox.showwarning("设置错误", str(exc))
             return
 
-        async def coro():
-            await self._ensure_client()
-            await download_channel(
-                self.client,
-                target=target,
-                download_dir=self.settings.download_dir,
-                types=parse_types(types_raw),
-                limit=int(limit) if limit else None,
-                since=None,
-                until=None,
-                skip_existing=True,
-                dry_run=False,
-                concurrency=concurrency,
-                retries=retries,
-                chunk_concurrency=chunk_concurrency,
-            )
-            print("下载完成。点『打开下载文件夹』查看。\n")
+        self._start_channel_download(
+            target, types_raw, limit, concurrency, retries, chunk_concurrency
+        )
 
-        self._run_task(coro(), self.download_btn)
+    def _start_channel_download(
+        self, target, types_raw, limit, concurrency, retries, chunk_concurrency,
+        monitor_item=None,
+    ) -> None:
+        if self._download_future is not None and not self._download_future.done():
+            self._log("[定时] 上一次下载尚未结束，跳过本轮。\n")
+            return
+
+        self._stop_download.clear()
+
+        def channel_resolved(title: str, peer_id: int) -> None:
+            if monitor_item is not None:
+                self.root.after(0, lambda: self._monitor_set_name(target, title))
+
+        async def coro():
+            self._download_task = asyncio.current_task()
+            try:
+                await self._ensure_client()
+                result = await download_channel(
+                    self.client,
+                    target=target,
+                    download_dir=self.settings.download_dir,
+                    temp_download_dir=self.settings.temp_download_dir,
+                    types=parse_types(types_raw),
+                    limit=int(limit) if limit else None,
+                    since=None,
+                    until=None,
+                    skip_existing=True,
+                    dry_run=False,
+                    concurrency=concurrency,
+                    retries=retries,
+                    chunk_concurrency=chunk_concurrency,
+                    on_saved=self._log_download,
+                    on_progress=self._update_download_progress,
+                    monitor_direction=monitor_item.get("direction", "newest") if monitor_item else None,
+                    monitor_batch_size=100,
+                    stop_event=self._stop_download,
+                    on_channel_resolved=channel_resolved,
+                )
+                print("下载完成。点『打开下载文件夹』查看。\n")
+                return result
+            finally:
+                self._download_task = None
+
+        self.download_btn.config(state="disabled")
+        future = self.loop.submit(coro())
+        self._download_future = future
+
+        def finished(fut: concurrent.futures.Future) -> None:
+            try:
+                result = fut.result()
+                if monitor_item is not None and result.more_pending:
+                    # Run the next bounded batch soon, after giving other channels a turn.
+                    self._monitor_next[target] = time.time()
+                if monitor_item is not None:
+                    self.root.after(0, lambda: self._monitor_log_progress(target, result))
+            except concurrent.futures.CancelledError:
+                self._log("[下载] 已取消当前任务\n")
+            except Exception as exc:
+                self._log(f"[下载错误] {exc}\n")
+            finally:
+                def on_ui():
+                    self.download_btn.config(state="normal")
+                    if self._closing:
+                        self._finish_close()
+                self.root.after(0, on_ui)
+
+        future.add_done_callback(finished)
+
+    def _monitor_log_progress(self, target: str, result, *, quota_reached: bool = False) -> None:
+        """Accumulate slices silently; report only a completed scan round."""
+        total = self._monitor_totals.setdefault(
+            target, {"matched": 0, "queued": 0, "skipped": 0, "failed": 0,
+                     "scanned_messages": 0, "batches": 0},
+        )
+        total["batches"] += 1
+        for key in ("matched", "queued", "skipped", "failed", "scanned_messages"):
+            total[key] += getattr(result, key, 0)
+        if result.more_pending and not quota_reached:
+            return
+        channel = next((item for item in self._monitored if item["target"] == target), None)
+        name = (channel.get("name") or target) if channel else target
+        suffix = ""
+        if quota_reached:
+            limit = channel.get("batch_size", 100) if channel else 100
+            suffix += f"｜达本轮上限{limit}，下轮续扫"
+        if total["failed"]:
+            suffix += f"｜失败{total['failed']}"
+        self._log(
+            f"[扫描] {name}：完成｜检查{total['scanned_messages']}条｜"
+            f"匹配{total['matched']}｜新增{total['queued']}｜"
+            f"跳过{total['skipped']}{suffix}\n"
+        )
+        self._monitor_totals.pop(target, None)
+
+    def on_toggle_auto(self) -> None:
+        if self._auto_config is not None:
+            self._stop_auto()
+            return
+        if self._monitor_active:
+            self._monitor_start_stop()
+        target = self._selected_target()
+        types_raw = self._types_string()
+        if not target or not types_raw:
+            self.messagebox.showwarning("定时下载", "请先选择频道和下载类型。")
+            return
+        try:
+            minutes = int(self.auto_minutes_var.get().strip())
+            if not 1 <= minutes <= 1440:
+                raise ValueError("间隔必须在 1-1440 分钟之间")
+            limit = self.dl_limit.get().strip()
+            if limit and int(limit) <= 0:
+                raise ValueError("数量上限必须为正整数")
+            concurrency, retries, chunks = self._media_options()
+        except ValueError as exc:
+            self.messagebox.showwarning("定时下载", f"参数错误：{exc}")
+            return
+        self._auto_config = (target, types_raw, limit, concurrency, retries, chunks)
+        self._auto_interval_ms = minutes * 60 * 1000
+        self.auto_btn.config(text="停止定时")
+        self._log(f"[定时] 已启动：频道 {target}，每 {minutes} 分钟检查一次，立即执行首轮。\n")
+        self._auto_tick()
+
+    def _auto_tick(self) -> None:
+        if self._auto_config is None:
+            return
+        self._auto_job_id = None
+        self._start_channel_download(*self._auto_config)
+        self.auto_status_var.set(
+            f"定时下载：运行中（{self._auto_config[0]}，每 {self._auto_interval_ms // 60000} 分钟）"
+        )
+        self._auto_job_id = self.root.after(self._auto_interval_ms, self._auto_tick)
+
+    def _stop_auto(self) -> None:
+        if self._auto_job_id is not None:
+            self.root.after_cancel(self._auto_job_id)
+            self._auto_job_id = None
+        self._auto_config = None
+        self.auto_btn.config(text="启动定时")
+        self.auto_status_var.set("定时下载：未启动")
+        self._log("[定时] 已停止后续检查；当前下载不会中断。\n")
 
     def on_parse(self) -> None:
         target = self._selected_target()
@@ -745,12 +1936,21 @@ class _App:
             ("代理用户名（可空）", self.proxy_username_var, False),
             ("代理密码（可空）", self.proxy_password_var, True),
             ("下载目录", self.download_dir_var, False),
+            ("分块临时目录（建议 SSD，留空=下载目录）", self.temp_download_dir_var, False),
         )
         for row, (name, var, secret) in enumerate(fields):
             ttk.Label(win, text=name).grid(row=row, column=0, sticky="w", **pad)
             ttk.Entry(win, textvariable=var, width=43, show="*" if secret else "").grid(
                 row=row, column=1, sticky="we", **pad
             )
+        ttk.Label(
+            win,
+            text="SSD 缓存：最大 20 GiB，至少保留 10 GiB 可用空间；满额排队等待，不回退机械盘",
+            foreground="#555",
+        ).grid(row=len(fields), column=0, columnspan=2, sticky="w", **pad)
+        ttk.Button(win, text="检查并清理残留缓存", command=self._manual_cache_cleanup).grid(
+            row=len(fields) + 1, column=1, sticky="e", **pad
+        )
 
         def save_and_close():
             host = self.proxy_host_var.get().strip()
@@ -775,6 +1975,7 @@ class _App:
                 "api_hash": self.api_hash_var.get().strip(),
                 "phone": self.phone_var.get().strip(),
                 "download_dir": self.download_dir_var.get().strip() or str(default_download_dir()),
+                "temp_download_dir": self.temp_download_dir_var.get().strip(),
                 "proxy_host": host,
                 "proxy_port": port,
                 "proxy_username": self.proxy_username_var.get().strip(),
@@ -792,15 +1993,152 @@ class _App:
         )
 
     # ---------- lifecycle ----------
-    def _on_close(self) -> None:
+    @staticmethod
+    def _cleanup_path(raw: str) -> Path | None:
+        if not raw.strip():
+            return None
+        path = Path(raw.strip()).expanduser()
+        return path if path.is_absolute() else data_dir() / path
+
+    def _manual_cache_cleanup(self):
+        ssd_raw = self.temp_download_dir_var.get().strip()
+        hdd_raw = self.download_dir_var.get().strip()
+        ssd = self._cleanup_path(ssd_raw)
+        hdd = self._cleanup_path(hdd_raw)
+        # Work outside Tk's event loop: scanning a large HDD folder can block.
+        def worker():
+            report = inspect_cleanup(ssd, hdd)
+            def finish():
+                self._log(report.summary() + "\n")
+                if report.legacy:
+                    total = len(report.legacy)
+                    confirmed = self.messagebox.askyesno(
+                        "旧版临时文件",
+                        f"发现 {total} 项没有所有权标记的旧临时文件。"
+                        "\n无法确认是否仍有旧版本进程在写入。"
+                        "\n请先确保旧版本已关闭。\n\n仍要清理这些文件吗？",
+                    )
+                    if confirmed:
+                        threading.Thread(target=legacy_worker, daemon=True).start()
+                for error in report.failed:
+                    self._log(f"[缓存清理] {error}\n")
+            self.root.after(0, finish)
+
+        def legacy_worker():
+            result = inspect_cleanup(ssd, hdd, include_legacy=True)
+            self.root.after(0, lambda: self._log(result.summary() + "\n"))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _cancel_current_download(self) -> None:
+        self._stop_download.set()
+        if self._download_future is not None and not self._download_future.done():
+            self._download_future.cancel()
+            self._log("[下载] 正在取消当前扫描及未完成文件；已成功的文件不会删除\n")
+        elif (getattr(self, "_monitor_download_future", None) is not None
+              and not self._monitor_download_future.done()):
+            # Cancel active transfers, leave uncommitted media in the durable
+            # queue, and let the monitor tick start a fresh worker afterwards.
+            self._monitor_download_stop.set()
+            self._monitor_download_future.cancel()
+            self._log("[监控] 正在取消当前媒体传输，未完成项目保留在队列\n")
+            if self._monitor_active:
+                self.root.after(1500, self._resume_monitor_downloads)
+        else:
+            self._log("[下载] 当前没有可取消的下载任务\n")
+
+    def _resume_monitor_downloads(self) -> None:
+        if self._monitor_active and not self._closing:
+            self._monitor_download_stop.clear()
+
+    def _finish_close(self) -> None:
+        if self._download_future is not None and not self._download_future.done():
+            return
+        self._telethon_diag_uninstall()
         sys.stdout, sys.stderr = self._stdout, self._stderr
-        try:
+
+        async def disconnect():
+            # Cancellation can settle the thread-safe Future before the real
+            # asyncio download task has removed its temporary chunk files.
+            active = self._download_task
+            if active is not None and not active.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(active), timeout=30)
+                except (asyncio.CancelledError, Exception):
+                    pass
+            # A cancelled concurrent.futures.Future can report done() while
+            # its underlying asyncio task still cleans up temporary chunks.
+            monitor_worker = getattr(self, "_monitor_worker_task", None)
+            if monitor_worker is not None and not monitor_worker.done():
+                try:
+                    await asyncio.shield(monitor_worker)
+                except (asyncio.CancelledError, Exception):
+                    pass
+            for future in (self._monitor_scan_future, self._monitor_download_future):
+                if future is not None and not future.done():
+                    try:
+                        await asyncio.wrap_future(future)
+                    except (asyncio.CancelledError, Exception):
+                        pass
             if self.client is not None:
-                self.loop.submit(self.client.disconnect())
+                await self.client.disconnect()
+
+        try:
+            future = self.loop.submit(disconnect())
+            future.add_done_callback(lambda _f: self.root.after(0, self._destroy_after_disconnect))
         except Exception:
-            pass
+            self._destroy_after_disconnect()
+
+    def _destroy_after_disconnect(self) -> None:
         self.loop.stop()
         self.root.destroy()
+
+    def _on_close(self) -> None:
+        if self._closing:
+            return
+        manual_busy = self._download_future is not None and not self._download_future.done()
+        monitor_busy = getattr(self, "_monitor_total_transfers", 0) > 0
+        busy = manual_busy or monitor_busy
+        if busy:
+            decision = self.messagebox.askyesnocancel(
+                "安全退出",
+                "当前有文件正在下载。\n\n"
+                "是：等待已开始的文件完成后退出（不再启动新文件）\n"
+                "否：取消正在下载的文件并退出\n"
+                "取消：继续下载，不退出",
+            )
+            if decision is None:
+                return
+        # Keep a normal window's most recent dimensions and placement. Never
+        # replace saved geometry with a minimized/maximized or invalid rect.
+        if getattr(self, "root", None) is not None and self.root.state() == "normal":
+            save_window_geometry(
+                self.root.geometry(),
+                self.root.winfo_screenwidth(),
+                self.root.winfo_screenheight(),
+            )
+        if self._monitor_active:
+            self._monitor_start_stop()
+        if self._auto_config is not None:
+            self._stop_auto()
+        self._closing = True
+        self._stop_download.set()
+        if hasattr(self, "_monitor_scan_stop"):
+            self._monitor_scan_stop.set()
+        if hasattr(self, "_monitor_download_stop"):
+            self._monitor_download_stop.set()
+        if busy:
+            if not decision:
+                if manual_busy:
+                    self._download_future.cancel()
+                if monitor_busy and self._monitor_download_future is not None:
+                    self._monitor_download_future.cancel()
+            self._log(
+                "[退出] 等待当前已开始的文件完成后关闭\n"
+                if decision else "[退出] 正在取消下载\n"
+            )
+            if manual_busy:
+                return
+        self._finish_close()
 
     def run(self) -> None:
         self.root.mainloop()
