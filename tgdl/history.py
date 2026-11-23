@@ -15,6 +15,8 @@ from tgdl.paths import prepare_data_dir
 
 _DEFAULT_BUSY_TIMEOUT_MS = 30_000
 _REALTIME_BUSY_TIMEOUT_MS = 25
+_UNREADABLE_RETRY_SECONDS = (3600, 6 * 3600, 24 * 3600)
+_UNREADABLE_LIMIT = len(_UNREADABLE_RETRY_SECONDS) + 1
 
 def default_history_path() -> Path:
     """Use the portable data folder, or the installed user's writable data."""
@@ -29,6 +31,12 @@ class PendingMedia:
     title: str
     kind: str
     base: str
+
+
+@dataclass(frozen=True)
+class UnreadableRetry:
+    misses: int
+    delay_seconds: int | None
 
 
 class DownloadHistory:
@@ -157,6 +165,22 @@ class DownloadHistory:
                     account_id TEXT NOT NULL, peer_id INTEGER NOT NULL,
                     message_id INTEGER NOT NULL, retry_after REAL NOT NULL,
                     PRIMARY KEY(account_id,peer_id,message_id))"""
+            )
+            self._connection.execute(
+                f"""CREATE TABLE IF NOT EXISTS account_unreadable_media (
+                    account_id TEXT NOT NULL,
+                    peer_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    misses INTEGER NOT NULL CHECK (misses BETWEEN 1 AND {_UNREADABLE_LIMIT}),
+                    retry_after REAL,
+                    CHECK ((misses = {_UNREADABLE_LIMIT} AND retry_after IS NULL)
+                        OR (misses < {_UNREADABLE_LIMIT} AND retry_after IS NOT NULL)),
+                    PRIMARY KEY (account_id, peer_id, message_id)
+                )"""
+            )
+            self._connection.execute(
+                """CREATE INDEX IF NOT EXISTS unreadable_media_message
+                   ON account_unreadable_media(peer_id, message_id)"""
             )
             cols = {row[1] for row in self._connection.execute(
                 "PRAGMA table_info(downloaded_media)"
@@ -415,8 +439,12 @@ class DownloadHistory:
                    AND NOT EXISTS (SELECT 1 FROM account_attempt_backoff b
                        WHERE b.account_id=? AND b.peer_id=p.peer_id
                          AND b.message_id=p.message_id AND b.retry_after>?)
+                   AND NOT EXISTS (SELECT 1 FROM account_unreadable_media u
+                       WHERE u.account_id=? AND u.peer_id=p.peer_id AND u.message_id=p.message_id
+                         AND (u.retry_after IS NULL OR u.retry_after>?))
                    ORDER BY p.{order} LIMIT ?""",
-                (target, realtime, realtime, selected, selected, now, account_id, now, limit),
+                (target, realtime, realtime, selected, selected, now, account_id, now,
+                 account_id, now, limit),
             )]
 
     def pending_for_peer(self, peer_id: int, *, account_id: str,
@@ -444,8 +472,12 @@ class DownloadHistory:
                    AND NOT EXISTS (SELECT 1 FROM account_attempt_backoff b
                        WHERE b.account_id=? AND b.peer_id=p.peer_id
                          AND b.message_id=p.message_id AND b.retry_after>?)
+                   AND NOT EXISTS (SELECT 1 FROM account_unreadable_media u
+                       WHERE u.account_id=? AND u.peer_id=p.peer_id AND u.message_id=p.message_id
+                         AND (u.retry_after IS NULL OR u.retry_after>?))
                    ORDER BY p.{order} LIMIT ?""",
-                (peer_id, realtime, realtime, selected, selected, now, account_id, now, limit),
+                (peer_id, realtime, realtime, selected, selected, now, account_id, now,
+                 account_id, now, limit),
             )]
 
     def try_claim(self, account_id: str, peer_id: int, message_id: int, *,
@@ -467,12 +499,16 @@ class DownloadHistory:
                      AND NOT EXISTS (SELECT 1 FROM account_attempt_backoff
                                      WHERE account_id=? AND peer_id=? AND message_id=?
                                        AND retry_after>?)
+                     AND NOT EXISTS (SELECT 1 FROM account_unreadable_media
+                                     WHERE account_id=? AND peer_id=? AND message_id=?
+                                       AND (retry_after IS NULL OR retry_after>?))
                    ON CONFLICT(peer_id,message_id) DO UPDATE SET
                      account_id=excluded.account_id,expires_at=excluded.expires_at,
                      claim_token=excluded.claim_token
                    WHERE download_claims.expires_at<=?""",
                 (peer_id, message_id, account_id, now + ttl, token,
                  peer_id, message_id, peer_id, message_id,
+                 account_id, peer_id, message_id, now,
                  account_id, peer_id, message_id, now, now),
             )
             return token if result.rowcount == 1 else None
@@ -492,18 +528,22 @@ class DownloadHistory:
             )
             return result.rowcount == 1
 
+    def _release_claim_locked(self, account_id: str, peer_id: int, message_id: int,
+                              token: str, now: float) -> bool:
+        return self._connection.execute(
+            """DELETE FROM download_claims
+               WHERE peer_id=? AND message_id=? AND account_id=?
+                 AND claim_token=? AND expires_at>?""",
+            (peer_id, message_id, account_id, token, now),
+        ).rowcount == 1
+
     def release_claim(self, account_id: str, peer_id: int, message_id: int, *,
                       token: str, cooldown: float = 0, now: float | None = None) -> bool:
         """Only a live attempt can clear its lease and set its account's backoff."""
         with self._lock, self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
             now = time.time() if now is None else now
-            owned = self._connection.execute(
-                """DELETE FROM download_claims
-                   WHERE peer_id=? AND message_id=? AND account_id=?
-                     AND claim_token=? AND expires_at>?""",
-                (peer_id, message_id, account_id, token, now),
-            ).rowcount
+            owned = self._release_claim_locked(account_id, peer_id, message_id, token, now)
             if owned and cooldown > 0:
                 self._connection.execute(
                     """INSERT INTO account_attempt_backoff(account_id,peer_id,message_id,retry_after)
@@ -511,7 +551,58 @@ class DownloadHistory:
                        DO UPDATE SET retry_after=excluded.retry_after""",
                     (account_id, peer_id, message_id, now + cooldown),
                 )
-            return owned == 1
+            return owned
+
+    def finish_unreadable_claim(self, account_id: str, peer_id: int, message_id: int, *,
+                                token: str, now: float | None = None) -> UnreadableRetry | None:
+        """Count a definitive metadata miss and release only this live attempt.
+
+        An omitted retry time on the fourth miss means this account no longer
+        claims the shared job. No queue row is deleted.
+        """
+        key = (account_id, peer_id, message_id)
+        with self._lock, self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            now = time.time() if now is None else now
+            if not self._release_claim_locked(account_id, peer_id, message_id, token, now):
+                return None
+            previous = self._connection.execute(
+                """SELECT misses FROM account_unreadable_media
+                   WHERE account_id=? AND peer_id=? AND message_id=?""",
+                key,
+            ).fetchone()
+            misses = min(_UNREADABLE_LIMIT, (previous[0] if previous else 0) + 1)
+            delay = _UNREADABLE_RETRY_SECONDS[misses - 1] if misses < _UNREADABLE_LIMIT else None
+            self._connection.execute(
+                """INSERT INTO account_unreadable_media(account_id,peer_id,message_id,misses,retry_after)
+                   VALUES (?,?,?,?,?) ON CONFLICT(account_id,peer_id,message_id)
+                   DO UPDATE SET misses=excluded.misses,retry_after=excluded.retry_after""",
+                (*key, misses, now + delay if delay is not None else None),
+            )
+            return UnreadableRetry(misses, delay)
+
+    def record_readable_message(self, account_id: str, peer_id: int, message_id: int, *,
+                                token: str, now: float | None = None) -> bool:
+        """Reset a prior unreadable streak on a confirmed, dated Telegram read."""
+        key = (account_id, peer_id, message_id)
+        with self._lock:
+            # No write lock needed for ordinary reads without a miss.
+            if self._connection.execute(
+                """SELECT 1 FROM account_unreadable_media
+                   WHERE account_id=? AND peer_id=? AND message_id=?""",
+                key,
+            ).fetchone() is None:
+                return False
+            with self._connection:
+                self._connection.execute("BEGIN IMMEDIATE")
+                now = time.time() if now is None else now
+                if not self._owns_claim_locked(account_id, peer_id, message_id, token, now):
+                    return False
+                return self._connection.execute(
+                    """DELETE FROM account_unreadable_media
+                       WHERE account_id=? AND peer_id=? AND message_id=?""",
+                    key,
+                ).rowcount == 1
 
     def _owns_claim_locked(self, account_id: str, peer_id: int, message_id: int,
                            token: str, now: float) -> bool:
@@ -620,7 +711,7 @@ class DownloadHistory:
             (peer_id, message_id, kind, str(path),
              datetime.now(timezone.utc).isoformat(), account_id),
         )
-        for table in ("scan_failures", "pending_media", "account_attempt_backoff"):
+        for table in ("scan_failures", "pending_media", "account_attempt_backoff", "account_unreadable_media"):
             self._connection.execute(
                 f"DELETE FROM {table} WHERE peer_id=? AND message_id=?", (peer_id, message_id),
             )

@@ -28,8 +28,8 @@ from tgdl.downloader import (
     UnsupportedSharedMonitorPeer,
 )
 from tgdl.errors import ChannelAccessError
-from tgdl.history import DownloadHistory, PendingMedia
-from tgdl.monitor import choose_monitor_download, load_channels, next_due_channel
+from tgdl.history import DownloadHistory, PendingMedia, UnreadableRetry
+from tgdl.monitor import MonitorUnreadableSummary, choose_monitor_download, load_channels, next_due_channel
 from tgdl.monitor_flow import MonitorFlow, MonitorPause, SharedSpeedLimiter
 from tgdl.slots import SlotCoordinator
 from tgdl.realtime_runtime import RealtimeDispatch
@@ -290,9 +290,11 @@ class AccountMonitorRuntime:
         self, history: DownloadHistory, item: dict, job: PendingMedia,
         settings: Any, limiter: SharedSpeedLimiter, retries: int, chunks: int,
         claim_token: str, *, on_claim_committed: Callable[[], None] | None = None,
+        on_unreadable: Callable[[PendingMedia, UnreadableRetry], None] | None = None,
     ) -> None:
         peer, mid = job.peer_id, job.message_id
-        cooldown = 0.0
+        cooldown = 0
+        unreadable_reply = False
         target = item["target"]  # resolve using THIS account, not the scanner's alias
         realtime = item.get("mode") == "realtime"
         label = "实时下载" if realtime else "监控下载"
@@ -314,10 +316,10 @@ class AccountMonitorRuntime:
                 self.log("[下载跳过] 监控目标已指向其他频道，重新扫描后再领取")
                 return
             message = await self.client.get_messages(entity, ids=mid)
-            if message is None or getattr(message, "date", None) is None:
-                cooldown = 3600
-                self.log(f"[下载跳过] {target} 消息 {mid} 在本账号不可读取")
+            if getattr(message, "date", None) is None:
+                unreadable_reply = True
                 return
+            history.record_readable_message(self.account.id, peer, mid, token=claim_token)
             kind = classify_message(message)
             enabled_kinds = {value.strip() for value in item.get("types", "photo,video").split(",")
                              if value.strip()}
@@ -388,9 +390,14 @@ class AccountMonitorRuntime:
             else:
                 self.log(f"[下载异常] {target} 消息 {mid}: {exc}")
         finally:
-            history.release_claim(
-                self.account.id, peer, mid, token=claim_token, cooldown=cooldown
-            )
+            if unreadable_reply:
+                retry = history.finish_unreadable_claim(self.account.id, peer, mid, token=claim_token)
+                if retry is not None and on_unreadable is not None:
+                    on_unreadable(job, retry)
+            else:
+                history.release_claim(
+                    self.account.id, peer, mid, token=claim_token, cooldown=cooldown
+                )
 
     async def _download_loop(self, settings: Any) -> None:
         from tgdl.slots import SlotCoordinator
@@ -412,9 +419,12 @@ class AccountMonitorRuntime:
         last_refresh = 0.0
         last_renew = 0.0
         occupancy: dict[str, float] = {}
+        unreadable_log = MonitorUnreadableSummary()
         try:
             while not self.stop_event.is_set() or active:
                 now = time.monotonic()
+                for line in unreadable_log.drain(now=now):
+                    self.log(line)
                 if self._cancel_transfers_requested.is_set():
                     for key, (task, _target, _began, token) in active.items():
                         if key not in retiring and token not in committed and not task.done():
@@ -559,6 +569,7 @@ class AccountMonitorRuntime:
                                                     history, item, job, transfer_settings,
                                                     limiter, retries, chunks, token,
                                                     on_claim_committed=lambda token=token: committed.add(token),
+                                                    on_unreadable=unreadable_log.add,
                                                 )
                                             )
                                             active[key] = (task, item["target"], time.monotonic(), token)
@@ -592,6 +603,8 @@ class AccountMonitorRuntime:
                 await asyncio.gather(
                     *(task for task, _, _, _ in active.values()), return_exceptions=True
                 )
+            for line in unreadable_log.drain(force=True):
+                self.log(line)
             for slot in active_slots.values():
                 slots.release(slot)
             try:

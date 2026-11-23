@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
+from tgdl.history import PendingMedia, UnreadableRetry
 from tgdl.paths import prepare_data_dir
 
 
@@ -57,6 +59,51 @@ class MonitorDispatchSummary:
                     f"[调度] {name}：恢复{count}个下载任务｜从原进度继续"
                 )
         self._events.clear()
+        return lines
+
+
+@dataclass
+class _UnreadableWindow:
+    title: str
+    first_at: float
+    last_at: float
+    counts: dict[UnreadableRetry, int] = field(default_factory=dict)
+
+
+class MonitorUnreadableSummary:
+    """Coalesce replies per canonical channel, flushing even during a burst."""
+
+    def __init__(self, *, quiet_seconds: float = 5.0, max_seconds: float = 30.0):
+        self.quiet_seconds = quiet_seconds
+        self.max_seconds = max_seconds
+        self._events: dict[int, _UnreadableWindow] = {}
+
+    def add(self, job: PendingMedia, retry: UnreadableRetry, *, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        window = self._events.get(job.peer_id)
+        if window is None:
+            title = " ".join(job.title.splitlines()).strip() or str(job.peer_id)
+            window = self._events[job.peer_id] = _UnreadableWindow(title, now, now)
+        window.last_at = now
+        window.counts[retry] = window.counts.get(retry, 0) + 1
+
+    def drain(self, *, now: float | None = None, force: bool = False) -> list[str]:
+        if not self._events:
+            return []
+        now = time.monotonic() if now is None else now
+        lines = []
+        for peer, window in list(self._events.items()):
+            if not force and (now - window.last_at < self.quiet_seconds
+                              and now - window.first_at < self.max_seconds):
+                continue
+            details = []
+            for retry, count in sorted(window.counts.items(), key=lambda entry: entry[0].misses):
+                if retry.delay_seconds is None:
+                    details.append(f"连续{retry.misses}次 {count}项，已移出本账号自动队列")
+                else:
+                    details.append(f"第{retry.misses}次 {count}项，{retry.delay_seconds // 3600}小时后可重试")
+            lines.append(f"[监控·消息不可读取] {window.title}：{'；'.join(details)}")
+            del self._events[peer]
         return lines
 
 

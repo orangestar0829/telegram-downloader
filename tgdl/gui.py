@@ -52,7 +52,7 @@ from tgdl.history import DownloadHistory
 from tgdl.login_dialog import TelegramLoginDialog
 from tgdl.log_format import LogChunk, TimestampedLines
 from tgdl.monitor import (
-    MONITOR_MODE_LABELS, REALTIME, SCHEDULED, MonitorDispatchSummary,
+    MONITOR_MODE_LABELS, REALTIME, SCHEDULED, MonitorDispatchSummary, MonitorUnreadableSummary,
     choose_monitor_download, configure_monitor_mode, load_channels, next_due_channel, save_channels,
 )
 
@@ -1250,6 +1250,7 @@ class _App:
         occupied_seconds: dict[str, float] = {}
         suspended_accounted: set[tuple[int, int]] = set()
         dispatch_log = MonitorDispatchSummary()
+        unreadable_log = MonitorUnreadableSummary()
         priority_logged = False
         pause_requested_at: dict[tuple[int, int], float] = {}
         pause_delay_reported: set[tuple[int, int]] = set()
@@ -1298,6 +1299,7 @@ class _App:
                                    media_types=item.get("types", "photo,video"),
                                    transfer_settings=settings, claim_token=token):
                     cooldown = 0
+                    unreadable_reply = False
                     try:
                         # Real-time mode is only for channels already joined;
                         # legacy scheduled/manual invite behaviour is unchanged.
@@ -1318,10 +1320,12 @@ class _App:
                             print("[监控] 监控目标与队列记录不符，跳过旧任务并重新识别频道")
                             return
                         message = await self.client.get_messages(entity, ids=job.message_id)
-                        if message is None or message.date is None:
-                            cooldown = 3600
-                            print(f"[监控] {target}/{job.message_id} 在本账号不可读取")
+                        if getattr(message, "date", None) is None:
+                            unreadable_reply = True
                             return
+                        history.record_readable_message(
+                            "default", job.peer_id, job.message_id, token=claim_token,
+                        )
                         kind = job.kind or _downloader.classify_message(message)
                         if kind is None or kind not in {
                             value.strip() for value in media_types.split(",") if value.strip()
@@ -1361,12 +1365,17 @@ class _App:
                         cooldown = 60
                         print(f"[监控] 下载 {job.title}/{job.message_id} 失败：{exc}")
                     finally:
-                        # Keep the global pending row retryable by another
-                        # eligible account instead of deleting it on failure.
-                        history.release_claim(
-                            "default", job.peer_id, job.message_id,
-                            token=claim_token, cooldown=cooldown,
-                        )
+                        if unreadable_reply:
+                            retry = history.finish_unreadable_claim(
+                                "default", job.peer_id, job.message_id, token=claim_token,
+                            )
+                            if retry is not None:
+                                unreadable_log.add(job, retry)
+                        else:
+                            history.release_claim(
+                                "default", job.peer_id, job.message_id,
+                                token=claim_token, cooldown=cooldown,
+                            )
                 active[key] = asyncio.create_task(transfer())
                 active_jobs[key] = job
                 active_slots[key] = slot
@@ -1387,7 +1396,7 @@ class _App:
             await self._ensure_client()
             last_lease_refresh = time.monotonic()
             while not self._monitor_download_stop.is_set() or active:
-                for line in dispatch_log.drain():
+                for line in dispatch_log.drain() + unreadable_log.drain():
                     print(line)
                 enabled, baseline = getattr(self, "_monitor_live_throttle_settings", (
                     getattr(self, "_monitor_live_auto_throttle", False),
@@ -1709,6 +1718,8 @@ class _App:
                     task.cancel()
             if active:
                 await asyncio.gather(*active.values(), return_exceptions=True)
+            for line in unreadable_log.drain(force=True):
+                print(line)
             for key in active:
                 release_slot(key)
                 self._monitor_progress_state(key[0], key[1], "结束")
