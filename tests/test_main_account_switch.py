@@ -98,6 +98,7 @@ def _make_app(tmp_path):
     app._dialog_rows = app._default_dialog_rows
     app._default_status_text = "已连接：测试 A"
     app._closing = False
+    app._monitor_throttle_publications = {}
     app._gallery_entity = object()
     app._gallery_title = "A old gallery"
     app.gallery_cells = []
@@ -129,6 +130,7 @@ def _make_app(tmp_path):
                  "media_concurrency", "media_retries", "chunk_concurrency",
                  "media_speed_kib"):
         setattr(app, name + "_var", Var())
+    app.monitor_auto_throttle_var = Var(False)
     for name, value in (
         ("monitor_minutes_var", "5"), ("monitor_priority_var", "0"),
         ("monitor_batch_var", "100"), ("monitor_direction_var", "从新到旧"),
@@ -328,6 +330,88 @@ def test_secondary_media_settings_change_only_b_env_and_not_a_live_workers(tmp_p
     assert read_env_values(b_file)["chunk_concurrency"] == "3"
     assert app._monitor_live_concurrency == 2
     assert app._applied_media_settings == (2, 2, 1, 0)
+
+
+
+def test_monitor_auto_throttle_switch_saves_only_selected_account_and_refreshes_live(tmp_path):
+    from tgdl.config import read_env_values
+
+    app, b = _make_app(tmp_path)
+    warnings = []
+    app.messagebox = SimpleNamespace(showwarning=lambda *args: warnings.append(args))
+    calls = []
+    callbacks = []
+    app.loop = SimpleNamespace(loop=SimpleNamespace(call_soon_threadsafe=callbacks.append))
+    app._monitor_throttle = SimpleNamespace(configure=lambda **kw: calls.append(("default", kw)))
+    app._extra_runtimes[b.id]._monitor_throttle = SimpleNamespace(
+        configure=lambda **kw: calls.append((b.id, kw)),
+    )
+    a_path = app._account_registry.env_path("default")
+    b_path = app._account_registry.env_path(b.id)
+
+    app._switch_main_account(b.id)
+    assert not app.monitor_auto_throttle_var.get()
+    # An unsaved draft never changes a different account or the current governor.
+    app.monitor_auto_throttle_var.set(True)
+    app._switch_main_account("default")
+    assert not app.monitor_auto_throttle_var.get()
+    assert not callbacks
+
+    app.monitor_auto_throttle_var.set(True)
+    app.media_speed_kib_var.set("4096")
+    app._apply_media_settings()
+    assert app._monitor_live_throttle_settings == (True, 4096)
+    assert read_env_values(a_path)["monitor_auto_throttle"] == "1"
+    assert read_env_values(b_path)["monitor_auto_throttle"] == "0"
+
+    app._switch_main_account(b.id)
+    assert not app.monitor_auto_throttle_var.get()
+    app.monitor_auto_throttle_var.set(True)
+    app.media_speed_kib_var.set("2048")
+    app._apply_media_settings()
+    assert read_env_values(b_path)["monitor_auto_throttle"] == "1"
+    assert app._monitor_live_throttle_settings == (True, 4096)
+
+    app._switch_main_account("default")
+    assert app.monitor_auto_throttle_var.get()
+    app.monitor_auto_throttle_var.set(False)
+    app._apply_media_settings()
+    for callback in callbacks:
+        callback()
+    assert calls == [
+        (b.id, {"enabled": True, "manual_kib": 2048}),
+        ("default", {"enabled": False, "manual_kib": 4096}),
+    ]
+    assert app._monitor_live_throttle_settings == (False, 4096)
+    assert read_env_values(a_path)["monitor_auto_throttle"] == "0"
+    assert read_env_values(b_path)["monitor_auto_throttle"] == "1"
+    assert not warnings
+
+    # A quick off/on must still reset accumulated waits and fence pending RPCs.
+    callbacks.clear()
+    calls.clear()
+    app._switch_main_account(b.id)
+    app.monitor_auto_throttle_var.set(False)
+    app._apply_media_settings()
+    app.monitor_auto_throttle_var.set(True)
+    app._apply_media_settings()
+    for callback in callbacks:
+        callback()
+    assert calls == [
+        (b.id, {"enabled": False, "manual_kib": 2048}),
+        (b.id, {"enabled": True, "manual_kib": 2048}),
+    ]
+
+    # A settings callback queued for an old secondary runtime must not leak.
+    callbacks.clear()
+    calls.clear()
+    app._switch_main_account(b.id)
+    app.monitor_auto_throttle_var.set(False)
+    app._apply_media_settings()
+    app._extra_runtimes[b.id] = SimpleNamespace(_monitor_throttle=app._monitor_throttle)
+    callbacks.pop()()
+    assert calls == []
+    assert read_env_values(b_path)["monitor_auto_throttle"] == "0"
 
 
 def test_duplicate_telegram_account_names_have_distinct_display_choices():

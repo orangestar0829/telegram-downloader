@@ -50,7 +50,8 @@ def test_batch_and_download_settings_are_separate_tabs():
     app = object.__new__(gui._App)
     app.root = object()
     for name in ("type_photo", "type_video", "type_anim", "dl_limit", "media_concurrency_var",
-                 "media_retries_var", "chunk_concurrency_var", "media_speed_kib_var"):
+                 "media_retries_var", "chunk_concurrency_var", "media_speed_kib_var",
+                 "monitor_auto_throttle_var"):
         setattr(app, name, object())
     app.ttk, batch = widgets()
     app._build_download_tab()
@@ -64,6 +65,8 @@ def test_batch_and_download_settings_are_separate_tabs():
     app.ttk, settings = widgets()
     app._build_download_settings_tab()
     assert any(w.get("command") == app._apply_media_settings for w in settings)
+    assert any(w.get("variable") is app.monitor_auto_throttle_var
+               and "自动降速" in w.get("text", "") for w in settings)
     assert {w.get("textvariable") for w in settings} - {None} == {
         app.media_concurrency_var, app.media_retries_var,
         app.chunk_concurrency_var, app.media_speed_kib_var,
@@ -101,7 +104,7 @@ def test_group_list_scrolls_and_keeps_its_height_when_switching_tabs():
                      "chunk_concurrency_var", "media_speed_kib_var", "p_limit"):
             setattr(app, name, tk.StringVar(root))
         for name in ("type_photo", "type_video", "type_anim", "p_no_previews",
-                     "p_no_bt", "p_dry", "p_catalog_only"):
+                     "p_no_bt", "p_dry", "p_catalog_only", "monitor_auto_throttle_var"):
             setattr(app, name, tk.BooleanVar(root))
         app._build_ui()
         root.update()

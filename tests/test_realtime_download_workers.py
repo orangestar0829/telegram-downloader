@@ -7,7 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from telethon.tl.types import Channel, ChatPhotoEmpty
+from telethon.errors import ChannelPrivateError
+from telethon.tl.types import Channel, ChatPhotoEmpty, Message, MessageMediaPhoto, PeerChannel
 
 from tgdl import downloader, gui, multi_runtime, realtime
 from tgdl.accounts import Account, AccountRegistry
@@ -21,11 +22,13 @@ from tgdl.slots import SlotCoordinator, make_plan
 def test_workers_never_borrow_realtime_and_schedule_one_live_file_per_peer(
     tmp_path, monkeypatch, account_id,
 ):
+    # Both lanes must use the same payload path, even when the channel and
+    # the readable messages both carry Telegram's forward-control flag.
     rows = [
         {"target": "@old", "peer_id": 100, "enabled": True,
-         "priority": 99, "types": "video"},
+         "priority": 99, "types": "photo"},
         {"target": "@live", "peer_id": 200, "enabled": True,
-         "priority": -99, "types": "video", "mode": "realtime"},
+         "priority": -99, "types": "photo", "mode": "realtime"},
     ]
     slots = SlotCoordinator()
     slots.configure(make_plan([(account_id, 2, rows)]))
@@ -35,15 +38,25 @@ def test_workers_never_borrow_realtime_and_schedule_one_live_file_per_peer(
     )
 
     class Client:
-        async def get_messages(self, _entity, ids):
-            return SimpleNamespace(id=ids, date=datetime.now(timezone.utc))
+        async def get_entity(self, peer):
+            assert isinstance(peer, PeerChannel) and peer.channel_id == 200
+            return Channel(200, "@live", ChatPhotoEmpty(), None, megagroup=True, noforwards=True)
+
+        async def get_messages(self, entity, ids):
+            return Message(id=ids, peer_id=PeerChannel(entity.id), date=datetime.now(timezone.utc),
+                           message="", media=MessageMediaPhoto(), noforwards=entity.noforwards)
+
+        async def download_media(self, message, *, file, progress_callback):
+            assert message.noforwards is True
+            self.started.put_nowait((message.peer_id.channel_id, message.id))
+            await self.wait_on[message.id].wait()
+            payload = Path(file) / "offline.jpg"
+            payload.write_bytes(f"test data for {message.id}".encode())
+            return payload
 
     async def resolve(_client, target):
-        return Channel(100 if target == "@old" else 200, target, ChatPhotoEmpty(), None, megagroup=True)
-
-    async def resolve_live(_client, target, *, expected_peer_id):
-        assert target == "@live" and expected_peer_id == 200
-        return Channel(200, target, ChatPhotoEmpty(), None, megagroup=True)
+        return Channel(100 if target == "@old" else 200, target, ChatPhotoEmpty(), None,
+                       megagroup=True, noforwards=True)
 
     async def ensure():
         pass
@@ -65,7 +78,6 @@ def test_workers_never_borrow_realtime_and_schedule_one_live_file_per_peer(
         stop = app._monitor_download_stop.set
         monkeypatch.setattr(gui, "DownloadHistory", lambda: DownloadHistory(path))
         monkeypatch.setattr(gui, "resolve_channel", resolve)
-        download_module = downloader
     else:
         app = multi_runtime.AccountMonitorRuntime(
             Account(account_id, "secondary"), AccountRegistry(tmp_path),
@@ -79,40 +91,28 @@ def test_workers_never_borrow_realtime_and_schedule_one_live_file_per_peer(
         app._blocked.add("@live")
         monkeypatch.setattr(app, "_channels", lambda: rows)
         monkeypatch.setattr(multi_runtime, "resolve_channel", resolve)
-        monkeypatch.setattr(multi_runtime, "classify_message", lambda _: "video")
         monkeypatch.setattr(multi_runtime, "read_env_values", lambda _: {
             "media_concurrency": "2", "media_retries": "0",
             "chunk_concurrency": "1", "media_speed_kib": "0",
         })
         worker = app._download_loop(settings)
         stop = app.stop
-        download_module = multi_runtime
 
     app._slots = slots
     app._realtime_ready = {200}
-    monkeypatch.setattr(realtime, "resolve_realtime_peer", resolve_live)
     history = DownloadHistory(path)
     history.enqueue_media([
-        PendingMedia(100, 1, "@old", "old", "video", "1"),
-        PendingMedia(100, 2, "@old", "old", "video", "2"),
-        PendingMedia(200, 10, "@live", "live", "video", "10"),  # old backlog of live peer
+        PendingMedia(100, 1, "@old", "old", "photo", "1"),
+        PendingMedia(100, 2, "@old", "old", "photo", "2"),
+        PendingMedia(200, 10, "@live", "live", "photo", "10"),  # old backlog of live peer
     ])
 
     async def scenario():
         started = asyncio.Queue()
         wait_on = {mid: asyncio.Event() for mid in (1, 2, 10, 11, 12)}
 
-        async def download(_client, message, _folder, base, _stats, *,
-                           peer_id, history, claim_token, on_claim_committed, **_):
-            started.put_nowait((peer_id, message.id))
-            await wait_on[message.id].wait()
-            assert history.mark_claim_saved(
-                account_id, peer_id, message.id, "video", Path(base), token=claim_token,
-            )
-            on_claim_committed()
-            return Path(base)
-
-        monkeypatch.setattr(download_module, "_download_with_retry", download)
+        client.started = started
+        client.wait_on = wait_on
         task = asyncio.create_task(worker)
         try:
             old_peer, old_id = await asyncio.wait_for(started.get(), 3)
@@ -130,8 +130,8 @@ def test_workers_never_borrow_realtime_and_schedule_one_live_file_per_peer(
             # Keep the first ordinary transfer running while two live items arrive.
             history.start_realtime(account_id, 200, "test-epoch", 10)
             assert history.commit_realtime(account_id, 200, "test-epoch", 12, [
-                PendingMedia(200, 11, "@live", "live", "video", "11"),
-                PendingMedia(200, 12, "@live", "live", "video", "12"),
+                PendingMedia(200, 11, "@live", "live", "photo", "11"),
+                PendingMedia(200, 12, "@live", "live", "photo", "12"),
             ]) == (2, 12)
             if account_id == "default":
                 app._download_future = asyncio.get_running_loop().create_future()
@@ -157,7 +157,10 @@ def test_workers_never_borrow_realtime_and_schedule_one_live_file_per_peer(
             await asyncio.wait_for(task, 3)
 
         assert slots.available(account_id, 2), "stopping releases in-flight tokens"
-        assert history.contains(200, 11) and history.contains(200, 12)
+        assert history.contains(100, 1) and history.contains(200, 11) and history.contains(200, 12)
+        assert sorted(p.read_bytes() for p in settings.download_dir.rglob("*.jpg")) == [
+            f"test data for {mid}".encode() for mid in sorted((1, 11, 12, next_job[1]), key=str)
+        ]
         assert history.pending_count() == 1
         assert not history.active_claims()
 
@@ -292,5 +295,55 @@ def test_secondary_realtime_permission_failure_backs_off_without_blocking_peer(t
         assert "@live" not in runtime._blocked
         assert history.pending_for_peer(200, account_id=account_id) == []
         assert history.pending_for_peer(200, account_id=account_id, now=time.time() + 310) == [job]
+    finally:
+        history.close()
+
+
+
+def test_secondary_realtime_media_refused_by_telegram_is_never_marked_saved(tmp_path):
+    account_id = "secondary"
+    successes, logs = [], []
+    runtime = multi_runtime.AccountMonitorRuntime(
+        Account(account_id, "secondary"), AccountRegistry(tmp_path),
+        ask=None, on_log=lambda _, text: logs.append(text),
+        on_saved=lambda *args: successes.append(args), on_progress=lambda *_: None,
+    )
+
+    class Client:
+        reads = 0
+
+        async def get_entity(self, peer):
+            assert isinstance(peer, PeerChannel) and peer.channel_id == 200
+            return Channel(200, "live", ChatPhotoEmpty(), None, megagroup=True, noforwards=True)
+
+        async def get_messages(self, entity, ids):
+            return Message(id=ids, peer_id=PeerChannel(entity.id), date=datetime.now(timezone.utc),
+                           message="", media=MessageMediaPhoto(), noforwards=True)
+
+        async def download_media(self, _message, *, file, progress_callback):
+            self.reads += 1
+            (Path(file) / "incomplete.jpg").write_bytes(b"partial before denial")
+            raise ChannelPrivateError(request=None)
+
+    runtime.client = Client()
+    settings = SimpleNamespace(download_dir=tmp_path, temp_download_dir=None)
+    row = {"target": "@live", "mode": "realtime", "types": "photo"}
+    job = PendingMedia(200, 11, "@live", "live", "photo", "11")
+    history = DownloadHistory(tmp_path / "refused.sqlite3")
+    try:
+        history.enqueue_media([job])
+        token = history.try_claim(account_id, job.peer_id, job.message_id)
+        assert token is not None
+        asyncio.run(runtime._transfer(
+            history, row, job, settings, SharedSpeedLimiter(), 0, 1, token,
+        ))
+        assert runtime.client.reads == 1  # The normal media request; no alternate path.
+        assert not history.contains(job.peer_id, job.message_id)
+        assert not successes and not history.active_claims()
+        assert not list(settings.download_dir.rglob("*.jpg"))
+        assert any("下载失败" in line for line in logs)
+        assert history.pending_for_peer(job.peer_id, account_id=account_id) == []
+        assert history.pending_for_peer(job.peer_id, account_id=account_id,
+                                        now=time.time() + 61) == [job]
     finally:
         history.close()

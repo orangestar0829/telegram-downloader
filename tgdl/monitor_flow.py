@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
 
+from tgdl.auto_throttle import MonitorAutoThrottle
 from tgdl.chunked import (
     CHUNK_IDLE_TIMEOUT, CHUNK_RETRIES, ChunkDownloadStalled, REQUEST_BYTES,
 )
@@ -96,6 +97,12 @@ class SharedSpeedLimiter:
         self._updated = time.monotonic()
         self._previous_limit = self.bytes_per_second
         self._lock = asyncio.Lock()
+        self.auto_throttle: MonitorAutoThrottle | None = None
+
+    def bind_auto_throttle(self, *, log: Callable[[str], None]) -> MonitorAutoThrottle:
+        """One ephemeral policy per account dispatcher, shared across its file lanes."""
+        self.auto_throttle = MonitorAutoThrottle(self, log=log)
+        return self.auto_throttle
 
     async def consume(self, amount: int, pause: MonitorPause | None = None) -> None:
         if amount <= 0:
@@ -122,7 +129,15 @@ class SharedSpeedLimiter:
                     self._tokens -= amount
                     return
                 delay = (amount - self._tokens) / limit
+            policy = self.auto_throttle
+            generation = policy.generation if policy and policy.enabled else None
             await asyncio.sleep(min(0.1, max(0.01, delay)))
+            if (generation is not None and policy.enabled and policy.generation == generation
+                    and not (pause and pause.requested)):
+                # Paid token-bucket time for bytes actually received, not a
+                # scan, a Telethon retry, or an arbitrary idle gap. Concurrent
+                # lanes share one clock and the governor unions their spans.
+                policy.on_paced(now, time.monotonic())
 
 
 @dataclass

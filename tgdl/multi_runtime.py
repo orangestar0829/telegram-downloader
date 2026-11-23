@@ -15,13 +15,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from telethon.errors import AuthKeyDuplicatedError, FloodWaitError, UnauthorizedError
+from telethon.errors import AuthKeyDuplicatedError, FloodPremiumWaitError, FloodWaitError, UnauthorizedError
 
 from tgdl.accounts import Account, AccountRegistry
 from tgdl.account_context import current_account_id
 from tgdl.account_identity import account_identity
 from tgdl.client import build_client, validate_login_phone
-from tgdl.config import load_settings, read_env_values
+from tgdl.config import load_settings, parse_monitor_auto_throttle, read_env_values
 from tgdl.downloader import (
     DownloadLeaseLost, DownloadStats, _download_with_retry, classify_message, resolve_channel,
     history_peer_id, peer_download_folder, require_shared_monitor_peer, scan_monitor_slice,
@@ -318,10 +318,6 @@ class AccountMonitorRuntime:
                 cooldown = 3600
                 self.log(f"[下载跳过] {target} 消息 {mid} 在本账号不可读取")
                 return
-            if realtime and getattr(message, "noforwards", False):
-                cooldown = 3600
-                self.log(f"[实时下载] 跳过受保护的消息 {target}/{mid}")
-                return
             kind = classify_message(message)
             enabled_kinds = {value.strip() for value in item.get("types", "photo,video").split(",")
                              if value.strip()}
@@ -371,7 +367,7 @@ class AccountMonitorRuntime:
                 self.peer_by_target.pop(target, None)
                 self._blocked.add(target)
                 self.log(f"[监控已暂停] {item.get('name') or '该目标'}：{exc}")
-        except FloodWaitError as exc:
+        except (FloodWaitError, FloodPremiumWaitError) as exc:
             cooldown = max(60, int(exc.seconds))
             self.log(f"[账号限流] {target} 消息 {mid}；等待{cooldown}秒")
         except Exception as exc:
@@ -405,7 +401,11 @@ class AccountMonitorRuntime:
         realtime_jobs: set[tuple[int, int]] = set()
         retiring: set[tuple[int, int]] = set()
         committed: set[str] = set()
-        limiter = SharedSpeedLimiter(settings.media_speed_kib * 1024)
+        limiter = governor = None
+        governor_generation = None
+        self._monitor_throttle = None
+        manual_kib = settings.media_speed_kib
+        auto_throttle = getattr(settings, "monitor_auto_throttle", False)
         workers, retries, chunks = (
             settings.media_concurrency, settings.media_retries, settings.chunk_concurrency
         )
@@ -439,9 +439,18 @@ class AccountMonitorRuntime:
                     except Exception as exc:
                         self.log(f"[下载协程异常] {type(exc).__name__}: {exc}")
                 self.active_count = len(active)
-                if not self.monitoring and not active:
-                    await asyncio.sleep(0.25)
-                    continue
+                generation = self._monitor_scan_stop
+                if not active:
+                    # Unlike the primary worker, this loop outlives monitoring.
+                    # Preserve the old cap while jobs drain, but reset it before
+                    # claiming for a newly started generation, even if Stop
+                    # and Start both happened during one scheduler sleep.
+                    if generation is not governor_generation or generation.is_set():
+                        limiter = governor = self._monitor_throttle = None
+                        governor_generation = None
+                    if generation.is_set() or self.stop_event.is_set():
+                        await asyncio.sleep(0.25)
+                        continue
                 if now - last_renew >= 30:
                     for key, (task, _target, _began, token) in active.items():
                         if key in retiring or token in committed:
@@ -451,19 +460,25 @@ class AccountMonitorRuntime:
                             task.cancel()
                             self.log(f"[下载跳过] 下载租约已失效，停止任务 {key}")
                     last_renew = now
-                if now - last_refresh >= 5:
+                if governor is None or now - last_refresh >= 5:
+                    # Re-read on every fresh monitoring run, even if settings
+                    # were saved while idle and no live governor received them.
                     env = read_env_values(self.registry.env_path(self.account.id))
                     try:
                         workers = min(8, max(1, int(env["media_concurrency"])))
                         retries = min(5, max(0, int(env["media_retries"])))
                         chunks = min(8, max(1, int(env["chunk_concurrency"])))
-                        limiter.bytes_per_second = (
-                            min(1048576, max(0, int(env["media_speed_kib"]))) * 1024
-                        )
+                        manual_kib = min(1048576, max(0, int(env["media_speed_kib"])))
+                        auto_throttle = parse_monitor_auto_throttle(env.get("monitor_auto_throttle"))
                     except (ValueError, TypeError):
                         self.log("[下载设置] 无效的并发/限速参数；继续使用原值")
+                    if governor is None:
+                        limiter = SharedSpeedLimiter()
+                        governor = limiter.bind_auto_throttle(log=self.log)
+                        governor_generation = generation
+                        self._monitor_throttle = governor
+                    governor.configure(manual_kib=manual_kib, enabled=auto_throttle)
                     last_refresh = now
-                generation = self._monitor_scan_stop
                 if self.monitoring and len(active) < workers:
                     try:
                         channels = [
@@ -584,6 +599,8 @@ class AccountMonitorRuntime:
                     history.release_claim(self.account.id, *key, token=token)
             finally:
                 self.active_count = 0
+                if self._monitor_throttle is governor:
+                    self._monitor_throttle = None
                 history.close()
 
     async def _restore_saved_session(self, settings):

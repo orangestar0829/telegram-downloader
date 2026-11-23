@@ -6,11 +6,11 @@ from types import SimpleNamespace
 
 import pytest
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError
+from telethon.errors import ChannelPrivateError, FloodWaitError
 from telethon.sessions import MemorySession
 from telethon.tl.functions.messages import CheckChatInviteRequest
 from telethon.tl.types import (
-    Channel, ChatInviteAlready, ChatPhotoEmpty, Message, MessageMediaPhoto, PeerChannel,
+    Channel, ChannelForbidden, ChatInviteAlready, ChatPhotoEmpty, Message, MessageMediaPhoto, PeerChannel,
 )
 
 from tgdl import realtime
@@ -108,7 +108,7 @@ def pending(history, *, account="default", lane=True):
     )]
 
 
-def test_read_only_membership_protection_and_peer_identity():
+def test_read_only_resolution_checks_membership_and_peer_identity_not_forwarding_flag():
     async def run():
         client = FakeTelegram()
         assert await realtime.resolve_realtime_peer(client, "https://t.me/+abc") is client.entity
@@ -121,11 +121,29 @@ def test_read_only_membership_protection_and_peer_identity():
             await realtime.resolve_realtime_peer(client, "@photos")
         client.entity.left = False
         client.entity.noforwards = True
-        with pytest.raises(ChannelAccessError, match="限制"):
+        assert await realtime.resolve_realtime_peer(client, "@photos") is client.entity
+        assert await realtime.resolve_realtime_peer(client, "@photos", expected_peer_id=PEER) is client.entity
+        client.entity.restricted = True
+        with pytest.raises(ChannelAccessError, match="访问受限"):
             await realtime.resolve_realtime_peer(client, "@photos")
-        client.entity.noforwards = False
+        client.entity.restricted = False
+        client.entity.min = True
+        with pytest.raises(ChannelAccessError, match="加入"):
+            await realtime.resolve_realtime_peer(client, "@photos")
+        client.entity.min = False
         with pytest.raises(ChannelAccessError, match="不一致"):
             await realtime.resolve_realtime_peer(client, "@photos", expected_peer_id=PEER + 1)
+
+        client.entity = ChannelForbidden(PEER, 123, "Photos", broadcast=True)
+        with pytest.raises(ChannelAccessError, match="加入"):
+            await realtime.resolve_realtime_peer(client, "@photos")
+
+        async def denied(_peer):
+            raise ChannelPrivateError(request=None)
+
+        client.get_entity = denied
+        with pytest.raises(ChannelAccessError, match="无法读取"):
+            await realtime.resolve_realtime_peer(client, "@photos", expected_peer_id=PEER)
 
     asyncio.run(run())
 
@@ -165,7 +183,7 @@ def test_first_push_next_turn_batches_exact_chunks_without_history_poll(tmp_path
             )
             await wait_for(lambda: history.realtime_cursor("default", PEER, "subscription") == 167)
             assert observed == [1, 32, 32, 2]
-            assert pending(history) == [mid for mid in range(101, 168) if mid != 103]
+            assert pending(history) == list(range(101, 168))
             await asyncio.sleep(.02)
             assert len(client.calls) == 2
         finally:
@@ -179,8 +197,9 @@ def test_first_push_next_turn_batches_exact_chunks_without_history_poll(tmp_path
 def test_fresh_tail_includes_update_racing_listener_enrollment(tmp_path):
     async def run():
         history = DownloadHistory(tmp_path / "state.db")
-        new_post = photo(501, date=datetime.now(timezone.utc))
+        new_post = photo(501, date=datetime.now(timezone.utc), protected=True)
         client = FakeTelegram([photo(500)])
+        client.entity.noforwards = True
 
         async def hide_push_until_after_snapshot(kwargs):
             if not kwargs.get("offset_date"):

@@ -15,9 +15,9 @@ from telethon.errors import (
     UsernameNotOccupiedError,
 )
 from telethon.tl.functions.messages import CheckChatInviteRequest
-from telethon.tl.types import Channel, ChatInviteAlready, Message, PeerChannel
+from telethon.tl.types import Channel, ChatInviteAlready, PeerChannel
 
-from tgdl.downloader import INVITE_RE, classify_message
+from tgdl.downloader import INVITE_RE, monitor_media
 from tgdl.errors import ChannelAccessError
 from tgdl.history import DownloadHistory, PendingMedia
 
@@ -36,8 +36,10 @@ _AUTH_ERRORS = _UNAVAILABLE + (ChannelAccessError,)
 def _require_joined(entity) -> Channel:
     if not isinstance(entity, Channel) or entity.left or entity.min:
         raise ChannelAccessError("实时监控仅支持本账号已加入的频道或超级群。")
-    if entity.noforwards or entity.restricted:
-        raise ChannelAccessError("频道有限制，不支持实时下载。")
+    if entity.restricted:
+        raise ChannelAccessError("频道访问受限，不支持实时监控。")
+    # Match scheduled monitoring: the standard Telegram read/download APIs
+    # determine which media the joined account can access.
     return entity
 
 
@@ -257,14 +259,10 @@ class RealtimeMonitor:
             sub.change.set()
 
     def _message_media(self, sub: _Subscription, message) -> tuple[str, str] | None:
-        if (not isinstance(message, Message) or message.date is None
-                or message.noforwards or not isinstance(message.peer_id, PeerChannel)
-                or message.peer_id.channel_id != sub.config.peer):
+        peer = getattr(message, "peer_id", None)
+        if not isinstance(peer, PeerChannel) or peer.channel_id != sub.config.peer:
             return None
-        kind = classify_message(message)
-        if kind is None or kind not in sub.config.types:
-            return None
-        return kind, f"{message.date.strftime('%Y%m%d')}_{message.id}"
+        return monitor_media(message, sub.config.types)
 
     @staticmethod
     def _pending(sub: _Subscription, message_id: int, media: tuple[str, str]) -> PendingMedia:

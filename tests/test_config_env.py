@@ -143,3 +143,29 @@ def test_invalid_setting_leaves_destination_unmodified(tmp_path, monkeypatch):
         config.update_env({"api_id": "5678"}, env_path)
     assert env_path.read_bytes() == original
     assert list(tmp_path.iterdir()) == [env_path]
+
+
+def test_monitor_auto_throttle_is_opt_in_and_never_inherited(tmp_path, monkeypatch):
+    from tgdl.accounts import AccountRegistry
+
+    registry = AccountRegistry(tmp_path)
+    primary = registry.env_path("default")
+    credentials = {"api_id": "1234", "api_hash": "test-only"}
+    config.update_env(credentials, primary)
+    monkeypatch.setenv("MONITOR_AUTO_THROTTLE", "1")
+    assert config.read_env_values(primary)["monitor_auto_throttle"] == "0"
+    assert not config.load_settings(env_path=primary).monitor_auto_throttle
+
+    config.update_env({**credentials, "monitor_auto_throttle": "1"}, primary)
+    secondary = registry.env_path(registry.add("Second").id)
+    assert config.load_settings(env_path=primary).monitor_auto_throttle
+    assert not config.load_settings(env_path=secondary).monitor_auto_throttle
+
+    config.update_env({**credentials, "monitor_auto_throttle": "YES"}, secondary)
+    config.update_env({**credentials, "download_dir": "./other"}, secondary)
+    assert config.read_env_values(secondary)["monitor_auto_throttle"] == "YES"
+    assert config.load_settings(env_path=secondary).monitor_auto_throttle
+
+    config.update_env({**credentials, "monitor_auto_throttle": "typo"}, secondary)
+    assert not config.load_settings(env_path=secondary).monitor_auto_throttle
+    assert config.load_settings(env_path=primary).monitor_auto_throttle

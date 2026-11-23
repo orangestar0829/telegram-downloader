@@ -137,6 +137,7 @@ def test_download_settings_reject_concurrency_below_reserved_lanes(tmp_path):
     app.media_retries_var = FakeVar("1")
     app.chunk_concurrency_var = FakeVar("1")
     app.media_speed_kib_var = FakeVar("0")
+    app.monitor_auto_throttle_var = FakeVar(True)
     warnings = []
     app.messagebox.showwarning = lambda *args: warnings.append(args)
     _bind_plan(app, registry, lambda: app._monitored)
@@ -144,6 +145,7 @@ def test_download_settings_reject_concurrency_below_reserved_lanes(tmp_path):
     app._apply_media_settings()
     assert "未生效" in warnings[-1][1]
     assert read_env_values(path)["media_concurrency"] == "2"
+    assert read_env_values(path)["monitor_auto_throttle"] == "0"
     assert app._applied_media_settings == (2, 2, 1, 0)
     assert app._slots.owner(321) == "default"
 

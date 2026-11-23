@@ -24,7 +24,7 @@ import threading
 import time
 from pathlib import Path
 
-from telethon.errors import AuthKeyDuplicatedError, UnauthorizedError
+from telethon.errors import AuthKeyDuplicatedError, FloodPremiumWaitError, FloodWaitError, UnauthorizedError
 
 from tgdl.accounts import AccountRegistry, DEFAULT_ACCOUNT
 from tgdl.account_context import current_account_id
@@ -41,6 +41,7 @@ from tgdl.config import (
     credentials_available,
     default_download_dir,
     load_settings,
+    parse_monitor_auto_throttle,
     read_env_values,
     resolve_api_credentials,
     update_env,
@@ -274,6 +275,9 @@ class _App:
         self.media_retries_var = tk.StringVar(value=env["media_retries"])
         self.chunk_concurrency_var = tk.StringVar(value=env["chunk_concurrency"])
         self.media_speed_kib_var = tk.StringVar(value=env.get("media_speed_kib", "0"))
+        self.monitor_auto_throttle_var = tk.BooleanVar(
+            value=parse_monitor_auto_throttle(env.get("monitor_auto_throttle"))
+        )
         # Editable form values are drafts. Only the Apply button publishes a
         # validated snapshot to the running monitor download worker.
         self._applied_media_settings = (
@@ -325,6 +329,11 @@ class _App:
         self._monitor_live_retries = self._applied_media_settings[1]
         self._monitor_live_chunks = self._applied_media_settings[2]
         self._monitor_live_speed_kib = self._applied_media_settings[3]
+        self._monitor_live_auto_throttle = self.monitor_auto_throttle_var.get()
+        self._monitor_live_throttle_settings = (
+            self._monitor_live_auto_throttle, self._monitor_live_speed_kib,
+        )
+        self._monitor_throttle_publications: dict[str, tuple[bool, int]] = {}
         self._monitor_worker_retry_at = 0.0
         self._monitor_job = None
         self._monitor_active = False
@@ -988,7 +997,7 @@ class _App:
         self._monitor_tick()
 
     def _apply_media_settings(self) -> None:
-        """Atomically validate, save, and apply all numeric download settings."""
+        """Atomically validate, save, and apply this account’s download settings."""
         try:
             raw = (
                 self.media_concurrency_var.get(),
@@ -1001,6 +1010,7 @@ class _App:
             self.messagebox.showwarning("下载设置", "请填写完整的整数参数，未应用任何更改")
             return
         workers, retries, chunks, speed = settings
+        auto_throttle = self.monitor_auto_throttle_var.get()
         if not (1 <= workers <= 8 and 0 <= retries <= 5
                 and 1 <= chunks <= 8 and 0 <= speed <= 1048576):
             self.messagebox.showwarning(
@@ -1009,6 +1019,7 @@ class _App:
             return
         account_id = self._selected_view_account()
         previous = getattr(self, "_applied_media_settings", None)
+        previous_auto_throttle = getattr(self, "_monitor_live_auto_throttle", False)
         try:
             registry = getattr(self, "_account_registry", None)
             path = registry.env_path(account_id) if registry is not None else None
@@ -1017,6 +1028,7 @@ class _App:
             values.update(
                 media_concurrency=str(workers), media_retries=str(retries),
                 chunk_concurrency=str(chunks), media_speed_kib=str(speed),
+                monitor_auto_throttle="1" if auto_throttle else "0",
             )
             if path is None:
                 update_env(values)
@@ -1027,23 +1039,58 @@ class _App:
             return
         if plan is not None:
             self._refresh_slot_plan(plan)
-        if account_id != "default":
+        self._publish_monitor_throttle_settings(account_id, auto_throttle, speed)
+        auto_label = "开启" if auto_throttle else "关闭"
+        if account_id != DEFAULT_ACCOUNT:
             self._log_account(account_id, (
                 f"[下载设置] 已保存｜文件并发{workers}｜重试{retries}｜"
-                f"分块并发{chunks}｜限速{speed} KiB/s；监控运行中自动读取\n"
+                f"分块并发{chunks}｜限速{speed} KiB/s｜自动降速{auto_label}；监控运行中自动读取\n"
             ))
             return
         self._applied_media_settings = settings
         self._monitor_live_concurrency = workers
         self._monitor_live_retries = retries
         self._monitor_live_chunks = chunks
-        self._monitor_live_speed_kib = speed
-        if previous is None or previous != settings:
+        if previous != settings or previous_auto_throttle != auto_throttle:
             self._log(
                 f"[下载设置] 已应用｜文件并发{workers}｜重试{retries}｜"
-                f"分块并发{chunks}｜监控总限速{speed} KiB/s"
+                f"分块并发{chunks}｜监控总限速{speed} KiB/s｜自动降速{auto_label}"
                 "（0=不限速；运行中的监控下载逐步生效）\n"
             )
+
+    def _publish_monitor_throttle_settings(
+        self, account_id: str, enabled: bool, manual_kib: int,
+    ) -> None:
+        publication = (enabled, manual_kib)
+        if account_id == DEFAULT_ACCOUNT:
+            self._monitor_live_speed_kib = manual_kib
+            self._monitor_live_auto_throttle = enabled
+            self._monitor_live_throttle_settings = publication
+            owner = self
+        else:
+            owner = self._extra_runtimes.get(account_id)
+        loop = getattr(getattr(self, "loop", None), "loop", None)
+        if owner is None or loop is None:
+            return
+        publications = self._monitor_throttle_publications
+        publications[account_id] = publication
+
+        def apply() -> None:
+            # Supersede stale enables, but always apply an explicit disable:
+            # queued off→on must fence the first generation's in-flight RPCs.
+            if enabled and publications.get(account_id) is not publication:
+                return
+            if owner is not self and self._extra_runtimes.get(account_id) is not owner:
+                return
+            governor = getattr(owner, "_monitor_throttle", None)
+            if governor is not None:
+                governor.configure(enabled=enabled, manual_kib=manual_kib)
+
+        try:
+            loop.call_soon_threadsafe(apply)
+        except RuntimeError:
+            if not loop.is_closed():
+                raise
 
     def _monitor_tick(self):
         self._monitor_job = None
@@ -1207,7 +1254,9 @@ class _App:
         pause_requested_at: dict[tuple[int, int], float] = {}
         pause_delay_reported: set[tuple[int, int]] = set()
         paused_since: dict[tuple[int, int], float] = {}
-        limiter = SharedSpeedLimiter(getattr(self, "_monitor_live_speed_kib", 0) * 1024)
+        limiter = SharedSpeedLimiter()
+        governor = limiter.bind_auto_throttle(log=print)
+        self._monitor_throttle = governor
 
         async def wait_for_work(delay):
             live = getattr(self, "_realtime_ready", None)
@@ -1273,10 +1322,6 @@ class _App:
                             cooldown = 3600
                             print(f"[监控] {target}/{job.message_id} 在本账号不可读取")
                             return
-                        if item.get("mode") == "realtime" and getattr(message, "noforwards", False):
-                            cooldown = 3600
-                            print(f"[实时下载] 跳过受保护的消息 {target}/{job.message_id}")
-                            return
                         kind = job.kind or _downloader.classify_message(message)
                         if kind is None or kind not in {
                             value.strip() for value in media_types.split(",") if value.strip()
@@ -1309,6 +1354,9 @@ class _App:
                         raise
                     except DownloadLeaseLost:
                         print(f"[监控] 下载租约已失效，放弃保存 {job.title}/{job.message_id}")
+                    except (FloodWaitError, FloodPremiumWaitError) as exc:
+                        cooldown = max(60, int(exc.seconds))
+                        print(f"[账号限流] {target}/{job.message_id}；等待{cooldown}秒")
                     except Exception as exc:
                         cooldown = 60
                         print(f"[监控] 下载 {job.title}/{job.message_id} 失败：{exc}")
@@ -1341,7 +1389,11 @@ class _App:
             while not self._monitor_download_stop.is_set() or active:
                 for line in dispatch_log.drain():
                     print(line)
-                limiter.bytes_per_second = getattr(self, "_monitor_live_speed_kib", 0) * 1024
+                enabled, baseline = getattr(self, "_monitor_live_throttle_settings", (
+                    getattr(self, "_monitor_live_auto_throttle", False),
+                    getattr(self, "_monitor_live_speed_kib", 0),
+                ))
+                governor.configure(manual_kib=baseline, enabled=enabled)
                 now_lease = time.monotonic()
                 finished = [key for key, task in active.items() if task.done()]
                 for key in finished:
@@ -1667,6 +1719,8 @@ class _App:
                     history.release_claim("default", *key, token=token)
             finally:
                 history.close()
+                if self._monitor_throttle is governor:
+                    self._monitor_throttle = None
                 self._monitor_worker_task = None
 
     def _build_gallery_tab(self):
@@ -1881,13 +1935,19 @@ class _App:
             ttk.Entry(frame, textvariable=var, width=10).grid(
                 row=row, column=col + 1, sticky="w", **pad
             )
+        ttk.Checkbutton(
+            frame, text="Telegram 限流时自动降速", variable=self.monitor_auto_throttle_var,
+        ).grid(row=3, column=0, columnspan=2, sticky="w", **pad)
+        ttk.Label(frame, text="仅用于定时 / 实时监控下载", foreground="#555").grid(
+            row=3, column=2, columnspan=2, sticky="w", **pad
+        )
         ttk.Button(
             frame, text="应用并保存", command=self._apply_media_settings,
-        ).grid(row=3, column=3, sticky="e", **pad)
+        ).grid(row=4, column=3, sticky="e", **pad)
         ttk.Label(
             frame, text="保存后监控下载逐步使用新设置；已开始的手动任务不受影响。",
             foreground="#555",
-        ).grid(row=3, column=0, columnspan=3, sticky="w", **pad)
+        ).grid(row=4, column=0, columnspan=3, sticky="w", **pad)
         frame.columnconfigure(0, weight=1, uniform="settings_labels")
         frame.columnconfigure(2, weight=1, uniform="settings_labels")
         return frame
@@ -2064,6 +2124,7 @@ class _App:
             ("media_speed_kib", self.media_speed_kib_var),
         ):
             var.set(env.get(name, ""))
+        self.monitor_auto_throttle_var.set(parse_monitor_auto_throttle(env.get("monitor_auto_throttle")))
         self.manual_var.set("")
         self.dialog_search_var.set("")
         if account_id == "default":

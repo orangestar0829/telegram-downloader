@@ -102,6 +102,7 @@ class AccountRegistry:
             "media_retries": original["media_retries"],
             "chunk_concurrency": original["chunk_concurrency"],
             "media_speed_kib": original["media_speed_kib"],
+            "monitor_auto_throttle": "0",  # Never inherit another account's opt-in.
         }
         update_env(values, self.env_path(account.id))
         self._write(existing[1:] + [account])

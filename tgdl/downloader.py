@@ -12,7 +12,7 @@ import threading
 import unicodedata
 from contextlib import closing
 from collections.abc import AsyncIterable
-from collections.abc import Callable
+from collections.abc import Callable, Set
 from datetime import datetime, timezone
 from glob import escape as glob_escape
 from pathlib import Path
@@ -20,6 +20,7 @@ from pathlib import Path
 from telethon import TelegramClient, utils
 from telethon.errors import (
     ChannelPrivateError,
+    FloodPremiumWaitError,
     FloodWaitError,
     UserAlreadyParticipantError,
     UsernameNotOccupiedError,
@@ -53,6 +54,7 @@ from tgdl.chunked import (
     ChunkDownloadStalled, chunkable_document, document_suffix, download_chunked,
 )
 from tgdl.monitor_flow import MonitorFlow, monitor_download_document
+from tgdl.monitor_rpc import monitor_media_requests
 from tgdl.cache_budget import optional_staging_reservation
 from tgdl.errors import ChannelAccessError
 from tgdl.history import DownloadHistory, PendingMedia
@@ -137,6 +139,16 @@ def classify_message(message: Message) -> str | None:
     if message.photo:
         return "photo"
     return None
+
+
+def monitor_media(message: object, types: Set[str]) -> tuple[str, str] | None:
+    """Return the same eligible kind and basename for scheduled and push discovery."""
+    if not isinstance(message, Message) or message.date is None:
+        return None
+    kind = classify_message(message)
+    if kind is None or kind not in types:
+        return None
+    return kind, f"{message.date.strftime('%Y%m%d')}_{message.id}"
 
 
 def download_target(message: Message):
@@ -617,18 +629,16 @@ async def scan_monitor_slice(
             if not stats.first_message_id:
                 stats.first_message_id = last_seen
             stats.last_message_id = last_seen
-            if not isinstance(message, Message) or message.date is None:
+            media = monitor_media(message, types)
+            if media is None:
                 continue
-            kind = classify_message(message)
-            if kind not in types:
-                continue
+            kind, base = media
             stats.matched += 1
             if history.contains(peer_id, message.id):
                 stats.skipped += 1
             else:
                 discovered.append(PendingMedia(
-                    peer_id, int(message.id), target, title, kind,
-                    f"{message.date.strftime('%Y%m%d')}_{message.id}",
+                    peer_id, int(message.id), target, title, kind, base,
                 ))
             if stats.matched >= match_limit:
                 quota_reached = True
@@ -988,7 +998,11 @@ async def _download_one(
                 if cache_lease is not None:
                     cache_lease.track(Path(temporary))
                 media_started = time.monotonic()
-                with tqdm(unit="B", unit_scale=True, desc=base, leave=False) as bar:
+                governor = monitor_flow.limiter.auto_throttle if monitor_flow is not None else None
+                with (
+                    monitor_media_requests(client, governor),
+                    tqdm(unit="B", unit_scale=True, desc=base, leave=False) as bar,
+                ):
                     def progress(current: int, total: int) -> None:
                         bar.total = total or bar.total
                         bar.n = current
@@ -1218,12 +1232,16 @@ async def _download_with_retry(
                 on_progress(f"{peer_id or 0}:{message.id}:{base}",
                             f"{dest_dir.parent.name} / {base}", 0, 0, "已取消")
             raise
-        except FloodWaitError:
-            if on_progress is not None:
-                on_progress(f"{peer_id or 0}:{message.id}:{base}",
-                            f"{dest_dir.parent.name} / {base}", 0, 0, "限流等待")
-            raise
         except Exception as exc:
+            if isinstance(exc, FloodWaitError) or (
+                monitor_flow is not None and isinstance(exc, FloodPremiumWaitError)
+            ):
+                # Both raw wait classes can escape Telethon's auto-sleep
+                # threshold. Don't turn a monitor wait into a short file retry.
+                if on_progress is not None:
+                    on_progress(f"{peer_id or 0}:{message.id}:{base}",
+                                f"{dest_dir.parent.name} / {base}", 0, 0, "限流等待")
+                raise
             if attempt >= retries:
                 stats.failed += 1
                 if on_progress is not None:

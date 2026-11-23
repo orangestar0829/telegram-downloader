@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from functools import partial
+
 from telethon import TelegramClient
 from telethon.errors import FloodPremiumWaitError, FloodWaitError
 from telethon import errors
-from telethon.tl.functions.upload import GetFileRequest
+from telethon.tl.functions.upload import GetCdnFileRequest, GetFileRequest
 from telethon.utils import parse_phone
 
+from tgdl.monitor_rpc import MediaRequest, capture_request
 from tgdl.config import SESSION_PATH, Settings
 from tgdl.errors import TGDLInputError
 
@@ -59,16 +62,44 @@ class DiagnosticTelegramClient(TelegramClient):
             futures = result if isinstance(result, list) else [result]
             for req, future in zip(requests, futures):
                 if isinstance(req, GetFileRequest):
-                    future.add_done_callback(self._tgdl_record_getfile_result)
+                    captured = capture_request(self, sender)
+                    callback = self._tgdl_record_getfile_result
+                    if captured is not None:
+                        callback = partial(callback, captured=captured)
+                    future.add_done_callback(callback)
+                elif isinstance(req, GetCdnFileRequest):
+                    # Successful CDN media also proves healthy downloading.
+                    # Its errors are NOT GetFile incidents or diagnostic counts.
+                    owner = getattr(self, "_tgdl_cdn_parent", self)
+                    captured = capture_request(owner, sender)
+                    if captured is not None:
+                        future.add_done_callback(partial(self._tgdl_record_cdn_bytes, captured))
             return result
 
         sender.send = observing_send
         sender._tgdl_observed = True
 
-    def _tgdl_record_getfile_result(self, future) -> None:
+    @staticmethod
+    def _tgdl_record_cdn_bytes(captured: MediaRequest, future) -> None:
+        if not future.cancelled() and future.exception() is None:
+            DiagnosticTelegramClient._tgdl_record_media_bytes(captured, future)
+
+    @staticmethod
+    def _tgdl_record_media_bytes(captured: MediaRequest, future) -> None:
+        governor = captured.current_governor()
+        if governor is not None and captured.uninterrupted():
+            payload = getattr(future.result(), "bytes", None)
+            if isinstance(payload, bytes) and payload:
+                governor.on_success(captured.sent_at, len(payload))
+
+    def _tgdl_record_getfile_result(self, future, *, captured: MediaRequest | None = None) -> None:
         if future.cancelled():
             return
         exc = future.exception()
+        if exc is None:
+            if captured is not None:
+                self._tgdl_record_media_bytes(captured, future)
+            return
         if isinstance(exc, (
             errors.ServerError, errors.RpcCallFailError,
             errors.RpcMcgetFailError, errors.InterdcCallErrorError,
@@ -89,6 +120,16 @@ class DiagnosticTelegramClient(TelegramClient):
         self._tgdl_flood_counts[kind] = [count + 1, seconds + max(0, exc.seconds)]
         print(f"[网络诊断] 服务端原始响应 {kind} {exc.seconds}s (GetFileRequest) | "
               f"累计{count + 1}次，要求等待累计{seconds + max(0, exc.seconds)}s")
+
+        if captured is not None and (governor := captured.current_governor()) is not None:
+            governor.on_wait(captured.sent_at, exc.seconds, kind=kind)
+
+    async def _get_cdn_client(self, cdn_redirect):
+        client = await super()._get_cdn_client(cdn_redirect)
+        # Telethon may delegate the file to a child with a separate sender.
+        # Only its successful CDN bytes may belong to this account's scope.
+        client._tgdl_cdn_parent = self
+        return client
 
     async def _borrow_exported_sender(self, dc_id):
         sender = await super()._borrow_exported_sender(dc_id)

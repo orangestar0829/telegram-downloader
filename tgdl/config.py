@@ -30,6 +30,7 @@ _ENV_KEYS = {
     "MEDIA_RETRIES": "media_retries",
     "CHUNK_CONCURRENCY": "chunk_concurrency",
     "MEDIA_SPEED_KIB": "media_speed_kib",
+    "MONITOR_AUTO_THROTTLE": "monitor_auto_throttle",
 }
 
 
@@ -60,6 +61,7 @@ class Settings:
     media_speed_kib: int = 0
     temp_download_dir: Path | None = None
     session_path: Path | None = None
+    monitor_auto_throttle: bool = False
 
 
 def default_download_dir() -> Path:
@@ -125,6 +127,7 @@ def read_env_values(path: Path | None = None) -> dict[str, str]:
         "proxy_username": "", "proxy_password": "",
         "media_concurrency": "3", "media_retries": "2",
         "chunk_concurrency": "1", "media_speed_kib": "0",
+        "monitor_auto_throttle": "0",
     }
     source_path = Path(path) if path is not None else ENV_PATH
     for key, value in _file_env(source_path).items():
@@ -184,6 +187,7 @@ def update_env(values: dict[str, str], path: Path | None = None) -> Path:
         ("MEDIA_RETRIES", "media_retries"),
         ("CHUNK_CONCURRENCY", "chunk_concurrency"),
         ("MEDIA_SPEED_KIB", "media_speed_kib"),
+        ("MONITOR_AUTO_THROTTLE", "monitor_auto_throttle"),
         ("TEMP_DOWNLOAD_DIR", "temp_download_dir"),
     ):
         if name in values:
@@ -304,7 +308,13 @@ def load_settings(*, env_path: Path | None = None, session_path: Path | None = N
         ),
         temp_download_dir=staging_dir,
         session_path=session_path if session_path is not None else SESSION_PATH,
+        monitor_auto_throttle=parse_monitor_auto_throttle(raw("MONITOR_AUTO_THROTTLE")),
     )
+
+
+def parse_monitor_auto_throttle(raw: str | None) -> bool:
+    """An explicit, recognized per-account value is required to opt in."""
+    return (raw or "").strip().casefold() in {"1", "true", "yes", "on"}
 
 
 def _bounded_int(raw: str, name: str, minimum: int, maximum: int) -> int:

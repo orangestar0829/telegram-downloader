@@ -335,6 +335,7 @@ def test_media_settings_apply_atomically_and_persist(monkeypatch):
     app.media_retries_var = Var("2")
     app.chunk_concurrency_var = Var("1")
     app.media_speed_kib_var = Var("2048")
+    app.monitor_auto_throttle_var = Var(False)
     app._monitor_active = True
     app._monitor_active_transfers = 2
     app._monitor_live_concurrency = 2
@@ -397,6 +398,7 @@ def test_media_settings_save_failure_keeps_previous_values(monkeypatch):
     app.media_retries_var = Var("2")
     app.chunk_concurrency_var = Var("1")
     app.media_speed_kib_var = Var("512")
+    app.monitor_auto_throttle_var = Var(True)
     app._applied_media_settings = (1, 1, 1, 0)
     app._monitor_live_concurrency = 1
     app._monitor_live_speed_kib = 0
@@ -410,6 +412,7 @@ def test_media_settings_save_failure_keeps_previous_values(monkeypatch):
     assert app._applied_media_settings == (1, 1, 1, 0)
     assert app._monitor_live_concurrency == 1
     assert app._monitor_live_speed_kib == 0
+    assert not getattr(app, "_monitor_live_auto_throttle", False)
 
 
 def test_high_priority_preempts_two_busy_low_downloads(tmp_path, monkeypatch, capsys):
