@@ -57,6 +57,7 @@ from tgdl.cache_budget import optional_staging_reservation
 from tgdl.errors import ChannelAccessError
 from tgdl.history import DownloadHistory, PendingMedia
 from tgdl.paths import data_dir
+from tgdl.slots import SlotCoordinator
 from tgdl.progress import ProgressCallback, TransferProgress
 from tgdl.temp_cleanup import PEER_DOWNLOADS_DIR, is_link_or_reparse_point, own_temporary
 
@@ -674,6 +675,7 @@ async def download_channel(
     on_channel_resolved: Callable[[str, int], None] | None = None,
     temp_download_dir: Path | None = None,
     on_progress: ProgressCallback | None = None,
+    gui_slots: SlotCoordinator | None = None,
 ) -> DownloadStats:
     entity = await resolve_channel(client, target)
     title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
@@ -838,7 +840,7 @@ async def download_channel(
                 on_saved=saved_with_source,
                 stop_event=stop_event,
                 temp_download_dir=temp_download_dir,
-                on_progress=on_progress,
+                on_progress=on_progress, gui_slots=gui_slots,
             )
             if monitored and history is not None:
                 # A failed download is durably queued before committing cursor.
@@ -1254,6 +1256,8 @@ async def download_many(
     stop_event: threading.Event | None = None,
     temp_download_dir: Path | None = None,
     on_progress: ProgressCallback | None = None,
+    gui_slots: SlotCoordinator | None = None,
+    gallery_history: DownloadHistory | None = None,
 ) -> list[Path]:
     """Bounded multi-file concurrency (not parallel chunks of one video)."""
     if not 1 <= concurrency <= 8:
@@ -1275,25 +1279,62 @@ async def download_many(
             if path is not None:
                 saved.append(path)
 
+    waiting_for_capacity = False
+
+    async def transfer(message, dest_dir, base):
+        nonlocal waiting_for_capacity
+        token = None
+        ledger = history
+        try:
+            if gui_slots is not None:
+                key = (peer_id, message.id) if peer_id is not None else None
+                while True:
+                    if stop_event is not None and stop_event.is_set():
+                        return None
+                    # A cooperatively paused monitor can own the SQLite lease
+                    # without occupying a slot. Don't wait on its own file:
+                    # the ordinary scheduler yields to manual jobs.
+                    coordination_ledger = history if history is not None else gallery_history
+                    if (coordination_ledger is not None and peer_id is not None and
+                            coordination_ledger.has_live_claim(peer_id, message.id)):
+                        stats.skipped += 1
+                        return None
+                    workers = gui_slots.account_limit("default", concurrency)
+                    token = gui_slots.acquire("default", workers, file_key=key)
+                    if token is not None:
+                        if waiting_for_capacity:
+                            print("[手动下载] 普通名额已释放，继续下载。")
+                            waiting_for_capacity = False
+                        if gallery_history is not None and peer_id in gui_slots.reserved_peers():
+                            ledger = gallery_history
+                        break
+                    if gui_slots.ordinary_capacity("default", workers) == 0 and not waiting_for_capacity:
+                        print("[手动下载] 正在等待普通名额：实时频道已占满本账号名额。"
+                              "可暂停一个实时频道、提高并发或取消本次手动下载。")
+                        waiting_for_capacity = True
+                    await asyncio.sleep(0.1)
+            path = await _download_with_retry(
+                client, message, dest_dir, base, stats,
+                skip_existing=skip_existing, retries=retries,
+                chunk_concurrency=chunk_concurrency, history=ledger, peer_id=peer_id,
+                on_saved=on_saved, temp_download_dir=temp_download_dir, on_progress=on_progress,
+            )
+            if (path is not None and gallery_history is not None and ledger is None
+                    and gui_slots is not None and peer_id in gui_slots.reserved_peers()):
+                # Monitoring was enabled while this gallery file was in flight.
+                gallery_history.mark_saved(peer_id, message.id, dest_dir.name, path)
+            return path
+        finally:
+            if token is not None:
+                gui_slots.release(token)
+
     try:
         async for message, dest_dir, base in jobs:
             while len(pending) >= concurrency:
                 await collect_one()
             if stop_event is not None and stop_event.is_set():
                 break
-            pending.add(
-                asyncio.create_task(
-                    _download_with_retry(
-                        client, message, dest_dir, base, stats,
-                        skip_existing=skip_existing, retries=retries,
-                        chunk_concurrency=chunk_concurrency,
-                        history=history, peer_id=peer_id,
-                        on_saved=on_saved,
-                        temp_download_dir=temp_download_dir,
-                        on_progress=on_progress,
-                    )
-                )
-            )
+            pending.add(asyncio.create_task(transfer(message, dest_dir, base)))
         while pending:
             await collect_one()
     finally:

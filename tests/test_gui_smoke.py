@@ -162,7 +162,7 @@ def test_monitor_table_requests_five_rows_and_uses_vertical_scrollbar():
     resources = {}
 
     def widget(*args, **kwargs):
-        return SimpleNamespace(pack=lambda **kw: None)
+        return SimpleNamespace(pack=lambda **kw: None, trace_add=lambda *_a: None)
 
     def tree(*args, **kwargs):
         resources["tree_options"] = kwargs

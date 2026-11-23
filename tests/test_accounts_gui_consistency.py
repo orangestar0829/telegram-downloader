@@ -110,7 +110,11 @@ def test_manager_login_save_keeps_proxy_saved_from_main_window(tmp_path):
     window._selected_id = lambda: "account-b"
     window._fields = {key: FakeVar(original[key]) for key, _ in _ACCOUNT_FIELDS}
     window._loaded_fields = {key: var.get() for key, var in window._fields.items()}
-    window.app = SimpleNamespace(_log_account=lambda *_: None)
+    window.app = SimpleNamespace(
+        _log_account=lambda *_: None,
+        _slot_plan=lambda *args, **kwargs: None,
+        _refresh_slot_plan=lambda: None,
+    )
 
     # The main window saved a proxy while this window remained open; the
     # manager's Login button runs _save_settings before creating its client.

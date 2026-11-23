@@ -10,6 +10,7 @@ from tgdl.accounts import AccountRegistry
 from tgdl.config import update_env
 from tgdl.gui import _App
 from tgdl.monitor import load_channels, save_channels
+from tgdl.slots import SlotCoordinator
 
 
 class Var:
@@ -82,6 +83,7 @@ def _make_app(tmp_path):
     )
     app = _App.__new__(_App)
     app._account_registry = registry
+    app._slots = SlotCoordinator()
     app._view_account_id = "default"
     app._monitored = load_channels(registry.monitor_path("default"))
     app._view_monitored = []

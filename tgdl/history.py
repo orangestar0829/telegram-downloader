@@ -6,11 +6,15 @@ import sqlite3
 import time
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from tgdl.paths import prepare_data_dir
+
+_DEFAULT_BUSY_TIMEOUT_MS = 30_000
+_REALTIME_BUSY_TIMEOUT_MS = 25
 
 def default_history_path() -> Path:
     """Use the portable data folder, or the installed user's writable data."""
@@ -34,13 +38,23 @@ class DownloadHistory:
     file after cloud backup does not remove the row.
     """
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, *,
+                 busy_timeout_ms: int = _DEFAULT_BUSY_TIMEOUT_MS) -> None:
         self.path = Path(path) if path is not None else default_history_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._connection = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        self._busy_timeout_ms = max(0, int(busy_timeout_ms))
+        self._connection = sqlite3.connect(
+            self.path, timeout=self._busy_timeout_ms / 1_000, check_same_thread=False,
+        )
+        try:
+            self._init_schema()
+        except BaseException:
+            self._connection.close()
+            raise
+
+    def _init_schema(self) -> None:
         with self._lock, self._connection:
-            self._connection.execute("PRAGMA busy_timeout = 30000")
             # Serialize the PRAGMA/ALTER pairs across separate connections.
             self._connection.execute("BEGIN IMMEDIATE")
             self._connection.execute(
@@ -84,6 +98,20 @@ class DownloadHistory:
                     kind TEXT NOT NULL,
                     base TEXT NOT NULL,
                     PRIMARY KEY (peer_id, message_id)
+                )"""
+            )
+            pending_columns = {
+                row[1] for row in self._connection.execute("PRAGMA table_info(pending_media)")
+            }
+            if "realtime" not in pending_columns:
+                self._connection.execute(
+                    "ALTER TABLE pending_media ADD COLUMN realtime INTEGER NOT NULL DEFAULT 0"
+                )
+            self._connection.execute(
+                """CREATE TABLE IF NOT EXISTS realtime_cursor (
+                    account_id TEXT NOT NULL, peer_id INTEGER NOT NULL,
+                    epoch TEXT NOT NULL, completed_id INTEGER NOT NULL,
+                    PRIMARY KEY (account_id, peer_id)
                 )"""
             )
             self._connection.execute(
@@ -250,15 +278,120 @@ class DownloadHistory:
             )
             return queued
 
+    @contextmanager
+    def _realtime_transaction(self) -> Iterator[None]:
+        # This connection is shared with the ordinary worker. Limit how long
+        # new push work can block its loop on another SQLite writer; existing
+        # ordinary operations retain their established timeout.
+        with self._lock:
+            timeout = min(self._busy_timeout_ms, _REALTIME_BUSY_TIMEOUT_MS)
+            self._connection.execute(f"PRAGMA busy_timeout = {timeout}")
+            try:
+                with self._connection:
+                    self._connection.execute("BEGIN IMMEDIATE")
+                    yield
+            finally:
+                self._connection.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+
+    def realtime_cursor(self, account_id: str, peer_id: int, epoch: str) -> int | None:
+        with self._lock:
+            row = self._connection.execute(
+                """SELECT completed_id FROM realtime_cursor
+                   WHERE account_id=? AND peer_id=? AND epoch=?""",
+                (account_id, peer_id, epoch),
+            ).fetchone()
+            return int(row[0]) if row else None
+
+    def previous_realtime_boundary(self, account_id: str, peer_id: int) -> int | None:
+        """A conservative takeover watermark from another account's coverage."""
+        with self._lock:
+            value = self._connection.execute(
+                """SELECT MIN(completed_id) FROM realtime_cursor
+                   WHERE peer_id=? AND account_id<>?""",
+                (peer_id, account_id),
+            ).fetchone()[0]
+            return int(value) if value is not None else None
+
+    def start_realtime(
+        self, account_id: str, peer_id: int, epoch: str, baseline: int, *,
+        promote_before: int | None = None, kinds: frozenset[str] = frozenset(),
+    ) -> int:
+        """Record the tail/scheduled watermark and migrate existing cutover work."""
+        with self._realtime_transaction():
+            cursor = self.realtime_cursor(account_id, peer_id, epoch)
+            if cursor is not None:
+                return cursor
+            self._connection.execute(
+                """INSERT INTO realtime_cursor(account_id,peer_id,epoch,completed_id)
+                   VALUES (?,?,?,?) ON CONFLICT(account_id,peer_id) DO UPDATE SET
+                   epoch=excluded.epoch,completed_id=excluded.completed_id""",
+                (account_id, peer_id, epoch, baseline),
+            )
+            if promote_before is not None and kinds:
+                self._connection.execute(
+                    """UPDATE pending_media SET realtime=1
+                       WHERE peer_id=? AND message_id<=? AND realtime=0
+                       AND NOT (peer_id>0 AND target=('-'||peer_id))
+                       AND (kind='' OR instr(','||?||',', ','||kind||',')>0)
+                       AND NOT EXISTS (SELECT 1 FROM downloaded_media d
+                           WHERE d.peer_id=pending_media.peer_id
+                             AND d.message_id=pending_media.message_id)""",
+                    (peer_id, promote_before, ",".join(sorted(kinds))),
+                )
+            return baseline
+
+    def commit_realtime(self, account_id: str, peer_id: int, epoch: str,
+                        completed: int, items: list[PendingMedia], *,
+                        observed: set[int] | None = None) -> tuple[int, int | None]:
+        """Atomically enqueue and checkpoint a proven history range or push batch.
+
+        Out-of-order pushes are durable, but cannot move the cursor past a
+        missing predecessor. A different epoch cannot write anything, even
+        if its asynchronous task is still unwinding.
+        """
+        with self._realtime_transaction():
+            cursor = self.realtime_cursor(account_id, peer_id, epoch)
+            if cursor is None or completed <= cursor:
+                return 0, cursor
+            changed = 0
+            for item in items:
+                if item.peer_id != peer_id or not 0 < item.message_id <= completed:
+                    raise ValueError("Real-time queue item does not match its cursor")
+                if item.message_id <= cursor:
+                    continue
+                self._enqueue(item)
+                changed += self._connection.execute(
+                    """UPDATE pending_media SET realtime=1,
+                           kind=?
+                       WHERE peer_id=? AND message_id=? AND realtime=0
+                         AND NOT (peer_id>0 AND target=('-'||peer_id))""",
+                    (item.kind, peer_id, item.message_id),
+                ).rowcount
+            advance = completed
+            if observed is not None:
+                advance = cursor
+                while advance < completed and advance + 1 in observed:
+                    advance += 1
+            if advance > cursor:
+                self._connection.execute(
+                    """UPDATE realtime_cursor SET completed_id=?
+                       WHERE account_id=? AND peer_id=? AND epoch=?""",
+                    (advance, account_id, peer_id, epoch),
+                )
+            return changed, advance
+
     def pending_for_target(self, target: str, limit: int = 16, *,
                            account_id: str | None = None,
-                           kinds: set[str] | None = None) -> list[PendingMedia]:
+                           kinds: set[str] | None = None,
+                           realtime: bool | None = None) -> list[PendingMedia]:
+        order = "message_id" if realtime is True else "rowid"
         if account_id is None:
             with self._lock:
                 return [PendingMedia(*row) for row in self._connection.execute(
-                    """SELECT peer_id, message_id, target, title, kind, base
-                       FROM pending_media WHERE target=? ORDER BY rowid LIMIT ?""",
-                    (target, limit),
+                    f"""SELECT peer_id, message_id, target, title, kind, base
+                       FROM pending_media WHERE target=? AND (? IS NULL OR realtime=?)
+                       ORDER BY {order} LIMIT ?""",
+                    (target, realtime, realtime, limit),
                 )]
         # An old positive-ID row whose target explicitly uses the marked
         # basic-chat ID belongs to the old Chat namespace, not a Channel.
@@ -269,9 +402,10 @@ class DownloadHistory:
         selected = ",".join(sorted(kinds)) if kinds is not None else ""
         with self._lock:
             return [PendingMedia(*row) for row in self._connection.execute(
-                """SELECT p.peer_id,p.message_id,p.target,p.title,p.kind,p.base
+                f"""SELECT p.peer_id,p.message_id,p.target,p.title,p.kind,p.base
                    FROM pending_media p WHERE p.target=?
                    AND NOT (p.peer_id>0 AND p.target=('-'||p.peer_id))
+                   AND (? IS NULL OR p.realtime=?)
                    AND (?='' OR p.kind='' OR instr(','||?||',', ','||p.kind||',')>0)
                    AND NOT EXISTS (SELECT 1 FROM downloaded_media d
                        WHERE d.peer_id=p.peer_id AND d.message_id=p.message_id)
@@ -281,23 +415,26 @@ class DownloadHistory:
                    AND NOT EXISTS (SELECT 1 FROM account_attempt_backoff b
                        WHERE b.account_id=? AND b.peer_id=p.peer_id
                          AND b.message_id=p.message_id AND b.retry_after>?)
-                   ORDER BY p.rowid LIMIT ?""",
-                (target, selected, selected, now, account_id, now, limit),
+                   ORDER BY p.{order} LIMIT ?""",
+                (target, realtime, realtime, selected, selected, now, account_id, now, limit),
             )]
 
     def pending_for_peer(self, peer_id: int, *, account_id: str,
                          limit: int = 16, now: float | None = None,
-                         kinds: set[str] | None = None) -> list[PendingMedia]:
+                         kinds: set[str] | None = None,
+                         realtime: bool | None = None) -> list[PendingMedia]:
         """Claimable files by canonical peer, constrained to this monitor's media."""
+        order = "message_id" if realtime is True else "rowid"
         now = time.time() if now is None else now
         selected = ",".join(sorted(kinds)) if kinds is not None else ""
         if kinds is not None and not kinds:
             return []
         with self._lock:
             return [PendingMedia(*row) for row in self._connection.execute(
-                """SELECT p.peer_id,p.message_id,p.target,p.title,p.kind,p.base
+                f"""SELECT p.peer_id,p.message_id,p.target,p.title,p.kind,p.base
                    FROM pending_media p WHERE p.peer_id=?
                    AND NOT (p.peer_id>0 AND p.target=('-'||p.peer_id))
+                   AND (? IS NULL OR p.realtime=?)
                    AND (?='' OR p.kind='' OR instr(','||?||',', ','||p.kind||',')>0)
                    AND NOT EXISTS (SELECT 1 FROM downloaded_media d
                        WHERE d.peer_id=p.peer_id AND d.message_id=p.message_id)
@@ -307,8 +444,8 @@ class DownloadHistory:
                    AND NOT EXISTS (SELECT 1 FROM account_attempt_backoff b
                        WHERE b.account_id=? AND b.peer_id=p.peer_id
                          AND b.message_id=p.message_id AND b.retry_after>?)
-                   ORDER BY p.rowid LIMIT ?""",
-                (peer_id, selected, selected, now, account_id, now, limit),
+                   ORDER BY p.{order} LIMIT ?""",
+                (peer_id, realtime, realtime, selected, selected, now, account_id, now, limit),
             )]
 
     def try_claim(self, account_id: str, peer_id: int, message_id: int, *,
@@ -399,6 +536,10 @@ class DownloadHistory:
                WHERE peer_id=? AND message_id=? AND expires_at>?""",
             (peer_id, message_id, now),
         ).fetchone() is not None
+
+    def has_live_claim(self, peer_id: int, message_id: int) -> bool:
+        with self._lock:
+            return self._has_live_claim_locked(peer_id, message_id, time.time())
 
     def active_claims(self) -> list[tuple[int, int, str, float]]:
         with self._lock:

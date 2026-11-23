@@ -12,6 +12,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from contextlib import closing, nullcontext
+import threading
+
+from tgdl.history import DownloadHistory
+from tgdl.slots import SlotCoordinator
 from pathlib import Path
 from typing import Iterable
 from tgdl.progress import ProgressCallback
@@ -20,7 +25,7 @@ from tgdl.downloader import (
     DownloadStats,
     download_many,
     classify_message,
-    peer_download_folder,
+    peer_download_folder, history_peer_id,
 )
 
 
@@ -101,6 +106,8 @@ async def save_items(
     chunk_concurrency: int = 1,
     temp_download_dir: Path | None = None,
     on_progress: ProgressCallback | None = None,
+    gui_slots: SlotCoordinator | None = None,
+    stop_event: threading.Event | None = None,
 ) -> SaveResult:
     """Download the full-quality files for the selected media items."""
     folder = peer_download_folder(download_dir, title, entity)
@@ -118,13 +125,18 @@ async def save_items(
             base = f"{date.strftime('%Y%m%d')}_{item.id}"
             yield item.message, dest, base
 
-    saved_paths = await download_many(
-        client, jobs(), stats=stats, concurrency=concurrency,
-        retries=retries, skip_existing=skip_existing,
-        chunk_concurrency=chunk_concurrency,
-        temp_download_dir=temp_download_dir,
-        on_progress=on_progress,
-    )
+    peer = history_peer_id(entity) if gui_slots is not None else None
+    # A GUI gallery save may target the same message as an active subscription.
+    # Use the same key and history ledger for these channels. Ordinary gallery
+    # browsing in CLI/library callers retains its existing local-file behavior.
+    with closing(DownloadHistory()) if gui_slots is not None else nullcontext(None) as history:
+        saved_paths = await download_many(
+            client, jobs(), stats=stats, concurrency=concurrency,
+            retries=retries, skip_existing=skip_existing,
+            chunk_concurrency=chunk_concurrency,
+            temp_download_dir=temp_download_dir, on_progress=on_progress,
+            gallery_history=history, peer_id=peer, gui_slots=gui_slots, stop_event=stop_event,
+        )
     result = SaveResult(
         saved=stats.saved, skipped=stats.skipped, failed=stats.failed,
         files=sorted(saved_paths),

@@ -21,7 +21,26 @@ class DiagnosticTelegramClient(TelegramClient):
         super().__init__(*args, **kwargs)
         self._tgdl_flood_counts = {"FLOOD_WAIT": [0, 0], "FLOOD_PREMIUM_WAIT": [0, 0]}
         self._tgdl_rpc_counts: dict[str, int] = {}
+        self._tgdl_reconnect_callbacks = set()
         self._tgdl_observe_sender(self._sender)
+
+    def add_reconnect_callback(self, callback) -> None:
+        """Subscribe to successful reconnects of the main Telegram transport."""
+        self._tgdl_reconnect_callbacks.add(callback)
+
+    def remove_reconnect_callback(self, callback) -> None:
+        self._tgdl_reconnect_callbacks.discard(callback)
+
+    async def _handle_auto_reconnect(self):
+        # Telethon 1.46's public is_connected() remains true during automatic
+        # reconnect; it has no public reconnect event. Hook the same callback
+        # it registers with its main sender, preserving its normal handling.
+        for callback in tuple(self._tgdl_reconnect_callbacks):
+            try:
+                callback()
+            except Exception:
+                self._log[__name__].exception("Telegram reconnect observer failed")
+        await super()._handle_auto_reconnect()
 
     def flood_snapshot(self) -> dict[str, tuple[int, int]]:
         return {name: tuple(values) for name, values in self._tgdl_flood_counts.items()}

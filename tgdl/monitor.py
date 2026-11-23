@@ -4,8 +4,14 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from uuid import uuid4
 
 from tgdl.paths import prepare_data_dir
+
+
+SCHEDULED = "scheduled"
+REALTIME = "realtime"
+MONITOR_MODE_LABELS = {SCHEDULED: "定时扫描", REALTIME: "实时监听"}
 
 
 class MonitorDispatchSummary:
@@ -65,7 +71,8 @@ def next_due_channel(
     ready = sorted(
         (
             item for item in items
-            if item.get("enabled", True) and next_at.get(item["target"], 0) <= now
+            if item.get("enabled", True) and item.get("mode") != REALTIME
+            and next_at.get(item["target"], 0) <= now
         ),
         key=lambda item: -int(item.get("priority", 0)),
     )
@@ -104,6 +111,34 @@ def choose_monitor_download(
     return min(candidates, key=key)
 
 
+
+def configure_monitor_mode(row: dict, old: dict | None, mode: str, dialogs) -> None:
+    """Prepare a mode edit without mutating the existing saved row."""
+    row["mode"] = mode
+    if mode != REALTIME:
+        row.pop("realtime_epoch", None)
+        row.pop("realtime_backfill", None)
+        row.pop("realtime_since", None)
+        return
+    from tgdl.account_view import joined_channel_peer
+
+    previous = old or {}
+    peer = previous.get("peer_id")
+    if not isinstance(peer, int) or isinstance(peer, bool) or peer <= 0:
+        peer = joined_channel_peer(dialogs, row["target"])
+    row["peer_id"] = peer
+    previous_epoch = previous.get("realtime_epoch") if previous.get("mode") == REALTIME else None
+    row["realtime_epoch"] = previous_epoch or uuid4().hex
+    if not previous_epoch:
+        row["realtime_since"] = int(time.time())
+    elif "realtime_since" in previous:
+        row["realtime_since"] = previous["realtime_since"]
+    row["realtime_backfill"] = (
+        bool(previous.get("realtime_backfill", False)) if previous_epoch
+        else old is not None and previous.get("mode") != REALTIME
+    )
+
+
 def load_channels(path: Path | None = None) -> list[dict]:
     path = path or monitor_path()
     if not path.exists():
@@ -140,9 +175,23 @@ def load_channels(path: Path | None = None) -> list[dict]:
                 "enabled": bool(item.get("enabled", True)),
                 "direction": item.get("direction", "newest") if item.get("direction") in ("newest", "oldest") else "newest",
                 "name": str(item.get("name", "")).strip(),
+                "mode": REALTIME if item.get("mode") == REALTIME else SCHEDULED,
             })
-            if item.get("peer_id"):
-                result[-1]["peer_id"] = int(item["peer_id"])
+            try:
+                raw_peer_id = item.get("peer_id")
+                peer_id = 0 if isinstance(raw_peer_id, bool) else int(raw_peer_id or 0)
+            except (TypeError, ValueError):
+                peer_id = 0
+            if peer_id:
+                result[-1]["peer_id"] = peer_id
+            if result[-1]["mode"] == REALTIME:
+                epoch = item.get("realtime_epoch")
+                if isinstance(epoch, str) and epoch.strip():
+                    result[-1]["realtime_epoch"] = epoch.strip()
+                result[-1]["realtime_backfill"] = item.get("realtime_backfill") is True
+                since = item.get("realtime_since")
+                if type(since) is int and 0 < since < 2**32:
+                    result[-1]["realtime_since"] = since
     return result
 
 

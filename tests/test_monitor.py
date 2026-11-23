@@ -9,7 +9,7 @@ def test_channel_intervals_persist_independently(tmp_path):
     ]
     save_channels(items, path)
     assert load_channels(path) == [
-        dict(item, direction="newest", name="", priority=0, batch_size=100)
+        dict(item, direction="newest", name="", priority=0, batch_size=100, mode="scheduled")
         for item in items
     ]
     assert path.parent.name == "default"
@@ -40,7 +40,7 @@ def test_channel_name_is_preserved_across_restart(tmp_path):
          "direction": "oldest", "name": "测试频道"}
     ]
     save_channels(items, path)
-    assert load_channels(path) == [dict(item, priority=0, batch_size=100) for item in items]
+    assert load_channels(path) == [dict(item, priority=0, batch_size=100, mode="scheduled") for item in items]
 
 
 def test_channel_priority_and_batch_persist(tmp_path):

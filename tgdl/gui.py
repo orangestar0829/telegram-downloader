@@ -29,7 +29,7 @@ from telethon.errors import AuthKeyDuplicatedError, UnauthorizedError
 from tgdl.accounts import AccountRegistry, DEFAULT_ACCOUNT
 from tgdl.account_context import current_account_id
 from tgdl.account_identity import account_identity
-from tgdl.account_view import progress_owner
+from tgdl.account_view import monitor_enabled_label, progress_owner
 from tgdl.log_store import DailyLogStore
 
 from tgdl.browser import list_media, save_items
@@ -51,11 +51,13 @@ from tgdl.history import DownloadHistory
 from tgdl.login_dialog import TelegramLoginDialog
 from tgdl.log_format import LogChunk, TimestampedLines
 from tgdl.monitor import (
-    MonitorDispatchSummary, choose_monitor_download, load_channels, next_due_channel,
-    save_channels,
+    MONITOR_MODE_LABELS, REALTIME, SCHEDULED, MonitorDispatchSummary,
+    choose_monitor_download, configure_monitor_mode, load_channels, next_due_channel, save_channels,
 )
 
 from tgdl.paths import data_dir, monitor_migration_error
+from tgdl.slots import SlotCoordinator, make_plan
+from tgdl.realtime_runtime import RealtimeDispatch
 from tgdl.single_instance import AlreadyRunning, gui_instance_guard
 from tgdl.temp_cleanup import inspect_cleanup
 from tgdl.telethon_diagnostics import install_telethon_diagnostics
@@ -301,6 +303,12 @@ class _App:
         except (ValueError, OSError) as exc:
             self._monitored = []
             self._log_startup(f"[监控] 配置读取失败：{exc}\n")
+        self._slots = SlotCoordinator()
+        self._realtime_ready = RealtimeDispatch()
+        try:
+            self._refresh_slot_plan()
+        except (OSError, ValueError) as exc:
+            self._log_startup(f"[实时监控] 名额配置无效，未启动实时监听：{exc}\n")
         self._monitor_next: dict[str, float] = {}
         self._monitor_totals: dict[str, dict[str, int]] = {}
         self._monitor_scan_future = None
@@ -355,6 +363,26 @@ class _App:
         self.root.after_idle(self._check_saved_sessions_at_startup)
 
     # ---------- UI ----------
+    def _slot_plan(self, account_id=None, *, rows=None, concurrency=None):
+        # All config writes happen on Tk. Validate the complete proposed plan
+        # before publishing it to the file workers; do not validate only the tab
+        # which is currently selected (disabling may transfer ownership).
+        registry = self._account_registry
+        accounts = []
+        for account in registry.accounts():
+            selected = account.id == account_id
+            monitors = (rows if selected and rows is not None else
+                        load_channels(registry.monitor_path(account.id)))
+            workers = (concurrency if selected and concurrency is not None else
+                       int(read_env_values(registry.env_path(account.id))["media_concurrency"]))
+            accounts.append((account.id, workers, monitors))
+        return make_plan(accounts)
+
+    def _refresh_slot_plan(self, plan=None) -> None:
+        if not hasattr(self, "_slots"):
+            self._slots = SlotCoordinator()
+        self._slots.configure(self._slot_plan() if plan is None else plan)
+
     def _build_ui(self) -> None:
         tk, ttk = self.tk, self.ttk
         pad = {"padx": 6, "pady": 4}
@@ -571,22 +599,40 @@ class _App:
         controls.pack(fill="x", padx=6, pady=4)
         ttk.Label(controls, text="扫描间隔(分钟)").pack(side="left")
         self.monitor_minutes_var = tk.StringVar(value="15")
-        ttk.Entry(controls, textvariable=self.monitor_minutes_var, width=6).pack(side="left", padx=5)
+        minutes_entry = ttk.Entry(controls, textvariable=self.monitor_minutes_var, width=6)
+        minutes_entry.pack(side="left", padx=5)
         ttk.Label(controls, text="优先级").pack(side="left", padx=4)
         self.monitor_priority_var = tk.StringVar(value="0")
-        ttk.Entry(controls, textvariable=self.monitor_priority_var, width=5).pack(side="left")
+        priority_entry = ttk.Entry(controls, textvariable=self.monitor_priority_var, width=5)
+        priority_entry.pack(side="left")
         ttk.Label(controls, text="每轮数量").pack(side="left", padx=4)
         self.monitor_batch_var = tk.StringVar(value="100")
-        ttk.Entry(controls, textvariable=self.monitor_batch_var, width=7).pack(side="left")
+        batch_entry = ttk.Entry(controls, textvariable=self.monitor_batch_var, width=7)
+        batch_entry.pack(side="left")
         ttk.Label(controls, text="方向").pack(side="left", padx=4)
         self.monitor_direction_var = tk.StringVar(value="从新到旧")
-        ttk.Combobox(
+        direction_choice = ttk.Combobox(
             controls, textvariable=self.monitor_direction_var, state="readonly", width=10,
             values=("从新到旧", "从旧到新"),
-        ).pack(side="left", padx=4)
+        )
+        direction_choice.pack(side="left", padx=4)
         monitor_types = ttk.Frame(frame)
         monitor_types.pack(fill="x", padx=6, pady=(0, 3))
-        ttk.Label(monitor_types, text="监控下载类型（每个频道独立）:").pack(side="left")
+        ttk.Label(monitor_types, text="监控方式").pack(side="left")
+        self.monitor_mode_var = tk.StringVar(value=MONITOR_MODE_LABELS[SCHEDULED])
+
+        def update_scan_controls(*_):
+            realtime = self._monitor_form_mode() == REALTIME
+            for entry in (minutes_entry, priority_entry, batch_entry):
+                entry.configure(state="disabled" if realtime else "normal")
+            direction_choice.configure(state="disabled" if realtime else "readonly")
+
+        self.monitor_mode_var.trace_add("write", update_scan_controls)
+        ttk.Combobox(
+            monitor_types, textvariable=self.monitor_mode_var, state="readonly",
+            width=10, values=tuple(MONITOR_MODE_LABELS.values()),
+        ).pack(side="left", padx=(4, 12))
+        ttk.Label(monitor_types, text="下载类型:").pack(side="left")
         self.monitor_type_photo = tk.BooleanVar(value=True)
         self.monitor_type_video = tk.BooleanVar(value=True)
         self.monitor_type_anim = tk.BooleanVar(value=False)
@@ -599,7 +645,7 @@ class _App:
         ttk.Button(edit_actions, text="更新所选", command=self._monitor_update).pack(side="left", padx=4)
         ttk.Button(edit_actions, text="删除所选", command=self._monitor_remove).pack(side="left", padx=5)
         ttk.Button(edit_actions, text="启用/暂停所选", command=self._monitor_toggle).pack(side="left")
-        columns = ("name", "target", "types", "minutes", "priority", "batch_size", "direction", "enabled", "next")
+        columns = ("name", "target", "types", "minutes", "priority", "batch_size", "direction", "enabled", "next", "mode")
         table = ttk.Frame(frame)
         table.pack(fill="x", padx=6)
         self.monitor_tree = ttk.Treeview(table, columns=columns, show="headings", height=5)
@@ -615,7 +661,8 @@ class _App:
             ("batch_size", "每轮数量", 80),
             ("direction", "扫描方向", 85),
             ("enabled", "状态", 65),
-            ("next", "下次扫描", 135),
+            ("next", "下次扫描", 90),
+            ("mode", "监控方式", 80),
         ):
             self.monitor_tree.heading(column, text=label)
             self.monitor_tree.column(column, width=width)
@@ -629,6 +676,10 @@ class _App:
         ttk.Label(actions, text="停止会等文件下完；取消会中断下载并暂停监控", foreground="#555").pack(
             side="left", padx=10
         )
+        ttk.Label(
+            frame, text="实时监听仅处理新消息及断线补漏；独占 1 个文件下载位。同一频道跨账号只占 1 位。",
+            foreground="#555",
+        ).pack(anchor="w", padx=6)
         self._monitor_refresh()
         return frame
 
@@ -637,19 +688,28 @@ class _App:
         monitors = self._visible_monitors()
         due_map = self._visible_monitor_next()
         is_running = self._visible_monitor_running()
+        account_id = self._selected_view_account()
+        slots = getattr(self, "_slots", None)
         expected = {str(i) for i in range(len(monitors))}
         for iid in self.monitor_tree.get_children():
             if iid not in expected:
                 self.monitor_tree.delete(iid)
         for index, item in enumerate(monitors):
+            mode = item.get("mode", SCHEDULED)
+            realtime = mode == REALTIME
             due = due_map.get(item["target"])
-            next_time = time.strftime("%H:%M:%S", time.localtime(due)) if due and item["enabled"] and is_running else "-"
+            next_time = (
+                time.strftime("%H:%M:%S", time.localtime(due))
+                if not realtime and due and item["enabled"] and is_running else "-"
+            )
             values = (
                 item.get("name") or "（待获取）", item["target"],
-                self._monitor_types_label(item.get("types", "photo,video")), item["minutes"],
-                item.get("priority", 0), item.get("batch_size", 100),
-                "旧→新" if item.get("direction") == "oldest" else "新→旧",
-                "启用" if item["enabled"] else "暂停", next_time,
+                self._monitor_types_label(item.get("types", "photo,video")),
+                "-" if realtime else item["minutes"],
+                "-" if realtime else item.get("priority", 0),
+                "-" if realtime else item.get("batch_size", 100),
+                "-" if realtime else ("旧→新" if item.get("direction") == "oldest" else "新→旧"),
+                monitor_enabled_label(item, account_id, slots), next_time, MONITOR_MODE_LABELS[mode],
             )
             iid = str(index)
             if self.monitor_tree.exists(iid):
@@ -668,6 +728,9 @@ class _App:
         for item in self._monitored:
             if item["target"] != target:
                 continue
+            if (item.get("mode") == REALTIME and peer_id is not None
+                    and int(peer_id) != item.get("peer_id")):
+                break  # A scheduled scan already in flight cannot change enrollment.
             changed = False
             if title and title != item.get("name"):
                 item["name"] = title
@@ -680,40 +743,54 @@ class _App:
                 self._monitor_refresh()
             break
 
+    def _monitor_form_mode(self) -> str:
+        variable = getattr(self, "monitor_mode_var", None)
+        return REALTIME if variable is not None and variable.get() == MONITOR_MODE_LABELS[REALTIME] else SCHEDULED
+
+    def _monitor_candidate(self, target: str, old: dict | None, *, name: str = "") -> dict:
+        mode = self._monitor_form_mode()
+        if mode == REALTIME:
+            saved = old or {}
+            minutes, priority, batch_size = (
+                saved.get("minutes", 15), saved.get("priority", 0), saved.get("batch_size", 100),
+            )
+        else:
+            minutes, priority, batch_size = self._monitor_form_values()
+        types = self._monitor_types_string()
+        if not types:
+            raise ValueError("至少选择一种监控下载类型")
+        row = {
+            **(old or {}), "target": target, "minutes": minutes, "types": types,
+            "enabled": (old or {}).get("enabled", True),
+            "direction": "oldest" if self.monitor_direction_var.get() == "从旧到新" else "newest",
+            "name": (old or {}).get("name") or name, "priority": priority, "batch_size": batch_size,
+        }
+        configure_monitor_mode(row, old, mode, getattr(self, "_dialog_rows", ()))
+        return row
+
     def _monitor_add(self):
         target = self._selected_target()
         if not target:
             self.messagebox.showwarning("监控", "请先选择或输入频道")
             return
+        selected = self.tree.selection()
+        selected_name = ""
+        if selected:
+            values = self.tree.item(selected[0], "values")
+            if values and str(values[0]) == target and len(values) > 2:
+                selected_name = str(values[2])
         try:
-            minutes, priority, batch_size = self._monitor_form_values()
-        except ValueError as exc:
-            self.messagebox.showwarning("监控", str(exc))
+            rows = self._read_visible_monitor_rows()
+            old = next((item for item in rows if item["target"] == target), None)
+            item = self._monitor_candidate(target, old, name=selected_name)
+            item["enabled"] = True
+            rows = [row for row in rows if row["target"] != target] + [item]
+            self._save_visible_monitors(rows)
+        except (ValueError, OSError) as exc:
+            self.messagebox.showwarning("监控配置无效", str(exc))
             return
-        types = self._monitor_types_string()
-        if not types:
-            self.messagebox.showwarning("监控", "至少选择一种下载类型")
-            return
-        monitors = self._visible_monitors()
-        existing_name = next(
-            (item.get("name", "") for item in monitors if item["target"] == target),
-            "",
-        )
-        if not existing_name:
-            selected = self.tree.selection()
-            if selected:
-                values = self.tree.item(selected[0], "values")
-                if values and str(values[0]) == target and len(values) > 2:
-                    existing_name = str(values[2])
         self.monitor_tree.selection_remove(self.monitor_tree.selection())
-        monitors[:] = [item for item in monitors if item["target"] != target]
-        monitors.append({
-            "target": target, "minutes": minutes, "types": types, "enabled": True,
-            "direction": "oldest" if self.monitor_direction_var.get() == "从旧到新" else "newest",
-            "name": existing_name, "priority": priority, "batch_size": batch_size,
-        })
         self._visible_monitor_next()[target] = time.time()
-        self._save_visible_monitors()
         self._monitor_refresh()
 
     def _monitor_selected_index(self):
@@ -731,33 +808,32 @@ class _App:
             self.monitor_direction_var.set(
                 "从旧到新" if item.get("direction") == "oldest" else "从新到旧"
             )
+            mode_var = getattr(self, "monitor_mode_var", None)
+            if mode_var is not None:
+                mode_var.set(MONITOR_MODE_LABELS[item.get("mode", SCHEDULED)])
             self._monitor_set_types(item.get("types", "photo,video"))
 
     def _monitor_update(self):
         index = self._monitor_selected_index()
-        if index is None:
+        visible = self._visible_monitors()
+        if index is None or index >= len(visible):
             self.messagebox.showwarning("监控", "请先在监控列表中选一个频道")
             return
+        target = visible[index]["target"]
         try:
-            minutes, priority, batch_size = self._monitor_form_values()
-        except ValueError as exc:
-            self.messagebox.showwarning("监控", str(exc))
+            rows = self._read_visible_monitor_rows()
+            row_index = next((i for i, item in enumerate(rows) if item["target"] == target), None)
+            if row_index is None:
+                raise ValueError("此频道已被移除，请重新选择。")
+            rows[row_index] = self._monitor_candidate(target, rows[row_index])
+            self._save_visible_monitors(rows)
+        except (ValueError, OSError) as exc:
+            self.messagebox.showwarning("监控配置无效", str(exc))
             return
-        types = self._monitor_types_string()
-        if not types:
-            self.messagebox.showwarning("监控", "至少选择一种监控下载类型")
-            return
-        item = self._visible_monitors()[index]
-        item["minutes"] = minutes
-        item["priority"] = priority
-        item["batch_size"] = batch_size
-        item["direction"] = "oldest" if self.monitor_direction_var.get() == "从旧到新" else "newest"
-        item["types"] = types
         if self._selected_view_account() == "default":
-            self._monitor_batch_used.pop(item["target"], None)
-            self._monitor_totals.pop(item["target"], None)
-        self._visible_monitor_next()[item["target"]] = time.time()
-        self._save_visible_monitors()
+            self._monitor_batch_used.pop(target, None)
+            self._monitor_totals.pop(target, None)
+        self._visible_monitor_next()[target] = time.time()
         self._monitor_refresh()
 
     @staticmethod
@@ -804,28 +880,40 @@ class _App:
         return minutes, priority, batch_size
 
     def _monitor_remove(self):
-        index = self._monitor_selected_index()
-        if index is not None:
-            self.monitor_tree.selection_remove(self.monitor_tree.selection())
-            item = self._visible_monitors().pop(index)
-            self._visible_monitor_next().pop(item["target"], None)
-            if self._selected_view_account() == "default":
-                self._monitor_batch_used.pop(item["target"], None)
-                self._monitor_totals.pop(item["target"], None)
-            self._save_visible_monitors()
-            self._monitor_refresh()
+        self._monitor_edit_enabled(remove=True)
 
     def _monitor_toggle(self):
+        self._monitor_edit_enabled(remove=False)
+
+    def _monitor_edit_enabled(self, *, remove: bool) -> None:
         index = self._monitor_selected_index()
-        if index is not None:
-            item = self._visible_monitors()[index]
-            item["enabled"] = not item["enabled"]
-            if self._selected_view_account() == "default":
-                self._monitor_batch_used.pop(item["target"], None)
-                self._monitor_totals.pop(item["target"], None)
-            self._visible_monitor_next()[item["target"]] = time.time()
-            self._save_visible_monitors()
-            self._monitor_refresh()
+        visible = self._visible_monitors()
+        if index is None or index >= len(visible):
+            return
+        target = visible[index]["target"]
+        try:
+            rows = self._read_visible_monitor_rows()
+            row_index = next((i for i, item in enumerate(rows) if item["target"] == target), None)
+            if row_index is None:
+                raise ValueError("此频道已被移除，请重新选择。")
+            if remove:
+                rows.pop(row_index)
+            else:
+                item = rows[row_index]
+                rows[row_index] = {**item, "enabled": not item.get("enabled", True)}
+            self._save_visible_monitors(rows)
+        except (ValueError, OSError) as exc:
+            self.messagebox.showwarning("监控配置无效", str(exc))
+            return
+        if remove:
+            self.monitor_tree.selection_remove(self.monitor_tree.selection())
+            self._visible_monitor_next().pop(target, None)
+        else:
+            self._visible_monitor_next()[target] = time.time()
+        if self._selected_view_account() == "default":
+            self._monitor_batch_used.pop(target, None)
+            self._monitor_totals.pop(target, None)
+        self._monitor_refresh()
 
     def _primary_monitor_draining(self) -> bool:
         return not getattr(self, "_monitor_active", False) and any(
@@ -924,6 +1012,7 @@ class _App:
         try:
             registry = getattr(self, "_account_registry", None)
             path = registry.env_path(account_id) if registry is not None else None
+            plan = self._slot_plan(account_id, concurrency=workers) if registry is not None else None
             values = read_env_values(path) if path is not None else read_env_values()
             values.update(
                 media_concurrency=str(workers), media_retries=str(retries),
@@ -933,9 +1022,11 @@ class _App:
                 update_env(values)
             else:
                 update_env(values, path)
-        except OSError as exc:
+        except (ValueError, OSError) as exc:
             self.messagebox.showwarning("下载设置", f"保存失败，设置未生效：{exc}")
             return
+        if plan is not None:
+            self._refresh_slot_plan(plan)
         if account_id != "default":
             self._log_account(account_id, (
                 f"[下载设置] 已保存｜文件并发{workers}｜重试{retries}｜"
@@ -1070,15 +1161,38 @@ class _App:
             self._monitor_next[target] = time.time()
 
     async def _monitor_download_worker(self, concurrency: int, retries: int, chunks: int):
+        from tgdl.realtime_runtime import supervise
+        control = getattr(self, "_slots", None)
+        watcher = None
+        if control is not None and getattr(self, "_monitor_active", False):
+            stop = self._monitor_scan_stop
+            watcher = asyncio.create_task(supervise(
+                account_id="default", slots=control, ready=self._realtime_ready,
+                get_client=lambda: self.client, active=lambda: not stop.is_set(),
+                finished=stop.is_set, path=self._account_registry.root / "tgdl_download_history.sqlite3",
+                log=lambda message: self._log(message + "\n"),
+            ))
+        try:
+            await self._monitor_download_dispatch(concurrency, retries, chunks)
+        finally:
+            if watcher is not None:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+
+    async def _monitor_download_dispatch(self, concurrency: int, retries: int, chunks: int):
         """Consume durable media jobs independently from the channel scanner."""
         from tgdl.downloader import (
             DownloadLeaseLost, DownloadStats, _download_with_retry, peer_download_folder,
         )
         from tgdl.monitor_flow import MonitorFlow, MonitorPause, SharedSpeedLimiter
+        from tgdl.slots import SlotCoordinator
+        slots = getattr(self, "_slots", None) or SlotCoordinator()
         self._monitor_worker_task = asyncio.current_task()
         history = DownloadHistory()
         active = {}
         active_jobs = {}
+        active_slots = {}
+        realtime_jobs: set[tuple[int, int]] = set()
         claims: dict[tuple[int, int], str] = {}
         retiring: set[tuple[int, int]] = set()
         committed: set[str] = set()
@@ -1094,6 +1208,133 @@ class _App:
         pause_delay_reported: set[tuple[int, int]] = set()
         paused_since: dict[tuple[int, int], float] = {}
         limiter = SharedSpeedLimiter(getattr(self, "_monitor_live_speed_kib", 0) * 1024)
+
+        async def wait_for_work(delay):
+            live = getattr(self, "_realtime_ready", None)
+            if isinstance(live, RealtimeDispatch) and live.service is not None:
+                await live.wait(delay)
+            else:
+                await asyncio.sleep(delay)
+
+        def release_slot(key):
+            slot = active_slots.pop(key, None)
+            if slot is not None:
+                slots.release(slot)
+
+        def launch(item, job, workers, *, realtime=False):
+            key = (job.peer_id, job.message_id)
+            if not realtime and job.peer_id in slots.reserved_peers():
+                return False
+            slot = slots.acquire("default", workers, job.peer_id if realtime else None,
+                                 file_key=key, scheduled_monitor=not realtime)
+            if slot is None:
+                return False
+            token = None
+            try:
+                token = history.try_claim("default", *key)
+                if token is None or self._monitor_download_stop.is_set():
+                    return False
+                label = "实时下载" if realtime else "监控下载"
+                pause = MonitorPause()
+                flow = MonitorFlow(
+                    pause=pause,
+                    limiter=limiter,
+                    chunks=lambda: getattr(self, "_monitor_live_chunks", None) or chunks,
+                )
+                settings = self.settings
+                if settings.temp_download_dir is not None:
+                    staged_jobs.add(key)
+
+                async def transfer(job=job, flow=flow, target=item["target"],
+                                   media_types=item.get("types", "photo,video"),
+                                   transfer_settings=settings, claim_token=token):
+                    cooldown = 0
+                    try:
+                        # Real-time mode is only for channels already joined;
+                        # legacy scheduled/manual invite behaviour is unchanged.
+                        if item.get("mode") == "realtime":
+                            from tgdl.realtime import resolve_realtime_peer
+                            entity = await resolve_realtime_peer(
+                                self.client, target, expected_peer_id=job.peer_id,
+                            )
+                        else:
+                            entity = await resolve_channel(self.client, target)
+                        resolved_peer = _downloader.history_peer_id(entity)
+                        if resolved_peer != job.peer_id:
+                            cooldown = 3600
+                            title = getattr(entity, "title", None) or job.title
+                            self.root.after(0, lambda: self._monitor_set_name(
+                                target, title, resolved_peer
+                            ))
+                            print("[监控] 监控目标与队列记录不符，跳过旧任务并重新识别频道")
+                            return
+                        message = await self.client.get_messages(entity, ids=job.message_id)
+                        if message is None or message.date is None:
+                            cooldown = 3600
+                            print(f"[监控] {target}/{job.message_id} 在本账号不可读取")
+                            return
+                        if item.get("mode") == "realtime" and getattr(message, "noforwards", False):
+                            cooldown = 3600
+                            print(f"[实时下载] 跳过受保护的消息 {target}/{job.message_id}")
+                            return
+                        kind = job.kind or _downloader.classify_message(message)
+                        if kind is None or kind not in {
+                            value.strip() for value in media_types.split(",") if value.strip()
+                        }:
+                            cooldown = 3600
+                            return
+                        folder = peer_download_folder(
+                            transfer_settings.download_dir,
+                            getattr(entity, "title", None) or job.title, entity,
+                        ) / ("photos" if kind == "photo" else "videos")
+                        stats = DownloadStats()
+                        path = await _download_with_retry(
+                            self.client, message, folder,
+                            job.base or f"{message.date.strftime('%Y%m%d')}_{message.id}",
+                            stats, skip_existing=True,
+                            retries=getattr(self, "_monitor_live_retries", retries),
+                            chunk_concurrency=chunks, history=history,
+                            peer_id=job.peer_id, account_id="default", claim_token=claim_token,
+                            on_claim_committed=lambda: committed.add(claim_token),
+                            on_saved=lambda detail: self._log_download(f"[{label}] [{job.title}] {detail}"),
+                            temp_download_dir=transfer_settings.temp_download_dir,
+                            on_progress=self._update_download_progress,
+                            monitor_flow=flow,
+                        )
+                        if stats.failed:
+                            cooldown = 60
+                        elif path is None and not history.contains(job.peer_id, job.message_id):
+                            cooldown = 300
+                    except asyncio.CancelledError:
+                        raise
+                    except DownloadLeaseLost:
+                        print(f"[监控] 下载租约已失效，放弃保存 {job.title}/{job.message_id}")
+                    except Exception as exc:
+                        cooldown = 60
+                        print(f"[监控] 下载 {job.title}/{job.message_id} 失败：{exc}")
+                    finally:
+                        # Keep the global pending row retryable by another
+                        # eligible account instead of deleting it on failure.
+                        history.release_claim(
+                            "default", job.peer_id, job.message_id,
+                            token=claim_token, cooldown=cooldown,
+                        )
+                active[key] = asyncio.create_task(transfer())
+                active_jobs[key] = job
+                active_slots[key] = slot
+                if realtime:
+                    realtime_jobs.add(key)
+                claims[key] = token
+                pauses[key] = pause
+                active_target[key] = item["target"]
+                active_started[key] = time.monotonic()
+                return True
+            finally:
+                if key not in active:
+                    slots.release(slot)
+                    if token is not None:
+                        history.release_claim("default", *key, token=token)
+
         try:
             await self._ensure_client()
             last_lease_refresh = time.monotonic()
@@ -1105,7 +1346,10 @@ class _App:
                 finished = [key for key, task in active.items() if task.done()]
                 for key in finished:
                     task = active.pop(key)
+                    release_slot(key)
                     token = claims.pop(key)
+                    was_realtime = key in realtime_jobs
+                    realtime_jobs.discard(key)
                     retiring.discard(key)
                     committed.discard(token)
                     active_jobs.pop(key)
@@ -1117,7 +1361,7 @@ class _App:
                     paused_since.pop(key, None)
                     target = active_target.pop(key)
                     started_at = active_started.pop(key)
-                    if key not in suspended_accounted:
+                    if not was_realtime and key not in suspended_accounted:
                         occupied_seconds[target] = (
                             occupied_seconds.get(target, 0.0)
                             + max(0.0, time.monotonic() - started_at)
@@ -1144,15 +1388,37 @@ class _App:
                             task.cancel()
                             print(f"[监控] 下载租约已失效，停止任务 {key}")
                     last_lease_refresh = now_lease
+                effective_concurrency = getattr(self, "_monitor_live_concurrency", None) or concurrency
+                ordinary_capacity = slots.ordinary_capacity("default", effective_concurrency)
+                reserved = slots.reserved_peers()
+                by_target = {item["target"]: item for item in self._monitored}
+                # A paused file normally keeps its durable claim while yielding
+                # its permit. If an edit removed its lane, however, it could
+                # never resume: retire it without deleting the pending row.
+                for key, ctl in pauses.items():
+                    if key in retiring or not ctl.suspended:
+                        continue
+                    release_slot(key)
+                    item = by_target.get(active_target[key])
+                    if (ordinary_capacity == 0 or item is None
+                            or item.get("mode") == "realtime" or key[0] in reserved):
+                        retiring.add(key)
+                        active[key].cancel()
+                        print(f"[调度] {active_target[key]} 的暂停任务已返回队列｜普通下载名额或监控目标已变更")
                 if self._monitor_download_stop.is_set():
-                    # Drain already-started files (including paused ones)
-                    # while continuing their lease heartbeat. Do not claim
-                    # anything new, even if a transfer frees a slot.
+                    # Drain already-started files and renew their leases; do
+                    # not borrow an idle reservation to resume a paused file.
                     for key, ctl in pauses.items():
-                        if key not in retiring and ctl.requested:
-                            ctl.resume()
-                            self._monitor_progress_state(key[0], key[1], "恢复中")
-                    self._monitor_active_transfers = len(active)
+                        if key in retiring or not ctl.requested:
+                            continue
+                        if key not in active_slots:
+                            slot = slots.acquire("default", effective_concurrency, file_key=key, scheduled_monitor=True)
+                            if slot is None:
+                                continue
+                            active_slots[key] = slot
+                        ctl.resume()
+                        self._monitor_progress_state(key[0], key[1], "恢复中")
+                    self._monitor_active_transfers = len(active_slots)
                     self._monitor_total_transfers = len(active)
                     if active:
                         await asyncio.sleep(0.25)
@@ -1192,28 +1458,53 @@ class _App:
                             f"[调度] 等待暂停 {active_target[key]} 的下载任务｜"
                             "当前网络请求尚未到安全暂停点，优先任务暂时等待"
                         )
-                running_keys = [
-                    key for key, ctl in pauses.items() if key in retiring or not ctl.suspended
-                ]
+                running_keys = list(active_slots)
+                ordinary_running = [key for key in running_keys if key not in realtime_jobs]
                 if not any(ctl.suspended or ctl.requested for ctl in pauses.values()):
                     priority_logged = False
                 self._monitor_active_transfers = len(running_keys)
                 self._monitor_total_transfers = len(active)
-                # Preserve the existing manual download behaviour: don't
-                # launch new monitor transfers while a manual job is running.
+                ready = getattr(self, "_realtime_ready", ())
+                # Each channel's real-time lane is independent of scheduled
+                # priority and never runs (or preempts) an ordinary file.
+                started_realtime = False
+                for item in self._monitored:
+                    peer = item.get("peer_id")
+                    if (item.get("mode") != "realtime" or not item["enabled"]
+                            or peer not in ready or not slots.owns("default", peer)
+                            or not slots.available("default", effective_concurrency, peer)):
+                        continue
+                    kinds = {value.strip() for value in item.get("types", "photo,video").split(",")
+                             if value.strip()}
+                    for job in history.pending_for_peer(
+                        peer, account_id="default", limit=16, kinds=kinds, realtime=True,
+                    ):
+                        key = (job.peer_id, job.message_id)
+                        if key in active or not slots.available(
+                            "default", effective_concurrency, peer, file_key=key,
+                        ):
+                            continue
+                        started_realtime = launch(item, job, effective_concurrency, realtime=True)
+                        if started_realtime:
+                            break
+                    if started_realtime:
+                        self._monitor_active_transfers = len(running_keys) + 1
+                        break
+                if started_realtime:
+                    continue
+                # Preserve existing manual priority for *ordinary* monitor
+                # work; real-time can independently use its reserved slot.
                 manual_busy = self._download_future is not None and not self._download_future.done()
-                # Only the live monitor limit changes. In-flight files are
-                # never preempted when the user reduces the limit.
-                effective_concurrency = getattr(self, "_monitor_live_concurrency", None) or concurrency
-                if not manual_busy:
+                if not manual_busy and ordinary_capacity:
                     candidates = sorted(
                         (
                             item for item in self._monitored
-                            if item["enabled"] or any(
+                            if item.get("mode") != "realtime" and item.get("peer_id") not in reserved
+                            and (item["enabled"] or any(
                                 key not in retiring and ctl.suspended
                                 and active_target[key] == item["target"]
                                 for key, ctl in pauses.items()
-                            )
+                            ))
                         ),
                         key=lambda item: -int(item.get("priority", 0)),
                     )
@@ -1233,9 +1524,10 @@ class _App:
                             value.strip() for value in item.get("types", "photo,video").split(",")
                             if value.strip()
                         }
-                        if item.get("peer_id"):
+                        peer = item.get("peer_id")
+                        if peer:
                             eligible_jobs = history.pending_for_peer(
-                                item["peer_id"], account_id="default", limit=16,
+                                peer, account_id="default", limit=16,
                                 kinds=enabled_kinds,
                             )
                         else:
@@ -1244,14 +1536,14 @@ class _App:
                                 kinds=enabled_kinds,
                             )
                         for job in eligible_jobs:
-                            if (job.peer_id, job.message_id) not in active:
+                            if job.peer_id not in reserved and (job.peer_id, job.message_id) not in active:
                                 pending.append((item, job))
                                 break
                     # Staged transfers may hold the SSD reservation for the
                     # entire file. Pausing one while starting another could
                     # make the new transfer wait for that paused reservation.
                     # With staging, switch priorities only at the next free slot.
-                    if pending and not staged_jobs and len(running_keys) >= effective_concurrency:
+                    if pending and not staged_jobs and len(ordinary_running) >= ordinary_capacity:
                         high_priority = max(int(item.get("priority", 0)) for item, _ in pending)
                         priority_by_target = {
                             item["target"]: int(item.get("priority", 0))
@@ -1262,7 +1554,7 @@ class _App:
                             for ctl in pauses.values()
                         )
                         victims = [
-                            key for key in running_keys
+                            key for key in ordinary_running
                             if key not in retiring and not pauses[key].requested
                             and priority_by_target.get(active_target[key], 0) < high_priority
                         ]
@@ -1276,16 +1568,16 @@ class _App:
                             )
                             pauses[victim].pause()
                             pause_requested_at[victim] = time.monotonic()
-                            await asyncio.sleep(0.1)
+                            await wait_for_work(0.1)
                             continue
-                    if len(running_keys) >= effective_concurrency:
-                        await asyncio.sleep(0.25)
+                    if not slots.available("default", effective_concurrency):
+                        await wait_for_work(0.25)
                         continue
                     active_counts: dict[str, int] = {}
                     current_occupied = dict(occupied_seconds)
                     now = time.monotonic()
                     for key, target in active_target.items():
-                        if pauses[key].suspended:
+                        if key in realtime_jobs or pauses[key].suspended:
                             continue
                         active_counts[target] = active_counts.get(target, 0) + 1
                         current_occupied[target] = (
@@ -1305,12 +1597,12 @@ class _App:
                                     (item.get("priority", 0) for item in candidates
                                      if item["target"] == active_target[key]), 0
                                 ))
-                                for key in running_keys
+                                for key in ordinary_running
                             ),
                             default=None,
                         )
                         if highest_running is not None and highest_running > highest:
-                            await asyncio.sleep(0.25)
+                            await wait_for_work(0.25)
                             continue  # Higher-priority transfer has not finished yet.
                         matching = [
                             pair for pair in pending
@@ -1333,6 +1625,11 @@ class _App:
                         item, job = selected
                         key = (job.peer_id, job.message_id)
                         if key in active:
+                            slot = slots.acquire("default", effective_concurrency, file_key=key, scheduled_monitor=True)
+                            if slot is None:
+                                await wait_for_work(0.25)
+                                continue
+                            active_slots[key] = slot
                             paused_since.pop(key, None)
                             suspended_accounted.discard(key)
                             active_started[key] = time.monotonic()
@@ -1340,100 +1637,16 @@ class _App:
                             self._monitor_progress_state(key[0], key[1], "恢复中")
                             dispatch_log.add("resumed", item.get("name") or item["target"])
                             continue
-                        token = history.try_claim("default", job.peer_id, job.message_id)
-                        if token is None:
-                            await asyncio.sleep(0.03)
+                        if not launch(item, job, effective_concurrency):
+                            await wait_for_work(0.03)
                             continue
-                        if self._monitor_download_stop.is_set():
-                            history.release_claim("default", job.peer_id, job.message_id, token=token)
-                            continue
-                        pause = MonitorPause()
-                        preempted = any(ctl.suspended for ctl in pauses.values())
-                        flow = MonitorFlow(
-                            pause=pause,
-                            limiter=limiter,
-                            chunks=lambda: getattr(self, "_monitor_live_chunks", None) or chunks,
-                        )
-                        settings = self.settings
-                        if settings.temp_download_dir is not None:
-                            staged_jobs.add(key)
-
-                        async def transfer(job=job, flow=flow, target=item["target"],
-                                           media_types=item.get("types", "photo,video"),
-                                           transfer_settings=settings, claim_token=token):
-                            cooldown = 0
-                            try:
-                                # Always resolve with the account's own channel target.
-                                entity = await resolve_channel(self.client, target)
-                                resolved_peer = _downloader.history_peer_id(entity)
-                                if resolved_peer != job.peer_id:
-                                    cooldown = 3600
-                                    title = getattr(entity, "title", None) or job.title
-                                    self.root.after(0, lambda: self._monitor_set_name(
-                                        target, title, resolved_peer
-                                    ))
-                                    print("[监控] 监控目标与队列记录不符，跳过旧任务并重新识别频道")
-                                    return
-                                message = await self.client.get_messages(entity, ids=job.message_id)
-                                if message is None or message.date is None:
-                                    cooldown = 3600
-                                    print(f"[监控] {target}/{job.message_id} 在本账号不可读取")
-                                    return
-                                kind = job.kind or _downloader.classify_message(message)
-                                if kind is None or kind not in {
-                                    value.strip() for value in media_types.split(",") if value.strip()
-                                }:
-                                    cooldown = 3600
-                                    return
-                                folder = peer_download_folder(
-                                    transfer_settings.download_dir,
-                                    getattr(entity, "title", None) or job.title, entity,
-                                ) / ("photos" if kind == "photo" else "videos")
-                                stats = DownloadStats()
-                                path = await _download_with_retry(
-                                    self.client, message, folder,
-                                    job.base or f"{message.date.strftime('%Y%m%d')}_{message.id}",
-                                    stats, skip_existing=True,
-                                    retries=getattr(self, "_monitor_live_retries", retries),
-                                    chunk_concurrency=chunks, history=history,
-                                    peer_id=job.peer_id, account_id="default", claim_token=claim_token,
-                                    on_claim_committed=lambda: committed.add(claim_token),
-                                    on_saved=lambda detail: self._log_download(f"[监控下载] [{job.title}] {detail}"),
-                                    temp_download_dir=transfer_settings.temp_download_dir,
-                                    on_progress=self._update_download_progress,
-                                    monitor_flow=flow,
-                                )
-                                if stats.failed:
-                                    cooldown = 60
-                                elif path is None and not history.contains(job.peer_id, job.message_id):
-                                    cooldown = 300
-                            except asyncio.CancelledError:
-                                raise
-                            except DownloadLeaseLost:
-                                print(f"[监控] 下载租约已失效，放弃保存 {job.title}/{job.message_id}")
-                            except Exception as exc:
-                                cooldown = 60
-                                print(f"[监控] 下载 {job.title}/{job.message_id} 失败：{exc}")
-                            finally:
-                                # Keep the global pending row retryable by another
-                                # eligible account instead of deleting it on failure.
-                                history.release_claim(
-                                    "default", job.peer_id, job.message_id,
-                                    token=claim_token, cooldown=cooldown,
-                                )
-                        active[key] = asyncio.create_task(transfer())
-                        active_jobs[key] = job
-                        claims[key] = token
-                        pauses[key] = pause
-                        active_target[key] = item["target"]
-                        active_started[key] = time.monotonic()
                         self._monitor_active_transfers = len(running_keys) + 1
-                        if preempted and not priority_logged:
+                        if not priority_logged and any(ctl.suspended for ctl in pauses.values()):
                             high_name = item.get("name") or item["target"]
                             print(f"[调度] {high_name}：已插队开始下载｜低优先级任务稍后恢复")
                             priority_logged = True
                         continue
-                await asyncio.sleep(0.25 if active else 1)
+                await wait_for_work(0.25 if active else 1)
         finally:
             for line in dispatch_log.drain(force=True):
                 print(line)
@@ -1445,6 +1658,7 @@ class _App:
             if active:
                 await asyncio.gather(*active.values(), return_exceptions=True)
             for key in active:
+                release_slot(key)
                 self._monitor_progress_state(key[0], key[1], "结束")
             self._monitor_active_transfers = 0
             self._monitor_total_transfers = 0
@@ -1581,6 +1795,8 @@ class _App:
             self.messagebox.showwarning("设置错误", str(exc))
             return
 
+        if not self._manual_capacity_available(concurrency):
+            return
         self._stop_download.clear()
         entity = self._gallery_entity
         title = self._gallery_title
@@ -1600,6 +1816,7 @@ class _App:
                     chunk_concurrency=chunk_concurrency,
                     temp_download_dir=self.settings.temp_download_dir,
                     on_progress=self._update_download_progress,
+                    gui_slots=getattr(self, "_slots", None), stop_event=self._stop_download,
                 )
                 print("保存完成。点『打开下载文件夹』查看。\n")
             finally:
@@ -1767,14 +1984,26 @@ class _App:
         runtime = self._extra_runtimes.get(self._selected_view_account())
         return bool(getattr(runtime, "monitoring", False))
 
-    def _save_visible_monitors(self) -> None:
+    def _read_visible_monitor_rows(self) -> list[dict]:
         account_id = self._selected_view_account()
         if account_id == "default":
-            save_channels(self._monitored)
+            return list(self._monitored)
+        return load_channels(self._account_registry.monitor_path(account_id))
+
+    def _save_visible_monitors(self, rows: list[dict]) -> None:
+        account_id = self._selected_view_account()
+        registry = getattr(self, "_account_registry", None)
+        plan = self._slot_plan(account_id, rows=rows) if registry is not None else None
+        if account_id == "default":
+            save_channels(rows)
+            self._monitored = rows
         else:
             path = self._account_registry.monitor_path(account_id)
-            save_channels(self._view_monitored, path)
+            save_channels(rows, path)
+            self._view_monitored = rows
             self._view_monitor_stamp = path.stat().st_mtime_ns
+        if plan is not None:
+            self._refresh_slot_plan(plan)
 
     def _refresh_main_account_choices(self) -> None:
         from tgdl.account_view import account_choices
@@ -1856,6 +2085,9 @@ class _App:
         self.monitor_priority_var.set("0")
         self.monitor_batch_var.set("100")
         self.monitor_direction_var.set("从新到旧")
+        mode_var = getattr(self, "monitor_mode_var", None)
+        if mode_var is not None:
+            mode_var.set(MONITOR_MODE_LABELS[SCHEDULED])
         self._monitor_set_types("photo,video")
         self._monitor_refresh()
         # Only A's manual download/parse/gallery tasks have an independent
@@ -2570,7 +2802,7 @@ class _App:
                 self._load_secondary_dialogs(account_id)
 
         runtime = AccountMonitorRuntime(
-            account, self._account_registry, ask=self._ask,
+            account, self._account_registry, ask=self._ask, slots=getattr(self, "_slots", None),
             on_log=self._log_account, on_saved=self._log_download_account,
             on_progress=self._update_download_progress, restore_session_only=True,
             on_authenticated=lambda: self.root.after(0, connected),
@@ -2666,7 +2898,7 @@ class _App:
             self._default_login_future = future
         else:
             runtime = AccountMonitorRuntime(
-                account, self._account_registry, ask=self._ask,
+                account, self._account_registry, ask=self._ask, slots=getattr(self, "_slots", None),
                 on_log=self._log_account, on_saved=self._log_download_account,
                 on_progress=self._update_download_progress,
                 authenticate=dialog.flow.authenticate,
@@ -2790,6 +3022,16 @@ class _App:
             target, types_raw, limit, concurrency, retries, chunk_concurrency
         )
 
+    def _manual_capacity_available(self, workers: int) -> bool:
+        slots = getattr(self, "_slots", None)
+        if slots is not None and slots.ordinary_capacity("default", workers) == 0:
+            self.messagebox.showinfo(
+                "没有普通下载名额", "本账号的文件并发名额已全部预留给实时频道。"
+                "请先将一个频道切回定时扫描、暂停该频道，或手动增加本账号的文件并发。"
+            )
+            return False
+        return True
+
     def _start_channel_download(
         self, target, types_raw, limit, concurrency, retries, chunk_concurrency,
         monitor_item=None,
@@ -2800,6 +3042,8 @@ class _App:
             self._log("[定时] 上一次下载尚未结束，跳过本轮。\n")
             return
 
+        if not self._manual_capacity_available(concurrency):
+            return
         self._stop_download.clear()
 
         def channel_resolved(title: str, peer_id: int) -> None:
@@ -2826,6 +3070,7 @@ class _App:
                     chunk_concurrency=chunk_concurrency,
                     on_saved=self._log_download,
                     on_progress=self._update_download_progress,
+                    gui_slots=getattr(self, "_slots", None),
                     monitor_direction=monitor_item.get("direction", "newest") if monitor_item else None,
                     monitor_batch_size=100,
                     stop_event=self._stop_download,

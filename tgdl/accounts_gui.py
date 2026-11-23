@@ -4,9 +4,12 @@ from __future__ import annotations
 from tgdl.account_context import current_account_id
 from tgdl.accounts import DEFAULT_ACCOUNT
 from tgdl.account_identity import account_identity
+from tgdl.account_view import monitor_enabled_label
 from tgdl.dialog_filter import filter_dialogs
 from tgdl.config import read_env_values, update_env
-from tgdl.monitor import load_channels, save_channels
+from tgdl.monitor import (
+    MONITOR_MODE_LABELS, REALTIME, SCHEDULED, configure_monitor_mode, load_channels, save_channels,
+)
 
 _ACCOUNT_FIELDS = (
     ("phone", "手机号（国际区号）"),
@@ -112,7 +115,7 @@ class AccountWindow:
             self.win, text="该账号独立监控的频道（未开启的频道绝不参与下载）"
         )
         monitors.pack(fill="both", expand=True, padx=10, pady=5)
-        cols = ("name", "target", "types", "minutes", "priority", "batch_size", "direction", "enabled", "next")
+        cols = ("name", "target", "types", "minutes", "priority", "batch_size", "direction", "enabled", "next", "mode")
         self.tree = ttk.Treeview(monitors, columns=cols, show="headings", height=5)
         for col, label, width in (
             ("name", "群组 / 频道名称", 180),
@@ -123,7 +126,8 @@ class AccountWindow:
             ("batch_size", "每轮数量", 80),
             ("direction", "扫描方向", 85),
             ("enabled", "状态", 65),
-            ("next", "下次扫描", 115),
+            ("next", "下次扫描", 90),
+            ("mode", "监控方式", 80),
         ):
             self.tree.heading(col, text=label)
             self.tree.column(col, width=width, stretch=(col in ("name", "target")))
@@ -136,6 +140,7 @@ class AccountWindow:
         self.priority = tk.StringVar(value="0")
         self.batch_size = tk.StringVar(value="100")
         self.direction = tk.StringVar(value="从新到旧")
+        self.mode = tk.StringVar(value=MONITOR_MODE_LABELS[SCHEDULED])
         self.enabled = tk.BooleanVar(value=True)
         self.type_photo = tk.BooleanVar(value=True)
         self.type_video = tk.BooleanVar(value=True)
@@ -143,22 +148,39 @@ class AccountWindow:
 
         editor = ttk.Frame(monitors)
         editor.pack(fill="x", padx=5, pady=2)
+        scan_entries = []
         for label, var, width in (
             ("扫描间隔(分钟)", self.minutes, 6),
             ("优先级", self.priority, 5),
             ("每轮数量", self.batch_size, 7),
         ):
             ttk.Label(editor, text=label).pack(side="left", padx=(5, 0))
-            ttk.Entry(editor, textvariable=var, width=width).pack(side="left", padx=3)
+            entry = ttk.Entry(editor, textvariable=var, width=width)
+            entry.pack(side="left", padx=3)
+            scan_entries.append(entry)
         ttk.Label(editor, text="方向").pack(side="left", padx=4)
-        ttk.Combobox(
+        direction_choice = ttk.Combobox(
             editor, textvariable=self.direction, state="readonly", width=10,
             values=("从新到旧", "从旧到新"),
-        ).pack(side="left", padx=4)
+        )
+        direction_choice.pack(side="left", padx=4)
+
+        def update_scan_controls(*_):
+            realtime = self.mode.get() == MONITOR_MODE_LABELS[REALTIME]
+            for entry in scan_entries:
+                entry.configure(state="disabled" if realtime else "normal")
+            direction_choice.configure(state="disabled" if realtime else "readonly")
+
+        self.mode.trace_add("write", update_scan_controls)
 
         kinds = ttk.Frame(monitors)
         kinds.pack(fill="x", padx=5, pady=2)
-        ttk.Label(kinds, text="监控下载类型（每个频道独立）:").pack(side="left")
+        ttk.Label(kinds, text="监控方式").pack(side="left")
+        ttk.Combobox(
+            kinds, textvariable=self.mode, state="readonly",
+            width=10, values=tuple(MONITOR_MODE_LABELS.values()),
+        ).pack(side="left", padx=(4, 12))
+        ttk.Label(kinds, text="下载类型:").pack(side="left")
         for label, var in (
             ("图片", self.type_photo), ("视频", self.type_video), ("GIF", self.type_anim)
         ):
@@ -182,7 +204,7 @@ class AccountWindow:
         self.toggle_btn = ttk.Button(actions, text="启用/暂停所选", command=self._toggle_selected)
         self.toggle_btn.pack(side="left", padx=3)
         ttk.Label(
-            actions, text="两个账号监控同一频道时自动领取不同文件，扫描游标独立。"
+            actions, text="实时监听独占 1 个文件下载位；同一频道跨账号只占 1 位。"
         ).pack(side="left", padx=10)
 
 
@@ -210,6 +232,7 @@ class AccountWindow:
         for key, value in self._loaded_fields.items():
             self._fields[key].set(value)
         self._channel_rows = load_channels(self.registry.monitor_path(account_id))
+        self.mode.set(MONITOR_MODE_LABELS[SCHEDULED])
         self.tree.selection_remove(self.tree.selection())
         self._refresh_channel_tree()
         # The original account is controlled by the main window to avoid
@@ -282,6 +305,10 @@ class AccountWindow:
                 value = int(values[name])
                 if not low <= value <= high:
                     raise ValueError(f"{name} 必须在 {low}～{high} 范围内")
+            plan = (
+                self.app._slot_plan(account_id, concurrency=int(values["media_concurrency"]))
+                if "media_concurrency" in edits else None
+            )
             if edits:
                 update_env(values, path)
         except (ValueError, OSError) as exc:
@@ -290,6 +317,8 @@ class AccountWindow:
         self._loaded_fields = {key: values[key] for key in self._fields}
         for key, value in self._loaded_fields.items():
             self._fields[key].set(value)
+        if plan is not None:
+            self.app._refresh_slot_plan(plan)
         if edits:
             self.app._log_account(account_id, "[账号设置] 已保存；代理变更重启账号生效\n")
         return True
@@ -314,7 +343,7 @@ class AccountWindow:
         account = next(a for a in self.registry.accounts() if a.id == account_id)
         qr_window = None
         runtime = AccountMonitorRuntime(
-            account, self.registry,
+            account, self.registry, slots=getattr(self.app, "_slots", None),
             ask=lambda prompt, secret: self.app._ask(
                 f"[{account.name}] {prompt}", secret
             ),
@@ -366,14 +395,17 @@ class AccountWindow:
                 self.tree.delete(iid)
         account_id = self._selected_id()
         runtime = self.app._extra_runtimes.get(account_id)
+        slots = getattr(self.app, "_slots", None)
         order = sorted(
             range(len(self._channel_rows)),
             key=lambda i: -int(self._channel_rows[i].get("priority", 0)),
         )
         for position, index in enumerate(order):
             item = self._channel_rows[index]
+            mode = item.get("mode", SCHEDULED)
+            realtime = mode == REALTIME
             next_scan = "-"
-            if runtime is not None and runtime.client is not None and item.get("enabled", True):
+            if not realtime and runtime is not None and runtime.client is not None and item.get("enabled", True):
                 due = runtime._next_at.get(item["target"])
                 if due:
                     import time
@@ -381,9 +413,11 @@ class AccountWindow:
             values = (
                 item.get("name") or "（待获取）",
                 item["target"], self.app._monitor_types_label(item.get("types", "photo,video")),
-                item["minutes"], item.get("priority", 0), item.get("batch_size", 100),
-                "旧→新" if item.get("direction") == "oldest" else "新→旧",
-                "启用" if item.get("enabled", True) else "暂停", next_scan,
+                "-" if realtime else item["minutes"],
+                "-" if realtime else item.get("priority", 0),
+                "-" if realtime else item.get("batch_size", 100),
+                "-" if realtime else ("旧→新" if item.get("direction") == "oldest" else "新→旧"),
+                monitor_enabled_label(item, account_id, slots), next_scan, MONITOR_MODE_LABELS[mode],
             )
             iid = str(index)
             if self.tree.exists(iid):
@@ -404,21 +438,28 @@ class AccountWindow:
         self.priority.set(str(row.get("priority", 0)))
         self.batch_size.set(str(row.get("batch_size", 100)))
         self.direction.set("从旧到新" if row.get("direction") == "oldest" else "从新到旧")
+        self.mode.set(MONITOR_MODE_LABELS[row.get("mode", SCHEDULED)])
         kinds = {item.strip() for item in row.get("types", "photo,video").split(",")}
         self.type_photo.set("photo" in kinds)
         self.type_video.set("video" in kinds)
         self.type_anim.set("animation" in kinds)
         self.enabled.set(row.get("enabled", True))
 
-    def _monitor_form(self) -> tuple[int, int, int, str]:
-        try:
-            minutes = int(self.minutes.get().strip())
-            priority = int(self.priority.get().strip())
-            batch_size = int(self.batch_size.get().strip())
-        except ValueError as exc:
-            raise ValueError("扫描间隔、优先级、每轮数量必须填写整数") from exc
-        if not 1 <= minutes <= 1440 or not 1 <= batch_size <= 100000:
-            raise ValueError("扫描间隔应为1～1440分钟，每轮数量应为1～100000")
+    def _monitor_form(self, mode: str, old: dict | None) -> tuple[int, int, int, str]:
+        if mode == REALTIME:
+            saved = old or {}
+            minutes, priority, batch_size = (
+                saved.get("minutes", 5), saved.get("priority", 0), saved.get("batch_size", 100),
+            )
+        else:
+            try:
+                minutes = int(self.minutes.get().strip())
+                priority = int(self.priority.get().strip())
+                batch_size = int(self.batch_size.get().strip())
+            except ValueError as exc:
+                raise ValueError("扫描间隔、优先级、每轮数量必须填写整数") from exc
+            if not 1 <= minutes <= 1440 or not 1 <= batch_size <= 100000:
+                raise ValueError("扫描间隔应为1～1440分钟，每轮数量应为1～100000")
         types = ",".join(kind for kind, var in (
             ("photo", self.type_photo), ("video", self.type_video),
             ("animation", self.type_anim),
@@ -426,6 +467,13 @@ class AccountWindow:
         if not types:
             raise ValueError("至少选择一种监控下载类型")
         return minutes, priority, batch_size, types
+
+    def _persist_channel_rows(self, account_id: str, rows: list[dict]) -> None:
+        plan = self.app._slot_plan(account_id, rows=rows)
+        save_channels(rows, self.registry.monitor_path(account_id))
+        self._channel_rows = rows
+        self.app._refresh_slot_plan(plan)
+        self._refresh_channel_tree()
 
     def _add_current_channel(self) -> None:
         account_id = self._selected_id()
@@ -441,32 +489,32 @@ class AccountWindow:
         if not target:
             self.app.messagebox.showwarning("监控", "请先在上方列表选择频道，或手动输入频道ID", parent=self.win)
             return
-        if any(row["target"] == target for row in self._channel_rows):
-            self.app.messagebox.showinfo("监控", "此频道已在监控列表中，请选择后点击『更新所选』", parent=self.win)
-            return
         self._upsert_channel(target, name)
 
     def _upsert_channel(self, target: str, name: str, *, index: int | None = None) -> None:
         try:
-            minutes, priority, batch_size, types = self._monitor_form()
             account_id = self._selected_id()
+            rows = load_channels(self.registry.monitor_path(account_id))
+            row_index = next((i for i, row in enumerate(rows) if row["target"] == target), None)
+            if index is not None and row_index is None:
+                raise ValueError("此频道已被移除，请重新选择。")
+            if index is None and row_index is not None:
+                raise ValueError("此频道已在监控列表中，请选择后点击『更新所选』。")
+            old = rows[row_index] if row_index is not None else None
+            mode = REALTIME if self.mode.get() == MONITOR_MODE_LABELS[REALTIME] else SCHEDULED
+            minutes, priority, batch_size, types = self._monitor_form(mode, old)
             row = {
-                "target": target, "name": name, "minutes": minutes,
-                "priority": priority, "batch_size": batch_size, "types": types,
+                **(old or {}), "target": target, "name": (old or {}).get("name") or name,
+                "minutes": minutes, "priority": priority, "batch_size": batch_size, "types": types,
                 "direction": "oldest" if self.direction.get() == "从旧到新" else "newest",
                 "enabled": self.enabled.get(),
             }
-            if index is None:
-                self._channel_rows.append(row)
+            configure_monitor_mode(row, old, mode, self._dialog_cache.get(account_id, ()))
+            if row_index is None:
+                rows.append(row)
             else:
-                original = self._channel_rows[index]
-                row["target"] = original["target"]
-                row["name"] = original.get("name") or name
-                if original.get("peer_id"):
-                    row["peer_id"] = original["peer_id"]
-                self._channel_rows[index] = row
-            save_channels(self._channel_rows, self.registry.monitor_path(account_id))
-            self._refresh_channel_tree()
+                rows[row_index] = row
+            self._persist_channel_rows(account_id, rows)
             self.app._log_account(account_id, f"[频道配置] 已保存 {row['target']}\n")
         except (ValueError, OSError) as exc:
             self.app.messagebox.showwarning("监控配置无效", str(exc), parent=self.win)
@@ -480,21 +528,30 @@ class AccountWindow:
                 self._upsert_channel(row["target"], row.get("name", ""), index=index)
 
     def _toggle_selected(self) -> None:
-        chosen = self.tree.selection()
-        if self._selected_id() == DEFAULT_ACCOUNT or not chosen:
-            return
-        row = self._channel_rows[int(chosen[0])]
-        row["enabled"] = not row.get("enabled", True)
-        save_channels(self._channel_rows, self.registry.monitor_path(self._selected_id()))
-        self._refresh_channel_tree()
+        self._edit_channel_enabled(remove=False)
 
     def _remove_channel(self) -> None:
+        self._edit_channel_enabled(remove=True)
+
+    def _edit_channel_enabled(self, *, remove: bool) -> None:
         chosen = self.tree.selection()
-        if self._selected_id() == DEFAULT_ACCOUNT or not chosen:
+        account_id = self._selected_id()
+        if account_id == DEFAULT_ACCOUNT or not chosen or int(chosen[0]) >= len(self._channel_rows):
             return
-        self._channel_rows.pop(int(chosen[0]))
-        save_channels(self._channel_rows, self.registry.monitor_path(self._selected_id()))
-        self._refresh_channel_tree()
+        target = self._channel_rows[int(chosen[0])]["target"]
+        try:
+            rows = load_channels(self.registry.monitor_path(account_id))
+            index = next((i for i, row in enumerate(rows) if row["target"] == target), None)
+            if index is None:
+                raise ValueError("此频道已被移除，请重新选择。")
+            if remove:
+                rows.pop(index)
+            else:
+                row = rows[index]
+                rows[index] = {**row, "enabled": not row.get("enabled", True)}
+            self._persist_channel_rows(account_id, rows)
+        except (ValueError, OSError) as exc:
+            self.app.messagebox.showwarning("监控配置无效", str(exc), parent=self.win)
 
     def _dialog_selected(self, _event=None) -> None:
         chosen = self.dialog_tree.selection()
