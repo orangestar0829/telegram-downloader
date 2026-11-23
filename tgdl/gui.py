@@ -1872,11 +1872,7 @@ class _App:
         self._gallery_title = ""
         self._set_main_log_account_filter(account_id)
         self._refresh_log_views()
-        self._paint_account_status(
-            getattr(self, "_default_status_text", "未登录") if account_id == "default"
-            else (self._extra_runtimes[account_id].status
-                  if account_id in self._extra_runtimes else "未登录")
-        )
+        self._show_main_account_status()
         self._restore_saved_session(account_id)
 
     def _set_main_log_account_filter(self, account_id: str) -> None:
@@ -1955,17 +1951,9 @@ class _App:
         expected_logs.update(account_choices(self._account_registry.accounts()))
         if expected_logs != getattr(self, "_log_filter_options", {}):
             self._refresh_log_accounts()
-        if account_id == DEFAULT_ACCOUNT:
-            self._paint_account_status(getattr(self, "_default_status_text", "未登录"))
-        else:
+        self._show_main_account_status()
+        if account_id != DEFAULT_ACCOUNT:
             runtime = self._extra_runtimes.get(account_id)
-            status = runtime.status if runtime is not None else "未登录"
-            count = runtime.active_count if runtime is not None else 0
-            monitor = ("监控运行中" if getattr(runtime, "monitoring", False) else
-                       "监控停止中" if getattr(runtime, "monitoring_draining", False) else "监控未启动")
-            if status.startswith("已连接"):
-                status = f"{status}｜{monitor}｜下载中 {count} 个"
-            self._paint_account_status(status)
             cache = getattr(self, "_account_dialog_cache", {})
             if (runtime is not None and runtime.status.startswith("已连接")
                     and account_id not in cache):
@@ -2220,6 +2208,30 @@ class _App:
 
         win.protocol("WM_DELETE_WINDOW", on_close)
 
+    def _show_main_account_status(self) -> None:
+        """Render the selected account's login state and monitor activity."""
+        account_id = self._selected_view_account()
+        primary = account_id == DEFAULT_ACCOUNT
+        runtime = None if primary else self._extra_runtimes.get(account_id)
+        status = (
+            self._default_status_text if primary else
+            runtime.status if runtime is not None else "未登录"
+        )
+        prefix, _, display = status.partition("：")
+        if prefix in ("已登录", "已连接") and display:
+            running = self._visible_monitor_running()
+            draining = (
+                self._primary_monitor_draining() if primary
+                else bool(getattr(runtime, "monitoring_draining", False))
+            )
+            count = (
+                getattr(self, "_monitor_active_transfers", 0) if primary
+                else runtime.active_count
+            )
+            monitor = "监控运行中" if running else "监控停止中" if draining else "监控未启动"
+            status = f"已登录：{display}｜{monitor}｜监控下载中 {count} 个"
+        self._paint_account_status(status)
+
     def _paint_account_status(self, status: str) -> None:
         color = "#546174"
         if status.startswith(("已登录", "已连接")):
@@ -2238,7 +2250,7 @@ class _App:
         def apply():
             self._default_status_text = text
             if self._selected_view_account() == "default":
-                self._paint_account_status(text)
+                self._show_main_account_status()
         self.root.after(0, apply)
 
     def _current_download_dir(self) -> Path:
@@ -2448,12 +2460,11 @@ class _App:
                 self._client_starting_task = None
                 self._client_starting_cleanup = False
 
-            name = " ".join(p for p in (me.first_name, me.last_name) if p)
-            handle = f"@{me.username}" if me.username else ""
-            account_identity.update("default", me)
+            display = account_identity.update(DEFAULT_ACCOUNT, me)
             self.root.after(0, self._refresh_log_accounts)
-            print(f"已登录:{name} {handle}".strip())
-            self._set_status(f"已登录:{name} {handle}".strip())
+            status = f"已登录：{display}"
+            print(status)
+            self._set_status(status)
             return client
 
     async def client_start(self, client, settings):

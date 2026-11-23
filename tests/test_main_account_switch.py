@@ -594,3 +594,38 @@ def test_account_selector_omits_redundant_remark(tmp_path, monkeypatch):
     identity.register(account.id, account.name)
     assert account_choices(registry.accounts())["显示备注"] == account.id
     assert "显示备注（显示备注）" not in account_choices(registry.accounts())
+
+
+def test_switch_and_refresh_show_the_same_status_for_each_account(tmp_path):
+    app, b = _make_app(tmp_path)
+    app.root = SimpleNamespace(after=lambda *_: None)
+    app._account_status_label = Widget()
+    app._default_status_text = "已登录：测试 A"
+    app._monitor_active_transfers = 2
+    runtime = app._extra_runtimes[b.id]
+    runtime.monitoring = True
+
+    app._switch_main_account(b.id)
+    active_b = "已登录：测试 B｜监控运行中｜监控下载中 1 个"
+    assert app.status_var.get() == active_b
+    assert app._account_status_label.options["foreground"] == "#13794d"
+    app._refresh_main_account_status()
+    assert app.status_var.get() == active_b
+
+    app._switch_main_account("default")
+    assert app.status_var.get() == "已登录：测试 A｜监控运行中｜监控下载中 2 个"
+    app._monitor_active = False
+    app._monitor_download_future = SimpleNamespace(done=lambda: False)
+    app._refresh_main_account_status()
+    assert app.status_var.get() == "已登录：测试 A｜监控停止中｜监控下载中 2 个"
+
+    runtime.monitoring = False
+    runtime.monitoring_draining = False
+    runtime.active_count = 0
+    app._switch_main_account(b.id)
+    assert app.status_var.get() == "已登录：测试 B｜监控未启动｜监控下载中 0 个"
+
+    runtime.status = "登录已失效"
+    app._refresh_main_account_status()
+    assert app.status_var.get() == "登录已失效｜请重新登录"
+    assert app._account_status_label.options["foreground"] == "#b62d32"
