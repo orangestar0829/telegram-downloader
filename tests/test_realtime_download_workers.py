@@ -40,7 +40,7 @@ def test_workers_never_borrow_realtime_and_schedule_one_live_file_per_peer(
     class Client:
         async def get_entity(self, peer):
             assert isinstance(peer, PeerChannel) and peer.channel_id == 200
-            return Channel(200, "@live", ChatPhotoEmpty(), None, megagroup=True, noforwards=True)
+            return Channel(200, "@live", ChatPhotoEmpty(), None, megagroup=True, noforwards=True, restricted=True)
 
         async def get_messages(self, entity, ids):
             return Message(id=ids, peer_id=PeerChannel(entity.id), date=datetime.now(timezone.utc),
@@ -56,7 +56,7 @@ def test_workers_never_borrow_realtime_and_schedule_one_live_file_per_peer(
 
     async def resolve(_client, target):
         return Channel(100 if target == "@old" else 200, target, ChatPhotoEmpty(), None,
-                       megagroup=True, noforwards=True)
+                       megagroup=True, noforwards=True, restricted=True)
 
     async def ensure():
         pass
@@ -314,7 +314,7 @@ def test_secondary_realtime_media_refused_by_telegram_is_never_marked_saved(tmp_
 
         async def get_entity(self, peer):
             assert isinstance(peer, PeerChannel) and peer.channel_id == 200
-            return Channel(200, "live", ChatPhotoEmpty(), None, megagroup=True, noforwards=True)
+            return Channel(200, "live", ChatPhotoEmpty(), None, megagroup=True, noforwards=True, restricted=True)
 
         async def get_messages(self, entity, ids):
             return Message(id=ids, peer_id=PeerChannel(entity.id), date=datetime.now(timezone.utc),

@@ -108,7 +108,7 @@ def pending(history, *, account="default", lane=True):
     )]
 
 
-def test_read_only_resolution_checks_membership_and_peer_identity_not_forwarding_flag():
+def test_read_only_resolution_checks_membership_and_identity_not_metadata_flags():
     async def run():
         client = FakeTelegram()
         assert await realtime.resolve_realtime_peer(client, "https://t.me/+abc") is client.entity
@@ -124,9 +124,8 @@ def test_read_only_resolution_checks_membership_and_peer_identity_not_forwarding
         assert await realtime.resolve_realtime_peer(client, "@photos") is client.entity
         assert await realtime.resolve_realtime_peer(client, "@photos", expected_peer_id=PEER) is client.entity
         client.entity.restricted = True
-        with pytest.raises(ChannelAccessError, match="访问受限"):
-            await realtime.resolve_realtime_peer(client, "@photos")
-        client.entity.restricted = False
+        assert await realtime.resolve_realtime_peer(client, "@photos") is client.entity
+        assert await realtime.resolve_realtime_peer(client, "@photos", expected_peer_id=PEER) is client.entity
         client.entity.min = True
         with pytest.raises(ChannelAccessError, match="加入"):
             await realtime.resolve_realtime_peer(client, "@photos")
@@ -194,12 +193,13 @@ def test_first_push_next_turn_batches_exact_chunks_without_history_poll(tmp_path
     asyncio.run(run())
 
 
-def test_fresh_tail_includes_update_racing_listener_enrollment(tmp_path):
+def test_readable_flagged_channel_catches_up_and_deduplicates_push(tmp_path):
     async def run():
         history = DownloadHistory(tmp_path / "state.db")
         new_post = photo(501, date=datetime.now(timezone.utc), protected=True)
         client = FakeTelegram([photo(500)])
         client.entity.noforwards = True
+        client.entity.restricted = True
 
         async def hide_push_until_after_snapshot(kwargs):
             if not kwargs.get("offset_date"):
@@ -215,6 +215,34 @@ def test_fresh_tail_includes_update_racing_listener_enrollment(tmp_path):
             await client.emit(new_post)
             await asyncio.sleep(0)
             assert pending(history) == [501]
+        finally:
+            await rt.close()
+            history.close()
+
+    asyncio.run(run())
+
+
+def test_server_denied_history_leaves_flagged_channel_unready_and_enqueues_nothing(tmp_path):
+    async def run():
+        history = DownloadHistory(tmp_path / "state.db")
+        client = FakeTelegram([photo(100, protected=True)])
+        client.entity.restricted = client.entity.noforwards = True
+        logs = []
+
+        async def deny_history(_kwargs):
+            raise ChannelPrivateError(request=None)
+
+        client.before_tail = deny_history
+        rt = realtime.RealtimeMonitor(client, history, "default", log=logs.append)
+        rt.update([item()])
+        try:
+            await wait_for(lambda: any("ChannelPrivateError" in line for line in logs))
+            assert len(client.calls) == 1                     # Ordinary history path was reached.
+            assert not client.requests                       # No join or alternative RPC path.
+            assert PEER not in rt.ready_peers
+            assert history.realtime_cursor("default", PEER, "subscription") is None
+            await client.emit(photo(101, protected=True))    # No admission after denied history.
+            assert pending(history) == []
         finally:
             await rt.close()
             history.close()

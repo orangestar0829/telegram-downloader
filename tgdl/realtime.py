@@ -36,10 +36,8 @@ _AUTH_ERRORS = _UNAVAILABLE + (ChannelAccessError,)
 def _require_joined(entity) -> Channel:
     if not isinstance(entity, Channel) or entity.left or entity.min:
         raise ChannelAccessError("实时监控仅支持本账号已加入的频道或超级群。")
-    if entity.restricted:
-        raise ChannelAccessError("频道访问受限，不支持实时监控。")
-    # Match scheduled monitoring: the standard Telegram read/download APIs
-    # determine which media the joined account can access.
+    # Match scheduled monitoring. Channel metadata alone does not establish
+    # access for this account; the ordinary Telegram history/media requests do.
     return entity
 
 
