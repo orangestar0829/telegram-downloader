@@ -31,6 +31,7 @@ from tgdl.errors import ChannelAccessError
 from tgdl.history import DownloadHistory, PendingMedia, UnreadableRetry
 from tgdl.monitor import MonitorUnreadableSummary, choose_monitor_download, load_channels, next_due_channel
 from tgdl.monitor_flow import MonitorFlow, MonitorPause, SharedSpeedLimiter
+from tgdl.realtime_burst import RealtimeBurst, realtime_candidates
 from tgdl.slots import SlotCoordinator
 from tgdl.realtime_runtime import RealtimeDispatch
 from tgdl.qr_auth import login_with_qr
@@ -91,6 +92,7 @@ class AccountMonitorRuntime:
         on_log: Callable[[str, str], None],
         on_saved: Callable[[str, str], None],
         on_progress: Callable[[str, str, int, int, str], None],
+        on_progress_state: Callable[[int, int, str], None] | None = None,
         login_method: str = "code",
         on_qr: Callable[[str, Any], None] | None = None,
         authenticate: Callable[[Any, str | None], Awaitable[Any]] | None = None,
@@ -106,6 +108,7 @@ class AccountMonitorRuntime:
         self.on_log = on_log
         self.on_saved = on_saved
         self.on_progress = on_progress
+        self.on_progress_state = on_progress_state
         self.login_method = login_method
         self.on_qr = on_qr
         self.authenticate = authenticate
@@ -119,6 +122,7 @@ class AccountMonitorRuntime:
         self._cancel_transfers_requested = threading.Event()
         self.status = "未启动"
         self.active_count = 0
+        self.running_count = 0
         self.peer_by_target: dict[str, int] = {}
         self._next_at: dict[str, float] = {}
         self._batch_used: dict[str, int] = {}
@@ -291,6 +295,7 @@ class AccountMonitorRuntime:
         settings: Any, limiter: SharedSpeedLimiter, retries: int, chunks: int,
         claim_token: str, *, on_claim_committed: Callable[[], None] | None = None,
         on_unreadable: Callable[[PendingMedia, UnreadableRetry], None] | None = None,
+        pause: MonitorPause | None = None,
     ) -> None:
         peer, mid = job.peer_id, job.message_id
         cooldown = 0
@@ -333,7 +338,8 @@ class AccountMonitorRuntime:
             ) / ("photos" if kind == "photo" else "videos")
             stats = DownloadStats()
             flow = MonitorFlow(
-                pause=MonitorPause(), limiter=limiter, chunks=lambda: chunks
+                pause=pause if pause is not None else MonitorPause(),
+                limiter=limiter, chunks=lambda: chunks,
             )
             path = await _download_with_retry(
                 self.client, message, folder,
@@ -405,7 +411,12 @@ class AccountMonitorRuntime:
         history = DownloadHistory(self.registry.root / "tgdl_download_history.sqlite3")
         active: dict[tuple[int, int], tuple[asyncio.Task, str, float, str]] = {}
         active_slots = {}
+        active_jobs = {}
+        pauses: dict[tuple[int, int], MonitorPause] = {}
+        paused_since: dict[tuple[int, int], float] = {}
+        staged_jobs = set()
         realtime_jobs: set[tuple[int, int]] = set()
+        burst = RealtimeBurst()
         retiring: set[tuple[int, int]] = set()
         committed: set[str] = set()
         limiter = governor = None
@@ -420,6 +431,74 @@ class AccountMonitorRuntime:
         last_renew = 0.0
         occupancy: dict[str, float] = {}
         unreadable_log = MonitorUnreadableSummary()
+        account_id = self.account.id
+
+        def progress_state(key, status):
+            if self.on_progress_state is not None:
+                self.on_progress_state(*key, status)
+
+        def resume(key):
+            task, target, _began, token = active[key]
+            if key not in active_slots:
+                slot = slots.acquire(account_id, workers, file_key=key, scheduled_monitor=True)
+                if slot is None:
+                    return False
+                active_slots[key] = slot
+                active[key] = task, target, time.monotonic(), token
+                paused_since.pop(key, None)
+                self.running_count = len(active_slots)
+                progress_state(key, "恢复中")
+            burst.ordinary_started(key, time.monotonic())
+            pauses[key].resume()
+            return True
+
+        def launch(item, job, generation, *, realtime=False, borrow=False):
+            storage = self._configured_paths
+            transfer_settings = settings if storage is None else replace(
+                settings, download_dir=storage[0], temp_download_dir=storage[1],
+            )
+            key = (job.peer_id, job.message_id)
+            slot = slots.acquire(
+                account_id, workers, job.peer_id if realtime else None,
+                file_key=key, scheduled_monitor=not realtime, borrow=borrow,
+                realtime_item=item if realtime else None,
+            )
+            if slot is None:
+                return False
+            token = None
+            try:
+                token = history.try_claim(account_id, *key)
+                with self._monitor_controls:
+                    if (token is None or not self.monitoring
+                            or self._monitor_scan_stop is not generation):
+                        return False
+                    pause = MonitorPause()
+                    task = asyncio.create_task(self._transfer(
+                        history, item, job, transfer_settings, limiter, retries, chunks, token,
+                        on_claim_committed=lambda: committed.add(token),
+                        on_unreadable=unreadable_log.add, pause=pause,
+                    ))
+                    active[key] = (task, item["target"], time.monotonic(), token)
+                    active_slots[key] = slot
+                    active_jobs[key] = job
+                    pauses[key] = pause
+                    if transfer_settings.temp_download_dir is not None:
+                        staged_jobs.add(key)
+                    if realtime:
+                        realtime_jobs.add(key)
+                        if borrow:
+                            burst.borrowed.add(key)
+                    else:
+                        burst.ordinary_started(key, time.monotonic())
+                    self.active_count = len(active)
+                    self.running_count = len(active_slots)
+                    return True
+            finally:
+                if key not in active:
+                    slots.release(slot)
+                    if token is not None:
+                        history.release_claim(account_id, *key, token=token)
+
         try:
             while not self.stop_event.is_set() or active:
                 now = time.monotonic()
@@ -435,13 +514,19 @@ class AccountMonitorRuntime:
                     if not task.done():
                         continue
                     del active[key]
-                    slots.release(active_slots.pop(key))
+                    slots.release(active_slots.pop(key, None))
                     retiring.discard(key)
                     committed.discard(token)
+                    burst.finished(key)
+                    active_jobs.pop(key)
+                    pauses.pop(key)
+                    staged_jobs.discard(key)
                     if key in realtime_jobs:
                         realtime_jobs.discard(key)
-                    else:
+                    elif key not in paused_since:
                         occupancy[target] = occupancy.get(target, 0) + max(0, now - began)
+                    paused_since.pop(key, None)
+                    progress_state(key, "结束")
                     try:
                         await task
                     except asyncio.CancelledError:
@@ -449,6 +534,7 @@ class AccountMonitorRuntime:
                     except Exception as exc:
                         self.log(f"[下载协程异常] {type(exc).__name__}: {exc}")
                 self.active_count = len(active)
+                self.running_count = len(active_slots)
                 generation = self._monitor_scan_stop
                 if not active:
                     # Unlike the primary worker, this loop outlives monitoring.
@@ -489,110 +575,140 @@ class AccountMonitorRuntime:
                         self._monitor_throttle = governor
                     governor.configure(manual_kib=manual_kib, enabled=auto_throttle)
                     last_refresh = now
-                if self.monitoring and len(active) < workers:
-                    try:
-                        channels = [
-                            item for item in self._channels()
-                            if item.get("enabled", True)
-                            and (item["target"] in self.peer_by_target or (
-                                item.get("mode") == "realtime" and item.get("peer_id")
-                            ))
-                            and (item.get("mode") == "realtime" or item["target"] not in self._blocked)
-                        ]
-                        account_id = self.account.id
-                        reserved = slots.reserved_peers()
-                        ready = getattr(self, "_realtime_ready", ())
-                        live_candidates = []
+                try:
+                    monitoring = self.monitoring
+                    channels = self._channels() if monitoring else ()
+                    by_target = {item["target"]: item for item in channels}
+                    reserved = slots.reserved_peers()
+                    ordinary_capacity = slots.ordinary_capacity(account_id, workers)
+                    # A yielded file still owns its lease and bytes. Retire it
+                    # only when an edit made an ordinary resume impossible.
+                    for key in burst.preempted.copy():
+                        if key in retiring or not pauses[key].safely_suspended:
+                            continue
+                        permit = active_slots.pop(key, None)
+                        if permit is not None:
+                            slots.release(permit)
+                            _task, target, began, _token = active[key]
+                            occupancy[target] = occupancy.get(target, 0) + max(0, now - began)
+                            paused_since[key] = now
+                            progress_state(key, "已暂停")
+                            self.log(f"[调度] {target}：暂停定时下载，让出名额给实时任务")
+                        task, target, _began, token = active[key]
+                        item = by_target.get(target)
+                        if (not ordinary_capacity or key[0] in reserved
+                                or (monitoring and (item is None or item.get("mode") == "realtime"))):
+                            retiring.add(key)
+                            task.cancel()
+                            self.log(f"[调度] {target} 的暂停任务已返回队列｜普通下载名额或监控目标已变更")
+                    self.running_count = len(active_slots)
+                    if not monitoring:
+                        for key in burst.preempted.copy():
+                            if key not in retiring:
+                                resume(key)
+                        await asyncio.sleep(0.25)
+                        continue
+
+                    ready = getattr(self, "_realtime_ready", ())
+                    if any(launch(item, job, generation, realtime=True)
+                           for item, job in realtime_candidates(
+                               channels, ready, slots, history, account_id, workers, active,
+                           )):
+                        continue
+                    overflow = list(realtime_candidates(
+                        channels, ready, slots, history, account_id, workers, active, borrow=True,
+                    )) if ordinary_capacity else []
+                    if not overflow or burst.ordinary_turn:
+                        burst.withdraw(pauses, active_slots, retiring)
+                    if not overflow and not burst.borrowed:
+                        burst.no_ordinary_demand()
+
+                    def launch_overflow():
+                        return any(launch(item, job, generation, realtime=True, borrow=True)
+                                   for item, job in overflow)
+
+                    if overflow and not burst.ordinary_turn:
+                        if launch_overflow():
+                            continue
+                        if not slots.available(account_id, workers):
+                            victims = sorted(
+                                (key for key in active_slots if key not in realtime_jobs
+                                 and key not in retiring and key not in staged_jobs
+                                 and active[key][3] not in committed),
+                                key=lambda key: (
+                                    int(by_target.get(active[key][1], {}).get("priority", 0)),
+                                    active[key][2],
+                                ),
+                            )
+                            burst.request(pauses, victims, now)
+                    elif slots.available(account_id, workers):
                         ordinary_candidates = []
-                        ordinary_available = slots.available(account_id, workers)
                         for item in channels:
-                            is_realtime = item.get("mode") == "realtime"
-                            peer = (item.get("peer_id") if is_realtime else None
-                                    ) or self.peer_by_target.get(item["target"])
-                            if not peer:
+                            target = item["target"]
+                            peer = self.peer_by_target.get(target)
+                            if item.get("mode") == "realtime":
+                                continue
+                            suspended = [
+                                active_jobs[key] for key in paused_since
+                                if key not in retiring and active[key][1] == target
+                            ]
+                            if suspended:
+                                ordinary_candidates.extend((item, job) for job in suspended)
+                                continue
+                            if (not peer or not item.get("enabled", True) or peer in reserved
+                                    or target in self._blocked):
                                 continue
                             kinds = {value.strip() for value in
                                      item.get("types", "photo,video").split(",") if value.strip()}
-                            if (is_realtime and peer in ready and slots.owns(account_id, peer)
-                                    and slots.available(account_id, workers, peer)):
-                                for job in history.pending_for_peer(
-                                    peer, account_id=account_id, limit=6, kinds=kinds, realtime=True,
+                            for job in history.pending_for_peer(
+                                peer, account_id=account_id, limit=6, kinds=kinds,
+                            ):
+                                key = (job.peer_id, job.message_id)
+                                if key not in active and slots.available(
+                                    account_id, workers, file_key=key,
                                 ):
-                                    key = (job.peer_id, job.message_id)
-                                    if key not in active and slots.available(
-                                        account_id, workers, peer, file_key=key,
-                                    ):
-                                        live_candidates.append((item, job))
-                                        break
-                            if ordinary_available and not is_realtime and peer not in reserved:
-                                for job in history.pending_for_peer(
-                                    peer, account_id=account_id, limit=6, kinds=kinds,
-                                ):
-                                    key = (job.peer_id, job.message_id)
-                                    if key not in active and slots.available(
-                                        account_id, workers, file_key=key,
-                                    ):
-                                        ordinary_candidates.append((item, job))
-                                        break
+                                    ordinary_candidates.append((item, job))
+                                    break
                         counts: dict[str, int] = {}
                         elapsed = dict(occupancy)
-                        for key, (_task, target, began, _token) in active.items():
+                        for key in active_slots:
                             if key in realtime_jobs:
                                 continue
+                            _task, target, began, _token = active[key]
                             counts[target] = counts.get(target, 0) + 1
                             elapsed[target] = elapsed.get(target, 0) + now - began
-                        selected = (live_candidates[0] if live_candidates else
-                                    choose_monitor_download(ordinary_candidates, counts, elapsed))
+                        selected = choose_monitor_download(ordinary_candidates, counts, elapsed)
                         if selected is not None:
                             item, job = selected
-                            realtime = bool(live_candidates)
-                            storage = self._configured_paths
-                            transfer_settings = settings if storage is None else replace(
-                                settings, download_dir=storage[0], temp_download_dir=storage[1],
-                            )
-                            key = (job.peer_id, job.message_id)
-                            slot = None
-                            if realtime or job.peer_id not in slots.reserved_peers():
-                                slot = slots.acquire(
-                                    account_id, workers, job.peer_id if realtime else None,
-                                    file_key=key, scheduled_monitor=not realtime,
-                                )
-                            if slot is not None:
-                                token = None
-                                try:
-                                    token = history.try_claim(account_id, *key)
-                                    with self._monitor_controls:
-                                        if (token is not None and self.monitoring
-                                                and self._monitor_scan_stop is generation):
-                                            task = asyncio.create_task(
-                                                self._transfer(
-                                                    history, item, job, transfer_settings,
-                                                    limiter, retries, chunks, token,
-                                                    on_claim_committed=lambda token=token: committed.add(token),
-                                                    on_unreadable=unreadable_log.add,
-                                                )
-                                            )
-                                            active[key] = (task, item["target"], time.monotonic(), token)
-                                            active_slots[key] = slot
-                                            if realtime:
-                                                realtime_jobs.add(key)
-                                            self.active_count = len(active)
-                                finally:
-                                    if key not in active:
-                                        slots.release(slot)
-                                        if token is not None:
-                                            history.release_claim(account_id, *key, token=token)
-                                if key in active:
+                            # At the same scheduled priority an interrupted
+                            # file gets its permit back before a new file.
+                            same_rank_suspended = [
+                                (candidate_job.peer_id, candidate_job.message_id)
+                                for candidate_item, candidate_job in ordinary_candidates
+                                if int(candidate_item.get("priority", 0)) == int(item.get("priority", 0))
+                                and (candidate_job.peer_id, candidate_job.message_id) in paused_since
+                            ]
+                            if same_rank_suspended:
+                                key = min(same_rank_suspended, key=paused_since.__getitem__)
+                                if resume(key):
+                                    self.log(f"[调度] {active[key][1]}：恢复定时下载")
                                     continue
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        self.log(f"[下载调度异常] {type(exc).__name__}: {exc}")
+                            elif launch(item, job, generation):
+                                continue
+                        elif overflow:
+                            # No eligible ordinary job needs the return turn.
+                            burst.no_ordinary_demand()
+                            if launch_overflow():
+                                continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.log(f"[下载调度异常] {type(exc).__name__}: {exc}")
                 live = getattr(self, "_realtime_ready", None)
                 if isinstance(live, RealtimeDispatch) and live.service is not None:
-                    await live.wait(0.25 if active else 1)
+                    await live.wait(0.1 if burst.preempted else 0.25 if active else 1)
                 else:
-                    await asyncio.sleep(0.25 if active else 0.8)
+                    await asyncio.sleep(0.1 if burst.preempted else 0.25 if active else 0.8)
         finally:
             # On cancellation or scheduler error, wait for each downloaded
             # file to remove temporary data before releasing its claim.
@@ -607,11 +723,13 @@ class AccountMonitorRuntime:
                 self.log(line)
             for slot in active_slots.values():
                 slots.release(slot)
+            for key in active:
+                progress_state(key, "结束")
             try:
                 for key, (_task, _target, _began, token) in active.items():
                     history.release_claim(self.account.id, *key, token=token)
             finally:
-                self.active_count = 0
+                self.active_count = self.running_count = 0
                 if self._monitor_throttle is governor:
                     self._monitor_throttle = None
                 history.close()

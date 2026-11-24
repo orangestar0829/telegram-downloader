@@ -59,6 +59,7 @@ from tgdl.monitor import (
 from tgdl.paths import data_dir, monitor_migration_error
 from tgdl.slots import SlotCoordinator, make_plan
 from tgdl.realtime_runtime import RealtimeDispatch
+from tgdl.realtime_burst import RealtimeBurst, realtime_candidates
 from tgdl.single_instance import AlreadyRunning, gui_instance_guard
 from tgdl.temp_cleanup import inspect_cleanup
 from tgdl.telethon_diagnostics import install_telethon_diagnostics
@@ -1240,6 +1241,7 @@ class _App:
         active_jobs = {}
         active_slots = {}
         realtime_jobs: set[tuple[int, int]] = set()
+        burst = RealtimeBurst()
         claims: dict[tuple[int, int], str] = {}
         retiring: set[tuple[int, int]] = set()
         committed: set[str] = set()
@@ -1255,6 +1257,7 @@ class _App:
         pause_requested_at: dict[tuple[int, int], float] = {}
         pause_delay_reported: set[tuple[int, int]] = set()
         paused_since: dict[tuple[int, int], float] = {}
+        manual_turn_until = 0.0
         limiter = SharedSpeedLimiter()
         governor = limiter.bind_auto_throttle(log=print)
         self._monitor_throttle = governor
@@ -1271,12 +1274,13 @@ class _App:
             if slot is not None:
                 slots.release(slot)
 
-        def launch(item, job, workers, *, realtime=False):
+        def launch(item, job, workers, *, realtime=False, borrow=False):
             key = (job.peer_id, job.message_id)
             if not realtime and job.peer_id in slots.reserved_peers():
                 return False
             slot = slots.acquire("default", workers, job.peer_id if realtime else None,
-                                 file_key=key, scheduled_monitor=not realtime)
+                                 file_key=key, scheduled_monitor=not realtime, borrow=borrow,
+                                 realtime_item=item if realtime else None)
             if slot is None:
                 return False
             token = None
@@ -1381,6 +1385,10 @@ class _App:
                 active_slots[key] = slot
                 if realtime:
                     realtime_jobs.add(key)
+                    if borrow:
+                        burst.borrowed.add(key)
+                else:
+                    burst.ordinary_started(key, time.monotonic())
                 claims[key] = token
                 pauses[key] = pause
                 active_target[key] = item["target"]
@@ -1411,6 +1419,7 @@ class _App:
                     token = claims.pop(key)
                     was_realtime = key in realtime_jobs
                     realtime_jobs.discard(key)
+                    burst.finished(key)
                     retiring.discard(key)
                     committed.discard(token)
                     active_jobs.pop(key)
@@ -1457,7 +1466,7 @@ class _App:
                 # its permit. If an edit removed its lane, however, it could
                 # never resume: retire it without deleting the pending row.
                 for key, ctl in pauses.items():
-                    if key in retiring or not ctl.suspended:
+                    if key in retiring or not ctl.safely_suspended:
                         continue
                     release_slot(key)
                     item = by_target.get(active_target[key])
@@ -1478,6 +1487,7 @@ class _App:
                                 continue
                             active_slots[key] = slot
                         ctl.resume()
+                        burst.preempted.discard(key)
                         self._monitor_progress_state(key[0], key[1], "恢复中")
                     self._monitor_active_transfers = len(active_slots)
                     self._monitor_total_transfers = len(active)
@@ -1486,7 +1496,8 @@ class _App:
                     continue
                 # Paused wall time must not count as occupied transfer time.
                 for key, ctl in pauses.items():
-                    if key not in retiring and ctl.suspended and key not in suspended_accounted:
+                    if (key not in retiring and key not in active_slots and ctl.suspended
+                            and key not in suspended_accounted):
                         paused_since[key] = time.monotonic()
                         pause_requested_at.pop(key, None)
                         pause_delay_reported.discard(key)
@@ -1509,7 +1520,7 @@ class _App:
                 # instead of silently appearing to ignore priority.
                 for key, requested_at in list(pause_requested_at.items()):
                     ctl = pauses.get(key)
-                    if ctl is None or ctl.suspended or key in retiring:
+                    if ctl is None or key not in active_slots or not ctl.requested or key in retiring:
                         pause_requested_at.pop(key, None)
                         continue
                     if (time.monotonic() - requested_at >= 5.0
@@ -1526,60 +1537,91 @@ class _App:
                 self._monitor_active_transfers = len(running_keys)
                 self._monitor_total_transfers = len(active)
                 ready = getattr(self, "_realtime_ready", ())
-                # Each channel's real-time lane is independent of scheduled
-                # priority and never runs (or preempts) an ordinary file.
-                started_realtime = False
-                for item in self._monitored:
-                    peer = item.get("peer_id")
-                    if (item.get("mode") != "realtime" or not item["enabled"]
-                            or peer not in ready or not slots.owns("default", peer)
-                            or not slots.available("default", effective_concurrency, peer)):
+                if any(launch(item, job, effective_concurrency, realtime=True)
+                       for item, job in realtime_candidates(
+                           self._monitored, ready, slots, history, "default",
+                           effective_concurrency, active,
+                       )):
+                    self._monitor_active_transfers = len(active_slots)
+                    continue
+                overflow = list(realtime_candidates(
+                    self._monitored, ready, slots, history, "default",
+                    effective_concurrency, active, borrow=True,
+                )) if ordinary_capacity else []
+                if not overflow or burst.ordinary_turn:
+                    burst.withdraw(pauses, active_slots, retiring)
+                if not overflow and not burst.borrowed:
+                    burst.no_ordinary_demand()
+                if not burst.ordinary_turn:
+                    manual_turn_until = 0.0
+
+                def launch_overflow():
+                    return any(launch(item, job, effective_concurrency, realtime=True, borrow=True)
+                               for item, job in overflow)
+
+                if overflow and not burst.ordinary_turn:
+                    if launch_overflow():
+                        self._monitor_active_transfers = len(active_slots)
                         continue
-                    kinds = {value.strip() for value in item.get("types", "photo,video").split(",")
-                             if value.strip()}
-                    for job in history.pending_for_peer(
-                        peer, account_id="default", limit=16, kinds=kinds, realtime=True,
-                    ):
-                        key = (job.peer_id, job.message_id)
-                        if key in active or not slots.available(
-                            "default", effective_concurrency, peer, file_key=key,
-                        ):
-                            continue
-                        started_realtime = launch(item, job, effective_concurrency, realtime=True)
-                        if started_realtime:
-                            break
-                    if started_realtime:
-                        self._monitor_active_transfers = len(running_keys) + 1
-                        break
-                if started_realtime:
+                    # SSD staging may own cache capacity needed by the next
+                    # realtime file, and existing manual permits are not ours.
+                    if not slots.available("default", effective_concurrency):
+                        victims = sorted(
+                            (key for key in ordinary_running if key not in staged_jobs
+                             and key not in retiring and claims[key] not in committed),
+                            key=lambda key: (
+                                int(by_target.get(active_target[key], {}).get("priority", 0)),
+                                active_started[key],
+                            ),
+                        )
+                        victim = burst.request(pauses, victims, time.monotonic())
+                        if victim is not None:
+                            pause_requested_at[victim] = time.monotonic()
+                    # Do not fill the next freed ordinary slot with another
+                    # scheduled file while there is eligible live overflow.
+                    await wait_for_work(0.1 if burst.preempted else 0.25)
                     continue
                 # Preserve existing manual priority for *ordinary* monitor
                 # work; real-time can independently use its reserved slot.
                 manual_busy = self._download_future is not None and not self._download_future.done()
-                if not manual_busy and ordinary_capacity:
+                # An active manual batch polls for ordinary permits every
+                # 100 ms. On a sustained-burst return turn give it a chance
+                # to take the freed permit, but don't wait for its next page.
+                if (overflow and burst.ordinary_turn and manual_busy
+                        and slots.available("default", effective_concurrency)):
+                    if manual_turn_until == 0.0:
+                        manual_turn_until = time.monotonic() + 0.25
+                    if time.monotonic() < manual_turn_until:
+                        await wait_for_work(0.1)
+                        continue
+                else:
+                    manual_turn_until = 0.0
+                pending = []
+                if ordinary_capacity:
                     candidates = sorted(
                         (
                             item for item in self._monitored
                             if item.get("mode") != "realtime" and item.get("peer_id") not in reserved
                             and (item["enabled"] or any(
-                                key not in retiring and ctl.suspended
+                                key not in retiring and key not in active_slots and ctl.suspended
                                 and active_target[key] == item["target"]
+                                and (not manual_busy or key in burst.preempted)
                                 for key, ctl in pauses.items()
                             ))
                         ),
                         key=lambda item: -int(item.get("priority", 0)),
                     )
-                    pending = []
                     for item in candidates:
                         suspended_jobs = [
                             active_jobs[key] for key, ctl in pauses.items()
-                            if key not in retiring and ctl.suspended
+                            if key not in retiring and key not in active_slots and ctl.suspended
                             and active_target[key] == item["target"]
+                            and (not manual_busy or key in burst.preempted)
                         ]
                         pending.extend((item, suspended) for suspended in suspended_jobs)
                         if suspended_jobs:
                             continue  # Resume all paused files before new ones at this priority.
-                        if not item["enabled"]:
+                        if not item["enabled"] or manual_busy:
                             continue  # Only finish an already-started disabled channel.
                         enabled_kinds = {
                             value.strip() for value in item.get("types", "photo,video").split(",")
@@ -1611,12 +1653,13 @@ class _App:
                             for item in candidates
                         }
                         transitioning = any(
-                            ctl.requested and not ctl.suspended
-                            for ctl in pauses.values()
+                            ctl.requested and key in active_slots and key not in retiring
+                            for key, ctl in pauses.items()
                         )
                         victims = [
                             key for key in ordinary_running
-                            if key not in retiring and not pauses[key].requested
+                            if key not in retiring and claims[key] not in committed
+                            and pauses[key].in_transfer and not pauses[key].requested
                             and priority_by_target.get(active_target[key], 0) < high_priority
                         ]
                         if victims and not transitioning:
@@ -1638,7 +1681,7 @@ class _App:
                     current_occupied = dict(occupied_seconds)
                     now = time.monotonic()
                     for key, target in active_target.items():
-                        if key in realtime_jobs or pauses[key].suspended:
+                        if key in realtime_jobs or key not in active_slots:
                             continue
                         active_counts[target] = active_counts.get(target, 0) + 1
                         current_occupied[target] = (
@@ -1663,6 +1706,11 @@ class _App:
                             default=None,
                         )
                         if highest_running is not None and highest_running > highest:
+                            if overflow:
+                                burst.no_ordinary_demand()
+                                if launch_overflow():
+                                    self._monitor_active_transfers = len(active_slots)
+                                    continue
                             await wait_for_work(0.25)
                             continue  # Higher-priority transfer has not finished yet.
                         matching = [
@@ -1695,6 +1743,7 @@ class _App:
                             suspended_accounted.discard(key)
                             active_started[key] = time.monotonic()
                             pauses[key].resume()
+                            burst.ordinary_started(key, active_started[key])
                             self._monitor_progress_state(key[0], key[1], "恢复中")
                             dispatch_log.add("resumed", item.get("name") or item["target"])
                             continue
@@ -1706,6 +1755,12 @@ class _App:
                             high_name = item.get("name") or item["target"]
                             print(f"[调度] {high_name}：已插队开始下载｜低优先级任务稍后恢复")
                             priority_logged = True
+                        continue
+                if overflow and not pending:
+                    # A return turn is only for eligible ordinary work.
+                    burst.no_ordinary_demand()
+                    if launch_overflow():
+                        self._monitor_active_transfers = len(active_slots)
                         continue
                 await wait_for_work(0.25 if active else 1)
         finally:
@@ -2326,10 +2381,13 @@ class _App:
         """Called from background downloads; only enqueue, never touch Tk."""
         self.progress_queue.put((key, label, done, total, status))
 
-    def _monitor_progress_state(self, peer_id: int, message_id: int, status: str) -> None:
+    def _monitor_progress_state(
+        self, peer_id: int, message_id: int, status: str, *, account_id: str = "default",
+    ) -> None:
         """Publish a worker pause/resume state to Tk without resetting bytes."""
+        account = "" if account_id == "default" else account_id + ":"
         self._update_download_progress(
-            f"__monitor_state__:{peer_id}:{message_id}", "", 0, 0, status
+            f"__monitor_state__:{account}{peer_id}:{message_id}", "", 0, 0, status
         )
 
     def _drain_progress(self) -> None:
@@ -2350,9 +2408,9 @@ class _App:
                         states[prefix] = event[4]
                     continue
                 if event[4] == "下载中":
-                    prefix = ":".join(event[0].split(":", 2)[:2]) + ":"
-                    if states.get(prefix) == "恢复中":
-                        states.pop(prefix, None)
+                    for prefix, status in list(states.items()):
+                        if status == "恢复中" and event[0].startswith(prefix):
+                            states.pop(prefix, None)
                 latest[event[0]] = event
         except queue.Empty:
             pass
@@ -2530,7 +2588,7 @@ class _App:
             )
             count = (
                 getattr(self, "_monitor_active_transfers", 0) if primary
-                else runtime.active_count
+                else getattr(runtime, "running_count", runtime.active_count)
             )
             monitor = "监控运行中" if running else "监控停止中" if draining else "监控未启动"
             status = f"已登录：{display}｜{monitor}｜监控下载中 {count} 个"
@@ -2877,6 +2935,9 @@ class _App:
             account, self._account_registry, ask=self._ask, slots=getattr(self, "_slots", None),
             on_log=self._log_account, on_saved=self._log_download_account,
             on_progress=self._update_download_progress, restore_session_only=True,
+            on_progress_state=lambda peer, mid, status: self._monitor_progress_state(
+                peer, mid, status, account_id=account_id,
+            ),
             on_authenticated=lambda: self.root.after(0, connected),
         )
         self._extra_runtimes[account_id] = runtime
@@ -2973,6 +3034,9 @@ class _App:
                 account, self._account_registry, ask=self._ask, slots=getattr(self, "_slots", None),
                 on_log=self._log_account, on_saved=self._log_download_account,
                 on_progress=self._update_download_progress,
+                on_progress_state=lambda peer, mid, status: self._monitor_progress_state(
+                    peer, mid, status, account_id=account_id,
+                ),
                 authenticate=dialog.flow.authenticate,
                 on_authenticated=lambda: self.root.after(0, connected),
             )

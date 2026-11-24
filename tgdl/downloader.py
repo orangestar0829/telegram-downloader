@@ -1214,6 +1214,15 @@ async def _download_with_retry(
 ) -> Path | None:
     for attempt in range(retries + 1):
         try:
+            if monitor_flow is not None and monitor_flow.pause.requested:
+                # A pause requested during the last RPC can outlive a failed
+                # media attempt. Register the retry's entry checkpoint so it
+                # cannot fetch again after yielding its permit.
+                monitor_flow.pause.register()
+                try:
+                    await monitor_flow.pause.checkpoint()
+                finally:
+                    monitor_flow.pause.unregister()
             return await _download_one(
                 client, message, dest_dir, base,
                 skip_existing=skip_existing, stats=stats,

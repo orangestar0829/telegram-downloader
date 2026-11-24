@@ -46,6 +46,7 @@ class _Permit:
     lane: int | None
     key: tuple[int, int] | None
     scheduled: bool
+    borrowed_peer: int | None
 
 
 class SlotCoordinator:
@@ -97,35 +98,65 @@ class SlotCoordinator:
             limit = min(workers, self._plan.limits.get(account_id, workers))
             return max(0, limit - sum(o == account_id for o in self._plan.owners.values()))
 
+    def _realtime_clear(self, account_id: str, peer_id: int) -> bool:
+        # Existing auto downloads from the previous mode/owner must drain.
+        return self.owns(account_id, peer_id) and not any(
+            (slot.scheduled and slot.key and slot.key[0] == peer_id)
+            or (slot.account != account_id and peer_id in (slot.lane, slot.borrowed_peer))
+            for slot in self._active.values()
+        )
+
+    def can_borrow_realtime(self, account_id: str, workers: int, peer_id: int) -> bool:
+        """A running and still-owned dedicated lane may use ordinary capacity."""
+        with self._lock:
+            return (
+                self.ordinary_capacity(account_id, workers) > 0
+                and self._realtime_clear(account_id, peer_id)
+                and any(slot.account == account_id and slot.lane == peer_id
+                        for slot in self._active.values())
+            )
+
+    def file_available(self, file_key: tuple[int, int]) -> bool:
+        with self._lock:
+            return not any(slot.key == file_key for slot in self._active.values())
+
     def available(self, account_id: str, workers: int, peer_id: int | None = None, *,
-                  file_key: tuple[int, int] | None = None) -> bool:
+                  file_key: tuple[int, int] | None = None, borrow: bool = False) -> bool:
         with self._lock:
             active = self._active.values()
-            if file_key is not None and any(slot.key == file_key for slot in active):
+            if file_key is not None and not self.file_available(file_key):
                 return False
             limit = min(workers, self._plan.limits.get(account_id, workers))
             if sum(slot.account == account_id for slot in active) >= limit:
                 return False
-            if peer_id is None:
+            if borrow:
+                if (peer_id is None or file_key is None or file_key[0] != peer_id
+                        or not self.can_borrow_realtime(account_id, workers, peer_id)):
+                    return False
+            if peer_id is None or borrow:
                 return (sum(slot.account == account_id and slot.lane is None for slot in active)
                         < self.ordinary_capacity(account_id, workers))
-            # A channel may have ordinary scheduled files already writing
-            # when it switches to realtime (possibly via another account).
-            # Let them drain rather than momentarily running two auto lanes.
-            return self.owns(account_id, peer_id) and not any(
-                slot.lane == peer_id or (slot.scheduled and slot.key and slot.key[0] == peer_id)
-                for slot in active
+            return self._realtime_clear(account_id, peer_id) and not any(
+                slot.lane == peer_id for slot in active
             )
 
     def acquire(self, account_id: str, workers: int, peer_id: int | None = None, *,
-                file_key: tuple[int, int] | None = None, scheduled_monitor: bool = False) -> object | None:
+                file_key: tuple[int, int] | None = None, scheduled_monitor: bool = False,
+                borrow: bool = False, realtime_item: Mapping | None = None) -> object | None:
         with self._lock:
             if scheduled_monitor and file_key is not None and file_key[0] in self._plan.owners:
                 return None
-            if not self.available(account_id, workers, peer_id, file_key=file_key):
+            if realtime_item is not None and (
+                realtime_item.get("peer_id") != peer_id or not self.matches(account_id, realtime_item)
+            ):
+                return None
+            if not self.available(account_id, workers, peer_id, file_key=file_key, borrow=borrow):
                 return None
             token = object()
-            self._active[token] = _Permit(account_id, peer_id, file_key, scheduled_monitor)
+            self._active[token] = _Permit(
+                account_id, None if borrow else peer_id, file_key, scheduled_monitor,
+                peer_id if borrow else None,
+            )
             return token
 
     def release(self, token: object | None) -> None:

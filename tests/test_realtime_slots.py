@@ -56,6 +56,31 @@ def test_reconfigure_does_not_overbook_during_existing_transfers():
     assert not slots.available("a", 2)  # never borrow idle peer 1
 
 
+def test_overflow_uses_only_owned_ordinary_capacity_and_blocks_old_owner_handover():
+    slots = SlotCoordinator()
+    slots.configure(make_plan([("a", 3, [row(10), row(20)]), ("b", 2, [row(10)])]))
+    assert slots.acquire("a", 3, 10, file_key=(10, 2), borrow=True) is None
+    live = slots.acquire("a", 3, 10, file_key=(10, 1))
+    manual = slots.acquire("a", 3, file_key=(30, 1))
+    assert live is not None and manual is not None
+    assert slots.acquire("a", 3, 10, file_key=(10, 2), borrow=True) is None
+    assert slots.acquire("b", 2, 10, file_key=(10, 2), borrow=True) is None
+    slots.release(manual)
+    overflow = slots.acquire("a", 3, 10, file_key=(10, 2), borrow=True)
+    assert overflow is not None
+    assert slots.acquire("a", 3, 10, file_key=(10, 3), borrow=True) is None
+    assert slots.acquire("a", 3, file_key=(30, 1)) is None
+    assert slots.acquire("a", 3, 20, file_key=(20, 1)) is not None
+    slots.release(live)
+    replacement = slots.acquire("a", 3, 10, file_key=(10, 3))
+    assert replacement is not None  # Its own overflow never occupies its dedicated lane.
+    slots.configure(make_plan([("a", 3, [row(20)]), ("b", 2, [row(10)])]))
+    slots.release(replacement)
+    assert slots.acquire("b", 2, 10, file_key=(10, 4)) is None
+    slots.release(overflow)
+    assert slots.acquire("b", 2, 10, file_key=(10, 4)) is not None
+
+
 def test_new_activation_timestamp_survives_exit_before_first_monitor_start(tmp_path, monkeypatch):
     monkeypatch.setattr(monitor.time, "time", lambda: 123456)
     row = {"target": "-1000000000010", "minutes": 5}

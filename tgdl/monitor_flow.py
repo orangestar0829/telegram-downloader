@@ -45,6 +45,16 @@ class MonitorPause:
     def suspended(self) -> bool:
         return self.requested and self._stopped.is_set()
 
+    @property
+    def in_transfer(self) -> bool:
+        """At least one media lane is registered (not metadata or final copy)."""
+        return self._lanes > 0
+
+    @property
+    def safely_suspended(self) -> bool:
+        """A real byte checkpoint, not the vacuous zero-lane acknowledgement."""
+        return self.in_transfer and self.suspended
+
     def _sync(self) -> None:
         if self.requested and self._waiting >= self._lanes:
             self._stopped.set()
