@@ -57,6 +57,7 @@ from tgdl.monitor import (
 )
 
 from tgdl.paths import data_dir, monitor_migration_error
+from tgdl.progress import format_transfer_rate, format_transfer_size
 from tgdl.slots import SlotCoordinator, make_plan
 from tgdl.realtime_runtime import RealtimeDispatch
 from tgdl.realtime_burst import RealtimeBurst, realtime_candidates
@@ -2451,9 +2452,11 @@ class _App:
             ratio = min(1.0, done / total) if total else 0
             cells = int(ratio * 10)
             bar = "━" * cells + "─" * (10 - cells)
-            portion = f"{done / 1048576:.1f}/{total / 1048576:.1f} MiB  {ratio:.0%}" if total else f"{done / 1048576:.1f} MiB"
+            portion = format_transfer_size(done)
+            if total:
+                portion += f" / {format_transfer_size(total)}  {ratio:.0%}"
             speed = (
-                f"{entry['speed'] / 1048576:.2f} MiB/s"
+                format_transfer_rate(entry["speed"])
                 if display_status == "下载中" and now - entry["last_time"] < 3
                 else "—"
             )
@@ -2466,10 +2469,14 @@ class _App:
                 paused.append(entry)
             elif display_status not in ("完成", "失败", "限流等待", "已取消"):
                 running.append(entry)
+        total_speed = sum(
+            entry["speed"] for entry in running
+            if entry["status"] == "下载中" and now - entry["last_time"] < 3
+        )
         self.progress_summary.set(
             f"正在下载 {len(running)} 个文件"
             + (f"，已暂停 {len(paused)} 个" if paused else "")
-            + f"，合计速度 {sum(v['speed'] for v in running if v['status'] == '下载中' and now - v['last_time'] < 3) / 1048576:.2f} MiB/s"
+            + f"，合计速度 {format_transfer_rate(total_speed)}"
             if running or paused else "当前没有正在下载的文件"
         )
 

@@ -60,7 +60,7 @@ from tgdl.errors import ChannelAccessError
 from tgdl.history import DownloadHistory, PendingMedia
 from tgdl.paths import data_dir
 from tgdl.slots import SlotCoordinator
-from tgdl.progress import ProgressCallback, TransferProgress
+from tgdl.progress import ProgressCallback, TransferProgress, format_transfer_size
 from tgdl.temp_cleanup import PEER_DOWNLOADS_DIR, is_link_or_reparse_point, own_temporary
 
 PHOTO_TYPES = {"photo"}
@@ -1149,8 +1149,9 @@ async def _download_one(
     stats.saved += 1
     transfer.emit("完成", force=True)
     elapsed = max(time.monotonic() - started, 0.001)
-    size_mib = final_path.stat().st_size / 1048576
-    detail = (f"[下载完成] {final_path.name} | {size_mib:.1f} MiB | "
+    size_bytes = final_path.stat().st_size
+    size_mib = size_bytes / 1048576
+    detail = (f"[下载完成] {final_path.name} | {format_transfer_size(size_bytes)} | "
               f"{elapsed:.1f}秒 | 全程均速{size_mib / elapsed:.2f} MiB/s | {mode}"
               f" | 传输阶段{media_elapsed:.1f}秒，均速{size_mib / media_elapsed:.2f} MiB/s")
     if flood_before is not None and callable(flood_snapshot):
