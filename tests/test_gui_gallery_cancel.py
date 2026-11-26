@@ -39,6 +39,7 @@ def test_gallery_save_uses_cancel_button_and_awaits_child_cleanup(monkeypatch):
     app._stop_download = threading.Event()
     app._closing = False
     app._gallery_title = "test"
+    app._gallery_entity = object()
     app.gallery_cells = [(SimpleNamespace(get=lambda: True), object())]
     app._media_options = lambda: (1, 2, 1)
     app._ensure_client = fake_ensure_client

@@ -58,7 +58,10 @@ def test_existing_file_backfills_history(tmp_path):
     path = folder / "20261119_8.mp4"
     path.write_bytes(b"existing file")
     client = FakeClient()
-    assert run(client, message(8), folder, history) is None
+    known = SimpleNamespace(id=8, media=SimpleNamespace(
+        document=SimpleNamespace(size=len(b"existing file"), mime_type="video/mp4"),
+    ))
+    assert run(client, known, folder, history) is None
     assert history.contains(1234, 8)
     path.unlink()
     assert run(client, message(8), folder, history) is None

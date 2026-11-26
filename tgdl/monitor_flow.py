@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from collections.abc import Callable
 
+from tgdl.auto_throttle import MonitorAutoThrottle
 from tgdl.chunked import (
     CHUNK_IDLE_TIMEOUT, CHUNK_RETRIES, ChunkDownloadStalled, REQUEST_BYTES,
 )
@@ -43,6 +44,16 @@ class MonitorPause:
     @property
     def suspended(self) -> bool:
         return self.requested and self._stopped.is_set()
+
+    @property
+    def in_transfer(self) -> bool:
+        """At least one media lane is registered (not metadata or final copy)."""
+        return self._lanes > 0
+
+    @property
+    def safely_suspended(self) -> bool:
+        """A real byte checkpoint, not the vacuous zero-lane acknowledgement."""
+        return self.in_transfer and self.suspended
 
     def _sync(self) -> None:
         if self.requested and self._waiting >= self._lanes:
@@ -96,6 +107,12 @@ class SharedSpeedLimiter:
         self._updated = time.monotonic()
         self._previous_limit = self.bytes_per_second
         self._lock = asyncio.Lock()
+        self.auto_throttle: MonitorAutoThrottle | None = None
+
+    def bind_auto_throttle(self, *, log: Callable[[str], None]) -> MonitorAutoThrottle:
+        """One ephemeral policy per account dispatcher, shared across its file lanes."""
+        self.auto_throttle = MonitorAutoThrottle(self, log=log)
+        return self.auto_throttle
 
     async def consume(self, amount: int, pause: MonitorPause | None = None) -> None:
         if amount <= 0:
@@ -122,7 +139,15 @@ class SharedSpeedLimiter:
                     self._tokens -= amount
                     return
                 delay = (amount - self._tokens) / limit
+            policy = self.auto_throttle
+            generation = policy.generation if policy and policy.enabled else None
             await asyncio.sleep(min(0.1, max(0.01, delay)))
+            if (generation is not None and policy.enabled and policy.generation == generation
+                    and not (pause and pause.requested)):
+                # Paid token-bucket time for bytes actually received, not a
+                # scan, a Telethon retry, or an arbitrary idle gap. Concurrent
+                # lanes share one clock and the governor unions their spans.
+                policy.on_paced(now, time.monotonic())
 
 
 @dataclass
@@ -159,15 +184,20 @@ async def monitor_download_document(
         handle.truncate(size)
     next_window = 0
     returned_ranges: deque[tuple[int, int]] = deque()
+    in_flight = 0
 
     async def worker(lane: int) -> None:
-        nonlocal next_window
+        nonlocal next_window, in_flight
         while True:
-            if lane >= flow.chunks():
-                if next_window >= size and not returned_ranges:
-                    return
+            if next_window >= size and not returned_ranges and not in_flight:
+                return
+            if (lane >= flow.chunks()
+                    or (next_window >= size and not returned_ranges)):
+                # A slower lane may still return an unfinished range when
+                # the limit drops. Do not let its replacement exit early.
                 await asyncio.sleep(0.1)
                 continue
+            owns_window = False
             flow.pause.register()
             try:
                 await flow.pause.checkpoint()
@@ -178,9 +208,11 @@ async def monitor_download_document(
                 else:
                     start = next_window
                     if start >= size:
-                        return
+                        continue
                     end = min(size, start + WINDOW_BYTES)
                     next_window = end
+                in_flight += 1
+                owns_window = True
                 position = start
                 handed_off = False
                 for attempt in range(CHUNK_RETRIES + 1):
@@ -235,6 +267,8 @@ async def monitor_download_document(
                 if position != end and not handed_off:
                     raise ChunkDownloadStalled(f"Incomplete monitor window {position} != {end}")
             finally:
+                if owns_window:
+                    in_flight -= 1
                 flow.pause.unregister()
 
     tasks = [asyncio.create_task(worker(i)) for i in range(8)]

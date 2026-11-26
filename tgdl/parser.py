@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-import aiohttp
 from telethon import TelegramClient
 from telethon.tl.types import (
     Message,
@@ -21,10 +20,12 @@ from tgdl.downloader import (
     _download_one,
     classify_message,
     resolve_channel,
-    safe_name,
+    download_peer_key,
+    peer_download_folder,
 )
 from tgdl.http_fetch import USER_AGENT, download_http_asset
 from tgdl.links import ParsedLink, classify_url, extract_raw_urls
+from tgdl.public_http import public_session
 from tgdl.torrent_fetch import download_torrent
 
 
@@ -98,10 +99,14 @@ async def parse_channel(
     download_direct: bool = True,
     download_torrents: bool = True,
     dry_run: bool = False,
+    catalog_only: bool = False,
+    show_sensitive_details: bool = True,
 ) -> ParserStats:
+    if catalog_only:
+        keep_previews = download_direct = download_torrents = False
     entity = await resolve_channel(client, target)
     title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(entity.id)
-    folder = download_dir / safe_name(str(title))
+    folder = peer_download_folder(download_dir, title, entity, create=not dry_run)
     preview_photos = folder / "photos"
     preview_videos = folder / "videos"
     direct_dir = folder / "parsed" / "direct"
@@ -116,7 +121,7 @@ async def parse_channel(
     rows: list[dict[str, object]] = []
     preview_stats = DownloadStats()
 
-    async with aiohttp.ClientSession(headers={"User-Agent": USER_AGENT}) as session:
+    async with public_session(headers={"User-Agent": USER_AGENT}) as session:
         async for message in client.iter_messages(entity, offset_date=until):
             if limit is not None and stats.messages >= limit:
                 break
@@ -141,7 +146,8 @@ async def parse_channel(
                 date_prefix = msg_date.strftime("%Y%m%d")
                 base = f"{date_prefix}_{message.id}"
                 if dry_run:
-                    print(f"{base}  preview/{kind}  {(message.raw_text or '')[:50]}")
+                    excerpt = (message.raw_text or "")[:50] if show_sensitive_details else ""
+                    print(f"{base}  preview/{kind}  {excerpt}")
                     stats.previews += 1
                 else:
                     dest = preview_photos if kind == "photo" else preview_videos
@@ -179,7 +185,8 @@ async def parse_channel(
                 }
 
                 if dry_run:
-                    print(f"{message.id}  {parsed.category:<13}  {parsed.url}")
+                    suffix = f"  {parsed.url}" if show_sensitive_details else ""
+                    print(f"{message.id}  {parsed.category:<13}{suffix}")
                     stats.catalogued += 1
                     rows.append(row)
                     continue
@@ -225,7 +232,7 @@ async def parse_channel(
                         stats.failed += 1
                         row["error"] = str(exc)
 
-                elif parsed.category == "telegram":
+                elif parsed.category == "telegram" and not catalog_only:
                     extra = await _try_telegram_post(client, parsed, folder, msg_date, message.id)
                     if extra:
                         row["downloaded"] = True
@@ -234,6 +241,7 @@ async def parse_channel(
 
                 rows.append(row)
                 stats.catalogued += 1
+
 
     if not dry_run:
         write_catalog(catalog_path, rows)
@@ -285,7 +293,7 @@ async def _try_telegram_post(
             client,
             message,
             dest,
-            f"{msg_date.strftime('%Y%m%d')}_{source_id}_tme{msg_id}",
+            f"{msg_date.strftime('%Y%m%d')}_{source_id}_tme{download_peer_key(entity)}_{msg_id}",
             skip_existing=True,
             stats=stats,
         )

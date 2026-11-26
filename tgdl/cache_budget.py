@@ -12,6 +12,8 @@ from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from tgdl.temp_cleanup import staging_orphan_bytes
+
 GIB = 1024 ** 3
 MAX_CACHE_BYTES = 20 * GIB
 MIN_FREE_BYTES = 10 * GIB
@@ -41,12 +43,9 @@ class _CacheBudget:
             except OSError:
                 continue
             for folder in candidates:
-                if not folder.is_dir() or folder.resolve() in self._owned_directories:
-                    continue
                 try:
-                    total += sum(
-                        file.stat().st_size for file in folder.rglob("*") if file.is_file()
-                    )
+                    if folder.resolve() not in self._owned_directories:
+                        total += staging_orphan_bytes(folder)
                 except OSError:
                     # External cleanup might race with scanning these entries.
                     continue

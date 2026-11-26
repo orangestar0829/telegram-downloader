@@ -20,7 +20,7 @@ def test_stdout_and_stderr_share_line_state():
     stdout.write("First")
     stderr.write(" line\n")
     stdout.write("Second\n")
-    assert "".join(sink.get_nowait() for _ in range(3)) == (
-        "[2026-11-19 15:04:09] First line\n"
-        "[2026-11-19 15:04:09] Second\n"
+    assert "".join(sink.get_nowait().text for _ in range(3)) == (
+        "[2026-11-19 15:04:09] [账号:原账号（未登录）] First line\n"
+        "[2026-11-19 15:04:09] [账号:原账号（未登录）] Second\n"
     )

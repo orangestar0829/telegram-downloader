@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import re
+import tempfile
 from pathlib import Path
 
 import aiohttp
 from tqdm import tqdm
 
-from tgdl.downloader import kind_from_name_and_mime, unique_path
+from tgdl.downloader import ANIM_EXTS, IMAGE_EXTS, VIDEO_EXTS, kind_from_name_and_mime, unique_path
+from tgdl.public_http import public_response
+from tgdl.temp_cleanup import own_temporary
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -59,7 +62,7 @@ async def download_http_asset(
     torrent_dir.mkdir(parents=True, exist_ok=True)
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=180)
     headers = {"User-Agent": USER_AGENT}
-    async with session.get(url, allow_redirects=True, timeout=timeout, headers=headers) as resp:
+    async with public_response(session, url, timeout=timeout, headers=headers) as resp:
         if resp.status >= 400:
             return "error", None
         content_type = resp.content_type or resp.headers.get("Content-Type", "")
@@ -77,17 +80,34 @@ async def download_http_asset(
         if length is not None and length > MAX_BYTES:
             return "too-large", None
 
-        suffix = Path(filename).suffix or (".torrent" if kind == "torrent" else ".bin")
-        final_path = unique_path(dest_dir / f"{basename}{suffix}")
-        with tqdm(total=length, unit="B", unit_scale=True, desc=basename, leave=False) as bar:
-            with final_path.open("wb") as handle:
-                async for chunk in resp.content.iter_chunked(1024 * 256):
-                    handle.write(chunk)
-                    bar.update(len(chunk))
-                    if final_path.stat().st_size > MAX_BYTES:
-                        handle.close()
-                        final_path.unlink(missing_ok=True)
-                        return "too-large", None
+        suffix = Path(filename).suffix.lower()
+        if kind == "torrent":
+            suffix = ".torrent"
+        elif suffix not in IMAGE_EXTS | VIDEO_EXTS | ANIM_EXTS:
+            # MIME/filename hints are untrusted. In particular do not keep
+            # a Windows executable/script suffix from Content-Disposition.
+            detected = kind_from_name_and_mime("", content_type)
+            suffix = {"photo": ".jpg", "video": ".mp4", "animation": ".gif"}.get(detected, ".bin")
+        total = 0
+        # Keep partial files out of the final directory's visible filenames;
+        # exceptions and cancellation unwind both contexts without publishing.
+        with tempfile.TemporaryDirectory(prefix="tgdl-", dir=dest_dir) as directory:
+            staging = Path(directory)
+            with own_temporary(staging):
+                partial = staging / "download.part"
+                with tqdm(total=length, unit="B", unit_scale=True, desc=basename, leave=False) as bar:
+                    with partial.open("xb") as handle:
+                        async for chunk in resp.content.iter_chunked(1024 * 256):
+                            total += len(chunk)
+                            if total > MAX_BYTES:
+                                return "too-large", None
+                            handle.write(chunk)
+                            bar.update(len(chunk))
+                encoding = resp.headers.get("Content-Encoding", "identity").strip().lower()
+                if length is not None and encoding == "identity" and total != length:
+                    raise aiohttp.ClientPayloadError("Incomplete HTTP media body")
+                final_path = unique_path(dest_dir / f"{basename}{suffix}")
+                partial.replace(final_path)
         return kind, final_path
 
 

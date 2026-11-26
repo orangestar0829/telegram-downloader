@@ -8,6 +8,22 @@ ProgressCallback = Callable[[str, str, int, int, str], None]
 REFRESH_SECONDS = 0.25
 
 
+def format_transfer_size(byte_count: int) -> str:
+    if byte_count >= 1024 ** 2:
+        return f"{byte_count / 1024 ** 2:.1f} MiB"
+    if byte_count >= 1024:
+        return f"{byte_count / 1024:.1f} KiB"
+    return f"{byte_count} B"
+
+
+def format_transfer_rate(bytes_per_second: float) -> str:
+    if bytes_per_second >= 1024 ** 2:
+        return f"{bytes_per_second / 1024 ** 2:.2f} MiB/s"
+    if bytes_per_second >= 1024:
+        return f"{bytes_per_second / 1024:.2f} KiB/s"
+    return f"{bytes_per_second:.2f} B/s"
+
+
 class TransferProgress:
     def __init__(self, key: str, label: str, callback: ProgressCallback | None):
         self.key = key

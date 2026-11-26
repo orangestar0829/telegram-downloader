@@ -21,6 +21,8 @@ git push origin v1.3.4
 几分钟后到仓库 **Releases** 页面即可下载 `TelegramDownloader-Setup-1.3.4.exe`。
 （也可在 Actions 里手动触发 `workflow_dispatch`，产物在该次运行的 Artifacts 中。）
 
+PR #4 的预览工作流为每个提交发布独立的 `preview-pr-4-<完整SHA>` 预发布，不上传 Actions Artifacts、不覆盖已有预览。若 GitHub 拒绝 Actions 创建指向含工作流修改的提交标签，由维护者在该**确切提交**创建并推送同名标签，然后重跑原工作流。预览标签已存在但指向不同提交时工作流会停止；不要移动或复用旧预览标签。
+
 ### 让发布版内置 api_id/api_hash(终端用户免填,可选)
 
 在仓库 `Settings → Secrets and variables → Actions` 添加两个 secret:
@@ -45,11 +47,12 @@ packaging\build_windows.cmd 1.3.4
 ```bat
 pip install -r requirements.txt pyinstaller
 pyinstaller --noconfirm packaging\tgdl.spec
+python packaging\build_uninstall_manifest.py dist\TelegramDownloader packaging\uninstall_manifest.nsh
 makensis /DVERSION=1.3.4 packaging\installer.nsi
 ```
 
 - `tgdl.spec`：PyInstaller 配置，产出 `dist\TelegramDownloader\TelegramDownloader.exe`（onedir，无控制台窗口，内嵌图标 + `version_info.txt` 版本信息）。
-- `installer.nsi`：NSIS 脚本，把上面的目录装进 `Program Files`，创建开始菜单 / 桌面快捷方式和卸载程序。
+- `installer.nsi`：NSIS 脚本，把清单列出的文件装进 `Program Files`，创建快捷方式和卸载程序。卸载只删除本版清单中的程序文件和空目录，不递归删除安装目录；便携数据和额外文件会保留。清单必须从不含用户数据的构建输出重新生成。旧版安装包生成的卸载器不受此修复影响。
 - 同时会打一个 **便携版** `TelegramDownloader-<版本>-portable-win64.zip`（解压即用，浏览器一般不拦 zip）。
 
 ## 减少杀毒误报

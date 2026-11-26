@@ -149,7 +149,7 @@ def test_chunked_completion_includes_io_stage_timings(tmp_path):
 
 
 def test_ssd_staging_then_atomic_publish_to_other_volume(tmp_path, monkeypatch):
-    from tgdl import downloader
+    from tgdl import cache_budget, downloader
     from types import SimpleNamespace
 
     data = b"z" * (16 * 1024 * 1024 + 17)
@@ -160,6 +160,8 @@ def test_ssd_staging_then_atomic_publish_to_other_volume(tmp_path, monkeypatch):
     output = tmp_path / "hdd" / "videos"
     staging = tmp_path / "ssd" / "staging"
     monkeypatch.setattr(downloader, "same_volume", lambda src, dst: False)
+    monkeypatch.setattr(cache_budget.shutil, "disk_usage",
+                        lambda path: SimpleNamespace(free=40 * cache_budget.GIB))
     logs = []
     result = asyncio.run(downloader._download_one(
         client, message, output, "20261119_99",
@@ -221,8 +223,13 @@ def test_small_media_fallback():
 def test_stalled_parallel_download_falls_back_to_regular(tmp_path, monkeypatch):
     from tgdl import downloader
 
+    from tgdl import chunked
+
+    complete = b"complete-regular-download"
+    monkeypatch.setattr(chunked, "MIN_CHUNKED_BYTES", len(complete))
+
     class Media:
-        document = Document(32 * 1024 * 1024)
+        document = Document(len(complete))
 
     class Message:
         media = Media()
@@ -235,7 +242,7 @@ def test_stalled_parallel_download_falls_back_to_regular(tmp_path, monkeypatch):
         async def download_media(self, message, *, file, progress_callback):
             path = __import__("pathlib").Path(file)
             assert not (path.parent / "data.mp4").exists()
-            path.write_bytes(b"complete-regular-download")
+            path.write_bytes(complete)
             return str(path)
 
     async def fail_chunks(*args, **kwargs):
@@ -250,7 +257,7 @@ def test_stalled_parallel_download_falls_back_to_regular(tmp_path, monkeypatch):
     ))
     assert path is not None
     assert path.name == "20261119_123.mp4"
-    assert path.read_bytes() == b"complete-regular-download"
+    assert path.read_bytes() == complete
     assert stats.saved == 1 and stats.failed == 0
     assert not list(tmp_path.glob("tgdl-*"))
 

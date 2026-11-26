@@ -33,7 +33,7 @@ except Exception as exc:  # pragma: no cover - build-time guard
 APP_NAME = "TelegramDownloader"
 
 datas, binaries, hiddenimports = [], [], []
-for pkg in ("telethon", "aiohttp", "dotenv", "tqdm", "rsa", "pyaes", "PIL", "cryptg", "python_socks"):
+for pkg in ("telethon", "aiohttp", "dotenv", "tqdm", "rsa", "pyaes", "PIL", "qrcode", "cryptg", "python_socks"):
     pkg_datas, pkg_binaries, pkg_hidden = collect_all(pkg)
     datas += pkg_datas
     binaries += pkg_binaries

@@ -2,21 +2,24 @@ name: Build Windows preview for PR
 
 on:
   push:
-    branches: [fix/chunk-stall-progress-pr-build]
+    branches: [feat/multi-account-multi-proxy]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: windows-preview-release
+  group: windows-preview-pr4
   cancel-in-progress: false
 
 jobs:
   windows-preview:
+    if: github.ref == 'refs/heads/feat/multi-account-multi-proxy'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -29,20 +32,23 @@ jobs:
       - name: Check cryptg and SOCKS5
         run: python -c "import cryptg, python_socks, telethon; print('Telethon', telethon.__version__)"
       - name: Build Windows executable
-        run: pyinstaller --noconfirm packaging/tgdl.spec
+        run: |
+          pyinstaller --noconfirm packaging/tgdl.spec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python packaging/build_uninstall_manifest.py dist/TelegramDownloader packaging/uninstall_manifest.nsh
       - name: Install NSIS
         run: choco install nsis -y --no-progress
       - name: Package Windows installer and portable ZIP
         shell: pwsh
         run: |
-          $version = "pr-3-${{ github.run_number }}"
+          $version = "pr-4-$($env:GITHUB_SHA.Substring(0, 12))"
           $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (-not (Test-Path $makensis)) { $makensis = "makensis" }
           & $makensis "/DVERSION=$version" packaging/installer.nsi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType File -Path dist/TelegramDownloader/portable.flag -Force | Out-Null
           New-Item -ItemType Directory -Path dist/TelegramDownloader/data -Force | Out-Null
-          Set-Content -Path dist/TelegramDownloader/data/README.txt -Value "Portable user data: .env, tgdl_session.session, tgdl_download_history.sqlite3. Keep this folder when upgrading."
+          Set-Content -Path dist/TelegramDownloader/data/README.txt -Value "Keep data/ when upgrading: .env, sessions, accounts.json, accounts/, monitored_channels.json, tgdl_download_history.sqlite3, logs/."
           Compress-Archive -Path dist/TelegramDownloader -DestinationPath "TelegramDownloader-$version-portable-win64.zip" -Force
       - name: Publish preview prerelease (no Actions artifacts)
         shell: pwsh
@@ -50,21 +56,42 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
-          $tag = "preview-pr-3"
-          $sha = "${{ github.sha }}"
-          $installer = Get-ChildItem "TelegramDownloader-Setup-pr-*.exe" | Select-Object -First 1
-          $portable = Get-ChildItem "TelegramDownloader-pr-*-portable-win64.zip" | Select-Object -First 1
-          if (-not $installer -or -not $portable) { throw "Missing Windows build output" }
-          Copy-Item $installer.FullName "TelegramDownloader-PR3-Setup.exe"
-          Copy-Item $portable.FullName "TelegramDownloader-PR3-portable-win64.zip"
-          # Create the prerelease if necessary. Keep the same tag/URL across builds.
-          gh release view $tag --json tagName *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --target $sha --title "PR #3 Windows preview" --notes "Unmerged preview build from PR #3. Not a stable release." --prerelease
-            if ($LASTEXITCODE -ne 0) { throw "Could not create prerelease" }
+          $sha = $env:GITHUB_SHA
+          $version = "pr-4-$($sha.Substring(0, 12))"
+          $installer = "TelegramDownloader-Setup-$version.exe"
+          $portable = "TelegramDownloader-$version-portable-win64.zip"
+          $checksums = "SHA256SUMS.txt"
+          $tag = "preview-pr-4-$sha"
+          $ref = "refs/tags/$tag"
+          $peeled = "$ref^{}"
+          $targetRefs = @(git ls-remote --tags origin $ref $peeled)
+          if ($LASTEXITCODE -ne 0) { throw "Could not verify preview tag" }
+          $tagOptions = @('--target', $sha)
+          if ($targetRefs.Count -gt 0) {
+            $resolved = @($targetRefs | Where-Object { ($_ -split '\s+')[1] -eq $peeled })
+            if ($resolved.Count -eq 0) { $resolved = $targetRefs }
+            if ($resolved.Count -ne 1 -or ($resolved[0] -split '\s+')[0] -ne $sha) {
+              throw "Existing tag $tag does not point to $sha; refusing to publish"
+            }
+            $tagOptions = @('--verify-tag')
           }
-          # Replace assets only after both builds have succeeded.
-          gh release upload $tag "TelegramDownloader-PR3-Setup.exe" "TelegramDownloader-PR3-portable-win64.zip" --clobber
-          if ($LASTEXITCODE -ne 0) { throw "Could not upload prerelease assets" }
-          gh release edit $tag --target $sha --prerelease --title "PR #3 Windows preview" --notes "Unmerged preview from commit $sha. Build run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          if ($LASTEXITCODE -ne 0) { throw "Could not update prerelease" }
+          $existing = gh release view $tag --json isDraft,isPrerelease,assets 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $release = $existing | ConvertFrom-Json
+            $names = @($release.assets | ForEach-Object { $_.name })
+            if ($targetRefs.Count -eq 0 -or $release.isDraft -or -not $release.isPrerelease -or
+                $installer -notin $names -or $portable -notin $names -or $checksums -notin $names) {
+              throw "Existing release $tag is incomplete or not tied to its source. Inspect it manually; this workflow will not overwrite it."
+            }
+            Write-Host "Release $tag already exists; no assets will be replaced."
+            exit 0
+          }
+          @($installer, $portable) | ForEach-Object {
+            $hash = Get-FileHash -LiteralPath $_ -Algorithm SHA256
+            "$($hash.Hash.ToLowerInvariant())  $_"
+          } | Set-Content -LiteralPath $checksums -Encoding ascii
+          $run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          gh release create $tag $installer $portable $checksums @tagOptions --prerelease --title "PR #4 Windows preview $($sha.Substring(0, 12))" --notes "Unmerged preview from commit $sha. Build run: $run"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not publish preview. If GitHub refused tag creation, have a maintainer create and push $tag at exactly $sha, then rerun this job. Do not reuse the old preview tag."
+          }

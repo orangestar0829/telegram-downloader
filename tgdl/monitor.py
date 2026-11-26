@@ -3,9 +3,17 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import uuid4
 
+from tgdl.history import PendingMedia, UnreadableRetry
 from tgdl.paths import prepare_data_dir
+
+
+SCHEDULED = "scheduled"
+REALTIME = "realtime"
+MONITOR_MODE_LABELS = {SCHEDULED: "定时扫描", REALTIME: "实时监听"}
 
 
 class MonitorDispatchSummary:
@@ -54,8 +62,53 @@ class MonitorDispatchSummary:
         return lines
 
 
+@dataclass
+class _UnreadableWindow:
+    title: str
+    first_at: float
+    last_at: float
+    counts: dict[UnreadableRetry, int] = field(default_factory=dict)
+
+
+class MonitorUnreadableSummary:
+    """Coalesce replies per canonical channel, flushing even during a burst."""
+
+    def __init__(self, *, quiet_seconds: float = 5.0, max_seconds: float = 30.0):
+        self.quiet_seconds = quiet_seconds
+        self.max_seconds = max_seconds
+        self._events: dict[int, _UnreadableWindow] = {}
+
+    def add(self, job: PendingMedia, retry: UnreadableRetry, *, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        window = self._events.get(job.peer_id)
+        if window is None:
+            title = " ".join(job.title.splitlines()).strip() or str(job.peer_id)
+            window = self._events[job.peer_id] = _UnreadableWindow(title, now, now)
+        window.last_at = now
+        window.counts[retry] = window.counts.get(retry, 0) + 1
+
+    def drain(self, *, now: float | None = None, force: bool = False) -> list[str]:
+        if not self._events:
+            return []
+        now = time.monotonic() if now is None else now
+        lines = []
+        for peer, window in list(self._events.items()):
+            if not force and (now - window.last_at < self.quiet_seconds
+                              and now - window.first_at < self.max_seconds):
+                continue
+            details = []
+            for retry, count in sorted(window.counts.items(), key=lambda entry: entry[0].misses):
+                if retry.delay_seconds is None:
+                    details.append(f"连续{retry.misses}次 {count}项，已移出本账号自动队列")
+                else:
+                    details.append(f"第{retry.misses}次 {count}项，{retry.delay_seconds // 3600}小时后可重试")
+            lines.append(f"[监控·消息不可读取] {window.title}：{'；'.join(details)}")
+            del self._events[peer]
+        return lines
+
+
 def monitor_path() -> Path:
-    return prepare_data_dir() / "monitored_channels.json"
+    return prepare_data_dir() / "accounts" / "default" / "monitored_channels.json"
 
 
 def next_due_channel(
@@ -65,7 +118,8 @@ def next_due_channel(
     ready = sorted(
         (
             item for item in items
-            if item.get("enabled", True) and next_at.get(item["target"], 0) <= now
+            if item.get("enabled", True) and item.get("mode") != REALTIME
+            and next_at.get(item["target"], 0) <= now
         ),
         key=lambda item: -int(item.get("priority", 0)),
     )
@@ -104,6 +158,34 @@ def choose_monitor_download(
     return min(candidates, key=key)
 
 
+
+def configure_monitor_mode(row: dict, old: dict | None, mode: str, dialogs) -> None:
+    """Prepare a mode edit without mutating the existing saved row."""
+    row["mode"] = mode
+    if mode != REALTIME:
+        row.pop("realtime_epoch", None)
+        row.pop("realtime_backfill", None)
+        row.pop("realtime_since", None)
+        return
+    from tgdl.account_view import joined_channel_peer
+
+    previous = old or {}
+    peer = previous.get("peer_id")
+    if not isinstance(peer, int) or isinstance(peer, bool) or peer <= 0:
+        peer = joined_channel_peer(dialogs, row["target"])
+    row["peer_id"] = peer
+    previous_epoch = previous.get("realtime_epoch") if previous.get("mode") == REALTIME else None
+    row["realtime_epoch"] = previous_epoch or uuid4().hex
+    if not previous_epoch:
+        row["realtime_since"] = int(time.time())
+    elif "realtime_since" in previous:
+        row["realtime_since"] = previous["realtime_since"]
+    row["realtime_backfill"] = (
+        bool(previous.get("realtime_backfill", False)) if previous_epoch
+        else old is not None and previous.get("mode") != REALTIME
+    )
+
+
 def load_channels(path: Path | None = None) -> list[dict]:
     path = path or monitor_path()
     if not path.exists():
@@ -140,7 +222,23 @@ def load_channels(path: Path | None = None) -> list[dict]:
                 "enabled": bool(item.get("enabled", True)),
                 "direction": item.get("direction", "newest") if item.get("direction") in ("newest", "oldest") else "newest",
                 "name": str(item.get("name", "")).strip(),
+                "mode": REALTIME if item.get("mode") == REALTIME else SCHEDULED,
             })
+            try:
+                raw_peer_id = item.get("peer_id")
+                peer_id = 0 if isinstance(raw_peer_id, bool) else int(raw_peer_id or 0)
+            except (TypeError, ValueError):
+                peer_id = 0
+            if peer_id:
+                result[-1]["peer_id"] = peer_id
+            if result[-1]["mode"] == REALTIME:
+                epoch = item.get("realtime_epoch")
+                if isinstance(epoch, str) and epoch.strip():
+                    result[-1]["realtime_epoch"] = epoch.strip()
+                result[-1]["realtime_backfill"] = item.get("realtime_backfill") is True
+                since = item.get("realtime_since")
+                if type(since) is int and 0 < since < 2**32:
+                    result[-1]["realtime_since"] = since
     return result
 
 

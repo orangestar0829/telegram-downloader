@@ -13,6 +13,7 @@ python -m pip install -r requirements.txt pyinstaller || goto :err
 
 echo === Building exe with PyInstaller ===
 pyinstaller --noconfirm packaging\tgdl.spec || goto :err
+python packaging\build_uninstall_manifest.py dist\TelegramDownloader packaging\uninstall_manifest.nsh || goto :err
 
 echo === Building installer with NSIS ===
 set "MAKENSIS=makensis"
